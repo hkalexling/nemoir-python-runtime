@@ -9,7 +9,11 @@ dev = [
     "pyright>=1.1.0",
     "ruff>=0.1.0",
     "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
 ]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
 
 [tool.pyright]
 typeCheckingMode = "strict"
@@ -19,4 +23,22 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["ALL"]
-ignore = ["D", "S101", "PLR2004", "INP001", "COM812"]
+ignore = [
+    "D",
+    "COM812",
+    "TRY003",
+    "ANN401",
+    "PLR0913",
+    "BLE001",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "S101",
+    "ARG001",
+    "S108",
+    "PLR2004",
+    "PT011",
+    "B017",
+    "ANN001",
+]

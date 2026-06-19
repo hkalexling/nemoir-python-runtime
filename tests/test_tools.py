@@ -1,0 +1,236 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import pytest  # type: ignore[import-untyped]
+
+from nemoir_runtime.capabilities import CapabilityParamType
+from nemoir_runtime.errors import (
+    MissingCapabilityError,
+    ToolInvocationError,
+    ToolValidationError,
+)
+from nemoir_runtime.tools import (
+    CATALOG_TYPE_MAP,
+    Tool,
+    ToolContext,
+    ToolRegistry,
+    tool,
+)
+
+
+def test_tool_decorator_captures_metadata() -> None:
+    @tool(capability="fs.read", description="Read a file under cwd.")
+    async def read_file(*, path: Path, ctx: ToolContext) -> str:
+        return f"read {path}"
+
+    assert isinstance(read_file, Tool)
+    assert read_file.name == "read_file"
+    assert read_file.capability == "fs.read"
+    assert read_file.description == "Read a file under cwd."
+    assert "path" in read_file.input_schema
+    assert read_file.input_schema["path"] is Path
+
+
+def test_tool_unknown_capability_rejected_at_registry() -> None:
+    @tool(capability="made.up", description="bad")
+    async def bad_tool(*, ctx: ToolContext) -> None:  # type: ignore[no-untyped-def]
+        pass
+
+    with pytest.raises(ToolValidationError, match="unknown capability"):  # type: ignore[reportUnknownMemberType]
+        ToolRegistry([bad_tool])
+
+
+def test_tool_sync_function_rejected_at_registry() -> None:
+    def sync_fn(*, path: Path, ctx: ToolContext) -> str:  # type: ignore[misc]
+        return str(path)
+
+    t = Tool(
+        name="sync_fn",
+        capability="fs.read",
+        description="sync",
+        input_schema={"path": Path},
+        handler=sync_fn,
+    )
+    with pytest.raises(ToolValidationError, match="must be async"):  # type: ignore[reportUnknownMemberType]
+        ToolRegistry([t])
+
+
+def test_tool_missing_required_param_rejected_at_registry() -> None:
+    @tool(capability="fs.read", description="missing path")
+    async def no_path(*, ctx: ToolContext) -> str:  # type: ignore[no-untyped-def]
+        return ""
+
+    with pytest.raises(ToolValidationError, match="missing required parameter"):  # type: ignore[reportUnknownMemberType]
+        ToolRegistry([no_path])
+
+
+def test_tool_wrong_required_param_type_rejected_at_registry() -> None:
+    @tool(capability="fs.read", description="wrong type")
+    async def wrong_type(*, path: str, ctx: ToolContext) -> str:
+        return path
+
+    with pytest.raises(ToolValidationError, match="has type"):  # type: ignore[reportUnknownMemberType]
+        ToolRegistry([wrong_type])
+
+
+def test_tool_missing_param_annotation_rejected() -> None:
+    t = Tool(
+        name="read_file",
+        capability="fs.read",
+        description="no annotation on path",
+        input_schema={},
+        handler=_missing_annotation_handler(),
+    )
+    with pytest.raises(ToolValidationError, match="missing type annotation"):  # type: ignore[reportUnknownMemberType]
+        ToolRegistry([t])
+
+
+def _missing_annotation_handler() -> Any:  # type: ignore[reportUnknownParameterType]
+    async def handler(*, path, ctx: ToolContext) -> str:  # type: ignore[no-untyped-def, misc]
+        return str(path)  # type: ignore[reportUnknownArgumentType]
+
+    return handler  # type: ignore[reportUnknownVariableType]
+
+
+def test_tool_missing_ctx_rejected_at_registry() -> None:
+    t = Tool(
+        name="no_ctx",
+        capability="fs.read",
+        description="no ctx",
+        input_schema={"path": Path},
+        handler=_no_ctx_factory(),
+    )
+    with pytest.raises(ToolValidationError, match="must have a 'ctx' parameter"):  # type: ignore[reportUnknownMemberType]
+        ToolRegistry([t])
+
+
+def _no_ctx_factory() -> Any:
+    async def no_ctx(*, path: Path) -> str:  # type: ignore[no-untyped-def,misc]
+        return str(path)
+
+    return no_ctx
+
+
+def test_tool_extra_optional_param_allowed() -> None:
+    @tool(capability="fs.read", description="has extra optional")
+    async def with_extra(*, path: Path, ctx: ToolContext, extra: int = 0) -> str:
+        return str(extra)
+
+    ToolRegistry([with_extra])
+
+
+def test_tool_extra_required_param_rejected_at_registry() -> None:
+    @tool(capability="fs.read", description="extra required")
+    async def with_req_extra(*, path: Path, ctx: ToolContext, extra: int) -> str:
+        return str(extra)
+
+    with pytest.raises(ToolValidationError, match="unsupported required extra"):  # type: ignore[reportUnknownMemberType]
+        ToolRegistry([with_req_extra])
+
+
+def test_tool_return_annotation_ignored() -> None:
+    @tool(capability="fs.read", description="returns int but that is fine")
+    async def returns_int(*, path: Path, ctx: ToolContext) -> int:
+        return 42
+
+    ToolRegistry([returns_int])
+
+
+def test_registry_duplicate_capability_rejected() -> None:
+    @tool(capability="fs.read", description="first")
+    async def read1(*, path: Path, ctx: ToolContext) -> str:
+        return ""
+
+    @tool(capability="fs.read", description="second")
+    async def read2(*, path: Path, ctx: ToolContext) -> str:
+        return ""
+
+    with pytest.raises(ToolValidationError, match="Duplicate capability"):  # type: ignore[reportUnknownMemberType]
+        ToolRegistry([read1, read2])
+
+
+def test_registry_require_capabilities_missing_rejected() -> None:
+    @tool(capability="fs.read", description="r")
+    async def read_file(*, path: Path, ctx: ToolContext) -> str:
+        return ""
+
+    registry = ToolRegistry([read_file])
+    with pytest.raises(MissingCapabilityError, match="Required capability"):  # type: ignore[reportUnknownMemberType]
+        registry.require_capabilities(["os.shell"])
+
+
+def test_registry_require_capabilities_satisfied() -> None:
+    @tool(capability="fs.read", description="r")
+    async def read_file(*, path: Path, ctx: ToolContext) -> str:
+        return ""
+
+    registry = ToolRegistry([read_file])
+    registry.require_capabilities(["fs.read"])
+
+
+async def test_registry_call_invokes_handler() -> None:
+    called: list[tuple[str, str]] = []
+
+    @tool(capability="fs.read", description="r")
+    async def read_file(*, path: Path, ctx: ToolContext) -> str:
+        called.append(("read_file", str(path)))
+        return "ok"
+
+    registry = ToolRegistry([read_file])
+    ctx = ToolContext(workflow_id="w", stage_id="s", inputs={"cwd": Path.cwd()})
+    result = await registry.call("fs.read", {"path": Path("/tmp")}, ctx)
+
+    assert result == "ok"
+    assert called == [("read_file", "/tmp")]
+
+
+async def test_registry_call_missing_capability_raises() -> None:
+    @tool(capability="fs.read", description="r")
+    async def read_file(*, path: Path, ctx: ToolContext) -> str:
+        return ""
+
+    registry = ToolRegistry([read_file])
+    ctx = ToolContext(workflow_id="w", stage_id="s", inputs={})
+
+    with pytest.raises(MissingCapabilityError, match="No tool registered"):  # type: ignore[reportUnknownMemberType]
+        await registry.call("os.shell", {"command": "ls"}, ctx)
+
+
+async def test_registry_call_wraps_handler_errors() -> None:
+    @tool(capability="fs.read", description="r")
+    async def read_file(*, path: Path, ctx: ToolContext) -> str:
+        msg = "boom"
+        raise ValueError(msg)
+
+    registry = ToolRegistry([read_file])
+    ctx = ToolContext(workflow_id="w", stage_id="s", inputs={})
+
+    with pytest.raises(ToolInvocationError, match="failed"):  # type: ignore[reportUnknownMemberType]
+        await registry.call("fs.read", {"path": Path("/tmp")}, ctx)
+
+
+def test_tool_context_fields() -> None:
+    ctx = ToolContext(
+        workflow_id="wf1",
+        stage_id="s1",
+        inputs={"task": "hello", "cwd": Path("/app")},
+        metadata={"run": 1},
+    )
+    assert ctx.workflow_id == "wf1"
+    assert ctx.stage_id == "s1"
+    assert ctx.inputs["task"] == "hello"
+    assert ctx.metadata["run"] == 1
+
+
+def test_catalog_type_map_covers_all_types() -> None:
+    assert CATALOG_TYPE_MAP[CapabilityParamType.STRING] is str
+    assert CATALOG_TYPE_MAP[CapabilityParamType.PATH] is Path
+    assert CATALOG_TYPE_MAP[CapabilityParamType.BOOL] is bool
+
+
+def test_tool_context_is_frozen() -> None:
+    ctx = ToolContext(workflow_id="w", stage_id="s", inputs={})
+    with pytest.raises(Exception):  # type: ignore[reportUnknownMemberType]
+        ctx.workflow_id = "x"  # type: ignore[misc]
