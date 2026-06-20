@@ -47,3 +47,11 @@ class WorkflowTimeoutError(NemoIRRuntimeError):
 
 class WorkflowValidationError(NemoIRRuntimeError):
     pass
+
+
+class ModelProviderError(NemoIRRuntimeError):
+    pass
+
+
+class ModelOutputValidationError(NemoIRRuntimeError):
+    pass

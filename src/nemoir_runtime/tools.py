@@ -74,6 +74,7 @@ def _derive_input_schema(handler: Callable[..., Any]) -> Mapping[str, type]:
 class ToolRegistry:
     def __init__(self, tools: Iterable[Tool]) -> None:
         self._tools: dict[str, Tool] = {}
+        self._tools_by_name: dict[str, Tool] = {}
         tool_list = list(tools)
         for t in tool_list:
             if t.capability in self._tools:
@@ -83,11 +84,26 @@ class ToolRegistry:
                     f"and tool '{t.name}'"
                 )
                 raise ToolValidationError(msg)
+            if t.name in self._tools_by_name:
+                msg = (
+                    f"Duplicate tool name: '{t.name}' used by capability "
+                    f"'{self._tools_by_name[t.name].capability}' "
+                    f"and capability '{t.capability}'"
+                )
+                raise ToolValidationError(msg)
             self._tools[t.capability] = t
+            self._tools_by_name[t.name] = t
         self._validate_tools(tool_list)
 
     def get(self, capability: str) -> Tool | None:
         return self._tools.get(capability)
+
+    def get_by_name(self, name: str) -> Tool | None:
+        return self._tools_by_name.get(name)
+
+    def tools_for_capabilities(self, capabilities: Iterable[str]) -> tuple[Tool, ...]:
+        cap_set = set(capabilities)
+        return tuple(t for t in self._tools_by_name.values() if t.capability in cap_set)
 
     def require_capabilities(self, capabilities: Iterable[str]) -> None:
         for cap in capabilities:

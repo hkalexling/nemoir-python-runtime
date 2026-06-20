@@ -1,0 +1,609 @@
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass, field, is_dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Protocol
+
+from nemoir_runtime.capabilities import CAPABILITY_CATALOG
+from nemoir_runtime.errors import ModelOutputValidationError, ModelProviderError
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+    from nemoir_runtime.runtime import StageContext, StageSpec
+    from nemoir_runtime.tools import Tool, ToolRegistry
+
+
+@dataclass(frozen=True)
+class ModelToolCall:
+    id: str
+    name: str
+    arguments: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class ModelResponse:
+    content: str | None = None
+    tool_calls: tuple[ModelToolCall, ...] = ()
+
+
+@dataclass(frozen=True)
+class ModelRequest:
+    stage_id: str
+    messages: tuple[Mapping[str, Any], ...]
+    tools: tuple[Mapping[str, Any], ...]
+    output_schema: Mapping[str, Any]
+    options: Mapping[str, Any] = field(default_factory=dict)  # type: ignore[reportUnknownVariableType]
+
+
+class ModelAdapter(Protocol):
+    async def complete(self, request: ModelRequest) -> ModelResponse: ...
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    name: str
+    temperature: float | None = None
+    max_tokens: int | None = None
+    structured_outputs: bool = False
+    extra: Mapping[str, Any] = field(default_factory=dict)  # type: ignore[reportUnknownVariableType]
+
+
+@dataclass(frozen=True)
+class ModelRouter:
+    default: str | Mapping[str, Any] | ModelAdapter
+    stages: Mapping[str, str | Mapping[str, Any] | ModelAdapter] = field(  # type: ignore[reportUnknownVariableType]
+        default_factory=dict
+    )
+
+
+class LiteLLMModelAdapter:
+    name: str
+    temperature: float | None
+    max_tokens: int | None
+    structured_outputs: bool
+    extra: Mapping[str, Any]
+
+    def __init__(
+        self,
+        spec: str | Mapping[str, Any] | ModelSpec,
+        *,
+        _acompletion: Any = None,
+    ) -> None:
+        self._spec = _resolve_spec(spec)
+        self.name = self._spec.name
+        self.temperature = self._spec.temperature
+        self.max_tokens = self._spec.max_tokens
+        self.structured_outputs = self._spec.structured_outputs
+        self.extra = self._spec.extra
+        self._acompletion = _acompletion
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        kwargs: dict[str, Any] = {
+            "model": self.name,
+            "messages": list(request.messages),
+        }
+        if request.tools:
+            kwargs["tools"] = list(request.tools)
+            kwargs["tool_choice"] = "auto"
+        if request.output_schema and "response_format" in self.extra:
+            kwargs["response_format"] = self.extra["response_format"]
+        elif request.output_schema and self.structured_outputs:
+            kwargs["response_format"] = _json_schema_response_format(
+                request.stage_id, request.output_schema
+            )
+        elif request.output_schema:
+            kwargs["response_format"] = {
+                "type": "json_object",
+            }
+        if self.temperature is not None:
+            kwargs["temperature"] = self.temperature
+        if self.max_tokens is not None:
+            kwargs["max_tokens"] = self.max_tokens
+        kwargs.update(self.extra)
+
+        acompletion = self._acompletion or _get_litellm_acompletion()
+        try:
+            response = await acompletion(**kwargs)
+        except Exception as e:
+            msg = f"LiteLLM provider error for model '{self.name}': {e}"
+            raise ModelProviderError(msg) from e
+
+        return _normalize_litellm_response(response, request.stage_id)
+
+
+def _resolve_spec(config: str | Mapping[str, Any] | ModelSpec) -> ModelSpec:
+    if isinstance(config, ModelSpec):
+        return config
+    if isinstance(config, str):
+        return ModelSpec(name=config)
+    if isinstance(config, dict):
+        name = config.get("name")
+        if not name or not isinstance(name, str):
+            msg = "model config mapping must have a string 'name' key"
+            raise TypeError(msg)
+        reserved = {"name", "temperature", "max_tokens", "structured_outputs"}
+        extra = {k: v for k, v in config.items() if k not in reserved}
+        return ModelSpec(
+            name=name,
+            temperature=config.get("temperature"),
+            max_tokens=config.get("max_tokens"),
+            structured_outputs=config.get("structured_outputs", False),
+            extra=extra,
+        )
+    msg = f"unsupported model spec type: {type(config).__name__}"
+    raise TypeError(msg)
+
+
+def _is_adapter(obj: object) -> bool:
+    return callable(getattr(obj, "complete", None))  # type: ignore[arg-type]
+
+
+def normalize_model(model: object) -> ModelAdapter | ModelRouter:
+    if isinstance(model, ModelRouter):
+        return model
+    if _is_adapter(model):
+        return model  # type: ignore[return-value]
+    if isinstance(model, (str, dict, ModelSpec)):
+        return LiteLLMModelAdapter(model)  # type: ignore[reportUnknownArgumentType]
+    msg = (
+        "Invalid model config: expected str, mapping, ModelSpec, "
+        f"ModelRouter, or ModelAdapter, got {type(model).__name__}"
+    )
+    raise TypeError(msg)
+
+
+def model_for_stage(model: ModelAdapter | ModelRouter, stage_id: str) -> ModelAdapter:
+    if isinstance(model, ModelRouter):
+        resolved = model.stages.get(stage_id, model.default)  # type: ignore[arg-type]
+        result = normalize_model(resolved)
+        if isinstance(result, ModelRouter):
+            msg = f"ModelRouter.default for stage '{stage_id}' resolved to another ModelRouter"
+            raise TypeError(msg)
+        return result
+    return model
+
+
+# ---------------------------------------------------------------------------
+# Stage output schema helpers
+# ---------------------------------------------------------------------------
+
+_WRITE_TYPE_TO_JSON: dict[str, dict[str, str | dict[str, str]]] = {
+    "string": {"type": "string"},
+    "bool": {"type": "boolean"},
+    "path": {"type": "string"},
+    "string[]": {"type": "array", "items": {"type": "string"}},
+}
+
+
+def output_schema_for_stage(stage: StageSpec) -> dict[str, Any]:
+    properties: dict[str, Any] = {}
+    required: list[str] = []
+    for write in stage.writes:
+        json_type = _WRITE_TYPE_TO_JSON.get(write.type)
+        if json_type is None:
+            msg = f"unsupported output write type '{write.type}' in stage '{stage.id}'"
+            raise ModelOutputValidationError(msg)
+        properties[write.name] = json_type
+        if not write.optional:
+            required.append(write.name)
+    schema: dict[str, Any] = {
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": False,
+    }
+    if required:
+        schema["required"] = required
+    return schema
+
+
+def normalize_stage_output(stage: StageSpec, raw: Mapping[str, Any]) -> dict[str, Any]:
+    allowed = {w.name for w in stage.writes}
+    for key in raw:
+        if key not in allowed:
+            msg = f"unknown output field '{key}' in stage '{stage.id}'"
+            raise ModelOutputValidationError(msg)
+    result: dict[str, Any] = {}
+    for write in stage.writes:
+        val = raw.get(write.name)
+        if val is None:
+            if not write.optional:
+                msg = f"missing required output field '{write.name}' in stage '{stage.id}'"
+                raise ModelOutputValidationError(msg)
+            result[write.name] = None
+            continue
+        result[write.name] = _normalize_write_value(write, val, stage.id)
+    return result
+
+
+def _normalize_write_value(write: Any, val: Any, stage_id: str) -> Any:
+    if write.type == "string":
+        if not isinstance(val, str):
+            msg = f"expected str for '{write.name}' in stage '{stage_id}', got {type(val).__name__}"
+            raise ModelOutputValidationError(msg)
+        return val
+    if write.type == "bool":
+        if not isinstance(val, bool):
+            msg = (
+                f"expected bool for '{write.name}' in stage '{stage_id}', got {type(val).__name__}"
+            )
+            raise ModelOutputValidationError(msg)
+        return val
+    if write.type == "path":
+        if isinstance(val, str):
+            return Path(val)
+        msg = (
+            f"expected str or Path for '{write.name}' "
+            f"in stage '{stage_id}', got {type(val).__name__}"
+        )
+        raise ModelOutputValidationError(msg)
+    if write.type == "string[]":
+        if not isinstance(val, list) or not all(
+            isinstance(v, str)
+            for v in val  # type: ignore[reportUnknownVariableType]
+        ):
+            msg = f"expected list[str] for '{write.name}' in stage '{stage_id}'"
+            raise ModelOutputValidationError(msg)
+        return list(val)  # type: ignore[reportUnknownArgumentType]
+    msg = f"unsupported write type '{write.type}' in stage '{stage_id}'"
+    raise ModelOutputValidationError(msg)
+
+
+# ---------------------------------------------------------------------------
+# Tool schema helpers
+# ---------------------------------------------------------------------------
+
+_TOOL_ARG_TYPE_TO_JSON: dict[type, dict[str, Any]] = {
+    str: {"type": "string"},
+    bool: {"type": "boolean"},
+    int: {"type": "integer"},
+    float: {"type": "number"},
+    Path: {"type": "string"},
+}
+
+
+def _required_tool_params(tool: Tool) -> frozenset[str]:
+    spec = CAPABILITY_CATALOG.get(tool.capability)
+    if spec is None:
+        return frozenset()
+    return frozenset(p.name for p in spec.required_params)
+
+
+def tool_schema(tool: Tool) -> dict[str, Any]:
+    properties: dict[str, Any] = {}
+    required: list[str] = []
+
+    catalog_required = _required_tool_params(tool)
+
+    for param_name, param_type in tool.input_schema.items():
+        json_type = _TOOL_ARG_TYPE_TO_JSON.get(param_type)
+        if json_type is None and param_type == list[str]:
+            json_type = {"type": "array", "items": {"type": "string"}}
+        if json_type is None:
+            msg = (
+                f"unsupported tool parameter type '{param_type.__name__}' "
+                f"for parameter '{param_name}' in tool '{tool.name}'"
+            )
+            raise ModelOutputValidationError(msg)
+        properties[param_name] = json_type
+        if param_name in catalog_required:
+            required.append(param_name)
+
+    return {
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def normalize_tool_args(tool: Tool, raw_args: Mapping[str, Any]) -> dict[str, Any]:  # noqa: C901, PLR0912
+    known = set(tool.input_schema.keys())
+    for key in raw_args:
+        if key not in known:
+            msg = (
+                f"unknown argument '{key}' for tool '{tool.name}' (capability '{tool.capability}')"
+            )
+            raise ModelOutputValidationError(msg)
+
+    for name in _required_tool_params(tool):
+        if name not in raw_args:
+            msg = (
+                f"missing required argument '{name}' for tool "
+                f"'{tool.name}' (capability '{tool.capability}')"
+            )
+            raise ModelOutputValidationError(msg)
+
+    result: dict[str, Any] = {}
+    for param_name, param_type in tool.input_schema.items():
+        if param_name not in raw_args:
+            continue
+        val = raw_args[param_name]
+        if param_type is Path:
+            if isinstance(val, str):
+                result[param_name] = Path(val)
+            else:
+                msg = (
+                    f"expected str for 'Path' parameter '{param_name}' "
+                    f"in tool '{tool.name}', got {type(val).__name__}"
+                )
+                raise ModelOutputValidationError(msg)
+        elif param_type is str:
+            if not isinstance(val, str):
+                msg = (
+                    f"expected str for parameter '{param_name}' "
+                    f"in tool '{tool.name}', got {type(val).__name__}"
+                )
+                raise ModelOutputValidationError(msg)
+            result[param_name] = val
+        elif param_type is bool:
+            if not isinstance(val, bool):
+                msg = (
+                    f"expected bool for parameter '{param_name}' "
+                    f"in tool '{tool.name}', got {type(val).__name__}"
+                )
+                raise ModelOutputValidationError(msg)
+            result[param_name] = val
+        elif param_type is int:
+            if not isinstance(val, int) or isinstance(val, bool):
+                msg = (
+                    f"expected int for parameter '{param_name}' "
+                    f"in tool '{tool.name}', got {type(val).__name__}"
+                )
+                raise ModelOutputValidationError(msg)
+            result[param_name] = val
+        elif param_type is float:
+            if not isinstance(val, (int, float)) or isinstance(val, bool):
+                msg = (
+                    f"expected float for parameter '{param_name}' "
+                    f"in tool '{tool.name}', got {type(val).__name__}"
+                )
+                raise ModelOutputValidationError(msg)
+            result[param_name] = float(val)
+        elif param_type == list[str]:
+            if not isinstance(val, list) or not all(
+                isinstance(v, str)
+                for v in val  # type: ignore[reportUnknownVariableType]
+            ):
+                msg = f"expected list[str] for parameter '{param_name}' in tool '{tool.name}'"
+                raise ModelOutputValidationError(msg)
+            result[param_name] = list(val)  # type: ignore[reportUnknownArgumentType]
+        else:
+            msg = (
+                f"unsupported parameter type '{param_type.__name__}' "
+                f"for parameter '{param_name}' in tool '{tool.name}'"
+            )
+            raise ModelOutputValidationError(msg)
+    return result
+
+
+def tool_result_to_model_content(value: Any) -> str:  # noqa: PLR0911
+    if value is None:
+        return "null"
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return json.dumps(value)
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (list, dict)):
+        return json.dumps(value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return json.dumps(asdict(value))
+    return str(value)
+
+
+# ---------------------------------------------------------------------------
+# LiteLLM helper
+# ---------------------------------------------------------------------------
+
+
+def _get_litellm_acompletion() -> Any:
+    import litellm  # noqa: PLC0415
+
+    return litellm.acompletion  # type: ignore[reportUnknownMemberType, reportUnknownVariableType]
+
+
+def _json_schema_response_format(stage_id: str, schema: Mapping[str, Any]) -> dict[str, Any]:
+    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in stage_id) or "stage"
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": safe_name[:64],
+            "schema": dict(schema),
+            "strict": False,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# ModelStageExecutor
+# ---------------------------------------------------------------------------
+
+
+class ModelStageExecutor:
+    def __init__(
+        self,
+        *,
+        model: object,
+        tools: ToolRegistry,
+        max_tool_rounds: int = 8,
+    ) -> None:
+        normalized = normalize_model(model)
+        self._model: ModelAdapter | ModelRouter = normalized
+        self._tools = tools
+        self._max_tool_rounds = max_tool_rounds
+
+    async def execute(self, ctx: StageContext) -> dict[str, Any]:
+        adapter = model_for_stage(self._model, ctx.stage.id)
+        output_schema = output_schema_for_stage(ctx.stage)
+        stage_tools = self._tools.tools_for_capabilities(ctx.allowed_capabilities)
+        tool_schemas = tuple(tool_schema(t) for t in stage_tools)
+
+        messages = self._build_initial_messages(ctx, output_schema)
+
+        tool_rounds = 0
+        while True:
+            request = ModelRequest(
+                stage_id=ctx.stage.id,
+                messages=tuple(messages),
+                tools=tool_schemas,
+                output_schema=output_schema,
+            )
+            response = await adapter.complete(request)
+
+            if response.tool_calls:
+                if tool_rounds >= self._max_tool_rounds:
+                    msg = f"stage '{ctx.stage.id}' exceeded max_tool_rounds={self._max_tool_rounds}"
+                    raise ModelOutputValidationError(msg)
+                tool_rounds += 1
+                messages.append(self._assistant_tool_call_message(response))
+                for tc in response.tool_calls:
+                    tool = self._tools.get_by_name(tc.name)
+                    if tool is None:
+                        msg = f"model requested unknown tool '{tc.name}' in stage '{ctx.stage.id}'"
+                        raise ModelOutputValidationError(msg)
+                    if tool.capability not in ctx.allowed_capabilities:
+                        msg = (
+                            f"tool '{tc.name}' has capability "
+                            f"'{tool.capability}' which is not allowed "
+                            f"in stage '{ctx.stage.id}'"
+                        )
+                        raise ModelOutputValidationError(msg)
+                    normalized_args = normalize_tool_args(tool, tc.arguments)
+                    result = await ctx.call_tool(tool.capability, normalized_args)
+                    result_content = tool_result_to_model_content(result)
+                    messages.append(self._tool_result_message(tc.id, result_content))
+            else:
+                if not response.content:
+                    msg = f"model returned empty content in stage '{ctx.stage.id}'"
+                    raise ModelOutputValidationError(msg)
+                try:
+                    parsed = json.loads(response.content)  # type: ignore[reportUnknownArgumentType]
+                except json.JSONDecodeError as e:
+                    msg = f"model returned invalid JSON in stage '{ctx.stage.id}': {e}"
+                    raise ModelOutputValidationError(msg) from e
+                if not isinstance(parsed, dict):
+                    msg = (
+                        f"model returned {type(parsed).__name__} "
+                        f"instead of object in stage '{ctx.stage.id}'"
+                    )
+                    raise ModelOutputValidationError(msg)
+                return normalize_stage_output(ctx.stage, parsed)  # type: ignore[reportUnknownArgumentType]
+
+    @staticmethod
+    def _build_initial_messages(
+        ctx: StageContext,
+        output_schema: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        system_msg: dict[str, Any] = {
+            "role": "system",
+            "content": (
+                "You are executing one NemoIR workflow stage. "
+                "Follow the stage prompt. "
+                "Use only the supplied tools when needed. "
+                "Return only JSON matching the required output schema "
+                "when the stage is complete. "
+                "Do not expose hidden chain-of-thought."
+            ),
+        }
+        user_content = (
+            f"Workflow: {ctx.workflow_id}\n"
+            f"Stage: {ctx.stage.id}\n\n"
+            f"Stage prompt:\n{ctx.stage.prompt}\n\n"
+            f"Readable context:\n"
+            f"{json.dumps(ctx.readable_context, indent=2, default=str)}\n\n"
+            f"Allowed capabilities:\n"
+            f"{json.dumps(list(ctx.allowed_capabilities))}\n\n"
+            f"When complete, respond with a JSON object matching this schema:\n"
+            f"{json.dumps(output_schema, indent=2)}"
+        )
+        user_msg: dict[str, Any] = {"role": "user", "content": user_content}
+        return [system_msg, user_msg]
+
+    @staticmethod
+    def _assistant_tool_call_message(
+        response: ModelResponse,
+    ) -> dict[str, Any]:
+        tool_calls_list: list[dict[str, Any]] = [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.name,
+                    "arguments": json.dumps(tc.arguments),
+                },
+            }
+            for tc in response.tool_calls
+        ]
+        return {"role": "assistant", "tool_calls": tool_calls_list}  # type: ignore[reportUnknownVariableType]
+
+    @staticmethod
+    def _tool_result_message(
+        tool_call_id: str,
+        content: str,
+    ) -> dict[str, Any]:
+        return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
+
+
+# ---------------------------------------------------------------------------
+# LiteLLM response normalization
+# ---------------------------------------------------------------------------
+
+
+def _normalize_litellm_response(response: Any, stage_id: str) -> ModelResponse:
+    try:
+        choice = response.choices[0]
+    except (AttributeError, IndexError, TypeError) as e:
+        msg = "LiteLLM response has no choices"
+        raise ModelProviderError(msg) from e
+
+    message = getattr(choice, "message", None)
+    if message is None:
+        msg = "LiteLLM response choice has no message"
+        raise ModelProviderError(msg)
+
+    content: str | None = getattr(message, "content", None)
+
+    tool_calls_list: list[ModelToolCall] = []
+    raw_tool_calls = getattr(message, "tool_calls", None) or []  # type: ignore[reportUnknownVariableType]
+
+    for raw_tc in raw_tool_calls:  # type: ignore[reportUnknownVariableType]
+        tc_type = getattr(raw_tc, "type", None) or "function"  # type: ignore[reportUnknownArgumentType]
+        if tc_type != "function":
+            continue
+        func = getattr(raw_tc, "function", None)  # type: ignore[reportUnknownArgumentType]
+        if func is None:
+            continue
+        try:
+            args_str = getattr(func, "arguments", "{}")
+            args = json.loads(args_str) if isinstance(args_str, str) else args_str
+            if not isinstance(args, dict):
+                msg = f"tool-call arguments must be an object, got {type(args).__name__}"
+                raise ModelOutputValidationError(msg)
+        except json.JSONDecodeError as e:
+            msg = f"model returned malformed tool-call arguments in stage '{stage_id}': {e}"
+            raise ModelOutputValidationError(msg) from e
+        except TypeError as e:
+            msg = f"model returned non-dict tool-call arguments in stage '{stage_id}': {e}"
+            raise ModelOutputValidationError(msg) from e
+
+        tool_calls_list.append(
+            ModelToolCall(
+                id=getattr(raw_tc, "id", ""),  # type: ignore[reportUnknownArgumentType]
+                name=getattr(func, "name", ""),
+                arguments=args,  # type: ignore[reportUnknownArgumentType]
+            )
+        )
+
+    return ModelResponse(content=content, tool_calls=tuple(tool_calls_list))

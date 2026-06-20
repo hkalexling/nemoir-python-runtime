@@ -234,3 +234,124 @@ def test_tool_context_is_frozen() -> None:
     ctx = ToolContext(workflow_id="w", stage_id="s", inputs={})
     with pytest.raises(Exception):  # type: ignore[reportUnknownMemberType]
         ctx.workflow_id = "x"  # type: ignore[misc]
+
+
+# ------------------------------------------------------------------
+# ToolRegistry: duplicate-name rejection + inspection helpers
+# ------------------------------------------------------------------
+
+
+def test_registry_rejects_duplicate_tool_name() -> None:
+    async def handler1(*, path: Path, ctx: ToolContext) -> str:
+        return "ok"
+
+    async def handler2(*, command: str, ctx: ToolContext) -> str:
+        return "ok"
+
+    t1 = Tool(
+        name="read",
+        capability="fs.read",
+        description="r1",
+        input_schema={"path": Path},
+        handler=handler1,
+    )
+    t2 = Tool(
+        name="read",
+        capability="os.shell",
+        description="r2",
+        input_schema={"command": str},
+        handler=handler2,
+    )
+    with pytest.raises(ToolValidationError, match="Duplicate tool name"):  # type: ignore[reportUnknownMemberType]
+        ToolRegistry([t1, t2])
+
+
+def test_get_by_name_returns_tool() -> None:
+    async def handler(*, path: Path, ctx: ToolContext) -> str:
+        return "ok"
+
+    t = Tool(
+        name="reader",
+        capability="fs.read",
+        description="reads files",
+        input_schema={"path": Path},
+        handler=handler,
+    )
+    registry = ToolRegistry([t])
+    found = registry.get_by_name("reader")
+    assert found is not None
+    assert found.name == "reader"
+    assert found.capability == "fs.read"
+
+
+def test_get_by_name_returns_none_for_unknown() -> None:
+    async def handler(*, path: Path, ctx: ToolContext) -> str:
+        return "ok"
+
+    t = Tool(
+        name="reader",
+        capability="fs.read",
+        description="r",
+        input_schema={"path": Path},
+        handler=handler,
+    )
+    registry = ToolRegistry([t])
+    assert registry.get_by_name("nonexistent") is None
+
+
+def test_tools_for_capabilities_filters_to_allowed() -> None:
+    async def h1(*, path: Path, ctx: ToolContext) -> str:
+        return "read"
+
+    async def h2(*, path: Path, content: str, ctx: ToolContext) -> None:
+        return None
+
+    async def h3(*, command: str, ctx: ToolContext) -> str:
+        return "ok"
+
+    t1 = Tool(
+        name="read",
+        capability="fs.read",
+        description="r",
+        input_schema={"path": Path},
+        handler=h1,
+    )
+    t2 = Tool(
+        name="write",
+        capability="fs.write",
+        description="w",
+        input_schema={"path": Path, "content": str},
+        handler=h2,
+    )
+    t3 = Tool(
+        name="shell",
+        capability="os.shell",
+        description="s",
+        input_schema={"command": str},
+        handler=h3,
+    )
+    registry = ToolRegistry([t1, t2, t3])
+
+    visible = registry.tools_for_capabilities({"fs.read"})
+    assert len(visible) == 1
+    assert visible[0].name == "read"
+
+    visible_two = registry.tools_for_capabilities({"fs.read", "fs.write"})
+    assert len(visible_two) == 2
+    names = {t.name for t in visible_two}
+    assert names == {"read", "write"}
+
+
+def test_tools_for_capabilities_empty_returns_empty() -> None:
+    async def h(*, path: Path, ctx: ToolContext) -> str:
+        return "ok"
+
+    t = Tool(
+        name="read",
+        capability="fs.read",
+        description="r",
+        input_schema={"path": Path},
+        handler=h,
+    )
+    registry = ToolRegistry([t])
+    assert registry.tools_for_capabilities(set()) == ()
