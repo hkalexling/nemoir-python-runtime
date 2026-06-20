@@ -22,6 +22,13 @@ from nemoir_runtime.errors import (
     WorkflowTimeoutError,
     WorkflowValidationError,
 )
+from nemoir_runtime.events import (
+    WorkflowEvent,
+    WorkflowEventChannel,
+    WorkflowEventEmitter,
+    WorkflowEventKind,
+    WorkflowEventSink,
+)
 from nemoir_runtime.models import (
     LiteLLMModelAdapter,
     ModelAdapter,
@@ -30,7 +37,10 @@ from nemoir_runtime.models import (
     ModelRouter,
     ModelSpec,
     ModelStageExecutor,
+    ModelStreamChunk,
+    ModelStreamingAdapter,
     ModelToolCall,
+    supports_streaming,
 )
 from nemoir_runtime.runtime import (
     ExprSpec,
@@ -79,6 +89,8 @@ __all__ = [
     "ModelRouter",
     "ModelSpec",
     "ModelStageExecutor",
+    "ModelStreamChunk",
+    "ModelStreamingAdapter",
     "ModelToolCall",
     "NemoIRRuntimeError",
     "NoTransitionMatchedError",
@@ -109,5 +121,16 @@ __all__ = [
     "WriteSpec",
     "get_capability",
     "required_param_names",
+    "supports_streaming",
     "tool",
+]
+
+# Extended with Phase 5 event primitives (re-exported for convenience).
+# Advanced users may import directly from nemoir_runtime.events.
+__all__ += [
+    "WorkflowEvent",
+    "WorkflowEventChannel",
+    "WorkflowEventEmitter",
+    "WorkflowEventKind",
+    "WorkflowEventSink",
 ]

@@ -783,3 +783,267 @@ def test_tool_result_dataclass() -> None:
 
 def test_tool_result_fallback_str() -> None:
     assert tool_result_to_model_content([1, 2]) == "[1, 2]"
+
+
+# ------------------------------------------------------------------
+# LiteLLM stream normalization (Phase 5 review Medium-2 + Medium-C3)
+# ------------------------------------------------------------------
+
+
+def _make_attr_chunk(content_text: str | None = None, tool_calls: Any = None) -> Any:
+    """Create an attribute-shaped chunk resembling a LiteLLM streaming delta."""
+    delta_kwargs: dict[str, Any] = {}
+    if content_text is not None:
+        delta_kwargs["content"] = content_text
+    if tool_calls is not None:
+        delta_kwargs["tool_calls"] = tool_calls
+    delta = type("Delta", (), delta_kwargs)()
+    choice = type("Choice", (), {"delta": delta})()
+    return type("Chunk", (), {"choices": [choice]})()
+
+
+def _make_dict_chunk(content_text: str | None = None, tool_calls: Any = None) -> dict[str, Any]:
+    """Create a dict-shaped chunk with the same logical shape."""
+    delta: dict[str, Any] = {}
+    if content_text is not None:
+        delta["content"] = content_text
+    if tool_calls is not None:
+        delta["tool_calls"] = tool_calls
+    return {"choices": [{"delta": delta}]}
+
+
+def _make_tc_delta(*, index: int, id_: str, name: str, arguments: str) -> Any:
+    """Create an attribute-shaped tool-call delta."""
+    func = type("Func", (), {"name": name, "arguments": arguments})()
+    return [type("TCDelta", (), {"index": index, "id": id_, "function": func})()]
+
+
+def _make_tc_delta_dict(*, index: int, id_: str, name: str, arguments: str) -> list[dict[str, Any]]:
+    """Create a dict-shaped tool-call delta."""
+    return [{"index": index, "id": id_, "function": {"name": name, "arguments": arguments}}]
+
+
+async def _aiter(items: list[Any]) -> Any:
+    """Yield items from a list as an async iterable."""
+    for item in items:
+        yield item
+
+
+async def test_litellm_normalize_stream_content_deltas() -> None:
+    """Content deltas from attribute-shaped chunks produce ModelStreamChunk values."""
+    adapter = LiteLLMModelAdapter("openai/gpt-4.1-mini")
+    response = _aiter(
+        [
+            _make_attr_chunk(content_text="Hello "),
+            _make_attr_chunk(content_text="world"),
+        ]
+    )
+
+    chunks: list[Any] = []
+    async for chunk in adapter._normalize_stream(response, "test"):  # type: ignore[reportPrivateUsage]  # noqa: SLF001
+        chunks.append(chunk)
+
+    deltas = [c for c in chunks if c.kind == "delta"]
+    assert len(deltas) == 2
+    assert deltas[0].text == "Hello "
+    assert deltas[0].channel == "assistant"
+    assert deltas[1].text == "world"
+
+    completed = [c for c in chunks if c.kind == "completed"]
+    assert len(completed) == 1
+    assert completed[0].response is not None
+    assert completed[0].response.content == "Hello world"
+
+
+async def test_litellm_normalize_stream_dict_shaped_chunks() -> None:
+    """Dict-shaped chunks work through _chunk_field helper."""
+    adapter = LiteLLMModelAdapter("openai/gpt-4.1-mini")
+    response = _aiter(
+        [
+            _make_dict_chunk(content_text="Hi "),
+            _make_dict_chunk(content_text="there"),
+        ]
+    )
+
+    chunks: list[Any] = []
+    async for chunk in adapter._normalize_stream(response, "test"):  # type: ignore[reportPrivateUsage]  # noqa: SLF001
+        chunks.append(chunk)
+
+    deltas = [c for c in chunks if c.kind == "delta"]
+    assert len(deltas) == 2
+    assert deltas[0].text == "Hi "
+    assert deltas[1].text == "there"
+
+    completed = [c for c in chunks if c.kind == "completed"]
+    assert len(completed) == 1
+    assert completed[0].response.content == "Hi there"
+
+
+async def test_litellm_normalize_stream_assembles_tool_calls() -> None:
+    """Streamed tool-call deltas assemble into ModelToolCall objects."""
+    adapter = LiteLLMModelAdapter("openai/gpt-4.1-mini")
+    tc_delta = _make_tc_delta(index=0, id_="call_1", name="read", arguments='{"path": "/tmp/x"}')
+    response = _aiter(
+        [
+            _make_attr_chunk(tool_calls=tc_delta),
+        ]
+    )
+
+    chunks: list[Any] = []
+    async for chunk in adapter._normalize_stream(response, "test"):  # type: ignore[reportPrivateUsage]  # noqa: SLF001
+        chunks.append(chunk)
+
+    completed = [c for c in chunks if c.kind == "completed"]
+    assert len(completed) == 1
+    tc = completed[0].response.tool_calls
+    assert len(tc) == 1
+    assert tc[0].name == "read"
+    assert tc[0].id == "call_1"
+    assert tc[0].arguments == {"path": "/tmp/x"}
+
+
+async def test_litellm_normalize_stream_tool_calls_dict_shaped() -> None:
+    """Dict-shaped tool-call deltas also assemble correctly."""
+    adapter = LiteLLMModelAdapter("openai/gpt-4.1-mini")
+    tc_delta = _make_tc_delta_dict(
+        index=0, id_="call_2", name="write", arguments='{"path": "/tmp/y", "content": "hi"}'
+    )
+    response = _aiter(
+        [
+            _make_dict_chunk(tool_calls=tc_delta),
+        ]
+    )
+
+    chunks: list[Any] = []
+    async for chunk in adapter._normalize_stream(response, "test"):  # type: ignore[reportPrivateUsage]  # noqa: SLF001
+        chunks.append(chunk)
+
+    completed = [c for c in chunks if c.kind == "completed"]
+    assert len(completed) == 1
+    tc = completed[0].response.tool_calls
+    assert len(tc) == 1
+    assert tc[0].name == "write"
+    assert tc[0].arguments == {"path": "/tmp/y", "content": "hi"}
+
+
+async def test_litellm_normalize_stream_malformed_tool_args_raises() -> None:
+    """Malformed JSON in streamed tool-call arguments raises ModelOutputValidationError."""
+    adapter = LiteLLMModelAdapter("openai/gpt-4.1-mini")
+    tc_delta = _make_tc_delta(index=0, id_="call_1", name="read", arguments="not valid json!!!")
+    response = _aiter(
+        [
+            _make_attr_chunk(tool_calls=tc_delta),
+        ]
+    )
+
+    with pytest.raises(ModelOutputValidationError, match="malformed streamed tool-call arguments"):  # type: ignore[reportUnknownMemberType]
+        async for _ in adapter._normalize_stream(response, "test"):  # type: ignore[reportPrivateUsage]  # noqa: SLF001
+            pass
+
+
+async def test_litellm_normalize_stream_non_dict_tool_args_raises() -> None:
+    """Streamed tool-call arguments that are not a dict (e.g. a list) raise."""
+    adapter = LiteLLMModelAdapter("openai/gpt-4.1-mini")
+    tc_delta = _make_tc_delta(index=0, id_="call_1", name="read", arguments="[1, 2, 3]")
+    response = _aiter(
+        [
+            _make_attr_chunk(tool_calls=tc_delta),
+        ]
+    )
+
+    with pytest.raises(ModelOutputValidationError, match="must be an object"):  # type: ignore[reportUnknownMemberType]
+        async for _ in adapter._normalize_stream(response, "test"):  # type: ignore[reportPrivateUsage]  # noqa: SLF001
+            pass
+
+
+async def test_litellm_stream_provider_exception_raises_model_provider_error() -> None:
+    """Provider exception during streaming raises ModelProviderError."""
+    from unittest.mock import AsyncMock  # noqa: PLC0415
+
+    mock_acompletion = AsyncMock(side_effect=RuntimeError("connection dropped"))
+    adapter = LiteLLMModelAdapter("openai/gpt-4.1-mini", _acompletion=mock_acompletion)
+    request = ModelRequest(stage_id="test", messages=(), tools=(), output_schema={})
+
+    with pytest.raises(ModelProviderError, match="LiteLLM provider error"):  # type: ignore[reportUnknownMemberType]
+        async for _ in adapter.stream(request):
+            pass
+
+
+async def test_litellm_complete_unchanged_after_stream_refactor() -> None:
+    """complete() still works correctly after stream refactoring."""
+    from unittest.mock import AsyncMock  # noqa: PLC0415
+
+    fake_response = type(  # type: ignore[reportUnknownVariableType]
+        "FakeResponse",
+        (),
+        {"choices": [type("Choice", (), {"message": type("Msg", (), {"content": '{"x":1}'})()})()]},  # type: ignore[reportUnknownMemberType]
+    )
+    mock_acompletion = AsyncMock(return_value=fake_response)
+    adapter = LiteLLMModelAdapter("openai/gpt-4.1-mini", _acompletion=mock_acompletion)
+    request = ModelRequest(stage_id="test", messages=(), tools=(), output_schema={})
+
+    response = await adapter.complete(request)
+    assert response.content == '{"x":1}'
+    assert response.tool_calls == ()
+
+
+async def test_litellm_stream_success_yields_model_stream_chunks() -> None:
+    """Successful stream() with injected _acompletion yields ModelStreamChunk values."""
+    from unittest.mock import AsyncMock  # noqa: PLC0415
+
+    # Create an async iterable that mimics a LiteLLM streaming response.
+    async def _fake_stream() -> Any:
+        for chunk in [
+            _make_attr_chunk(content_text="Hello "),
+            _make_attr_chunk(content_text="world"),
+        ]:
+            yield chunk
+
+    mock_acompletion = AsyncMock(return_value=_fake_stream())
+    adapter = LiteLLMModelAdapter("openai/gpt-4.1-mini", _acompletion=mock_acompletion)
+    request = ModelRequest(stage_id="test", messages=(), tools=(), output_schema={})
+
+    chunks: list[Any] = []
+    async for chunk in adapter.stream(request):
+        chunks.append(chunk)
+
+    # Verify content deltas.
+    deltas = [c for c in chunks if c.kind == "delta"]
+    assert len(deltas) == 2
+    assert deltas[0].text == "Hello "
+    assert deltas[0].channel == "assistant"
+    assert deltas[1].text == "world"
+
+    # Verify final completed chunk.
+    completed = [c for c in chunks if c.kind == "completed"]
+    assert len(completed) == 1
+    assert completed[0].response is not None
+    assert completed[0].response.content == "Hello world"
+
+    # Verify _acompletion was called with stream=True.
+    mock_acompletion.assert_called_once()
+    call_kwargs = mock_acompletion.call_args.kwargs
+    assert call_kwargs.get("stream") is True
+
+
+async def test_litellm_stream_mid_stream_exception_raises_model_provider_error() -> None:
+    """Provider exception during chunk delivery raises ModelProviderError."""
+    from unittest.mock import AsyncMock  # noqa: PLC0415
+
+    # Fake _acompletion returning an async iterable that raises after one chunk.
+    async def _failing_stream() -> Any:
+        yield _make_attr_chunk(content_text="Hello ")
+        msg = "mid-stream network drop"
+        raise RuntimeError(msg)
+
+    mock_acompletion = AsyncMock(return_value=_failing_stream())
+    adapter = LiteLLMModelAdapter("openai/gpt-4.1-mini", _acompletion=mock_acompletion)
+    request = ModelRequest(stage_id="test", messages=(), tools=(), output_schema={})
+
+    # The connection phase succeeds; iteration fails.
+    with pytest.raises(ModelProviderError, match="LiteLLM provider error"):  # type: ignore[reportUnknownMemberType]
+        async for _ in adapter.stream(request):
+            pass
+
+    # Verify _acompletion was still called (connection succeeded).
+    mock_acompletion.assert_called_once()

@@ -3,14 +3,15 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from nemoir_runtime.capabilities import CAPABILITY_CATALOG
 from nemoir_runtime.errors import ModelOutputValidationError, ModelProviderError
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import AsyncIterator, Mapping
 
+    from nemoir_runtime.events import WorkflowEventChannel
     from nemoir_runtime.runtime import StageContext, StageSpec
     from nemoir_runtime.tools import Tool, ToolRegistry
 
@@ -39,6 +40,30 @@ class ModelRequest:
 
 class ModelAdapter(Protocol):
     async def complete(self, request: ModelRequest) -> ModelResponse: ...
+
+
+@dataclass(frozen=True)
+class ModelStreamChunk:
+    kind: Literal["delta", "completed"]
+    channel: WorkflowEventChannel | None = None
+    text: str | None = None
+    response: ModelResponse | None = None
+
+
+class ModelStreamingAdapter(Protocol):
+    """Optional streaming capability on top of ModelAdapter.
+
+    Adapters must implement `ModelAdapter.complete()` to be accepted by
+    `normalize_model` / `ModelStageExecutor`.  `stream()` is additive —
+    when present and a consumer is attached, the executor uses it to emit
+    `model_delta` workflow events live.
+    """
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamChunk]: ...
+
+
+def supports_streaming(adapter: object) -> bool:
+    return callable(getattr(adapter, "stream", None))  # type: ignore[arg-type]
 
 
 @dataclass(frozen=True)
@@ -80,9 +105,39 @@ class LiteLLMModelAdapter:
         self._acompletion = _acompletion
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
+        kwargs = self._completion_kwargs(request, stream=False)
+        acompletion = self._acompletion or _get_litellm_acompletion()
+        try:
+            response = await acompletion(**kwargs)
+        except Exception as e:
+            msg = f"LiteLLM provider error for model '{self.name}': {e}"
+            raise ModelProviderError(msg) from e
+        return _normalize_litellm_response(response, request.stage_id)
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamChunk]:
+        kwargs = self._completion_kwargs(request, stream=True)
+        if "stream_options" not in kwargs:
+            kwargs["stream_options"] = {"include_usage": True}
+        acompletion = self._acompletion or _get_litellm_acompletion()
+        try:
+            response = await acompletion(**kwargs)
+        except Exception as e:
+            msg = f"LiteLLM provider error for model '{self.name}': {e}"
+            raise ModelProviderError(msg) from e
+        try:
+            async for chunk in self._normalize_stream(response, request.stage_id):
+                yield chunk
+        except ModelOutputValidationError:  # validation errors are not provider errors
+            raise
+        except Exception as e:
+            msg = f"LiteLLM provider error for model '{self.name}': {e}"
+            raise ModelProviderError(msg) from e
+
+    def _completion_kwargs(self, request: ModelRequest, *, stream: bool) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "model": self.name,
             "messages": list(request.messages),
+            "stream": stream,
         }
         if request.tools:
             kwargs["tools"] = list(request.tools)
@@ -102,15 +157,102 @@ class LiteLLMModelAdapter:
         if self.max_tokens is not None:
             kwargs["max_tokens"] = self.max_tokens
         kwargs.update(self.extra)
+        return kwargs
 
-        acompletion = self._acompletion or _get_litellm_acompletion()
-        try:
-            response = await acompletion(**kwargs)
-        except Exception as e:
-            msg = f"LiteLLM provider error for model '{self.name}': {e}"
-            raise ModelProviderError(msg) from e
+    @staticmethod
+    def _chunk_field(obj: Any, key: str, default: Any = None) -> Any:
+        """Read a field from an attribute- or mapping-shaped chunk."""
+        if obj is None:
+            return default
+        if isinstance(obj, dict):
+            return obj.get(key, default)  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
+        return getattr(obj, key, default)
 
-        return _normalize_litellm_response(response, request.stage_id)
+    async def _normalize_stream(  # noqa: C901, PLR0912
+        self, response: Any, stage_id: str
+    ) -> AsyncIterator[ModelStreamChunk]:
+        """Normalize a LiteLLM streaming response into ModelStreamChunk values."""
+        content_parts: list[str] = []
+        # Accumulate tool-call deltas indexed by position.
+        tool_call_builders: dict[int, dict[str, Any]] = {}
+
+        async for chunk in response:  # type: ignore[reportUnknownVariableType]
+            try:
+                choices: Any = self._chunk_field(chunk, "choices") or []
+            except (AttributeError, TypeError):
+                continue
+            if not choices:
+                continue
+
+            choice: Any = choices[0]  # type: ignore[reportUnknownVariableType]
+            delta = self._chunk_field(choice, "delta")
+            if delta is None:
+                continue
+
+            # Text delta.
+            #
+            # Note: provider reasoning fields (e.g. delta.reasoning_content in
+            # DeepSeek/Qwen/OpenAI-compatible endpoints) are NOT forwarded here.
+            # Those fields contain full chain-of-thought (hidden/private per
+            # PYTHON_BACKEND_PHASE5_PLAN.md), not a safe public summary. The
+            # `reasoning_summary` WorkflowEventChannel is reserved for future
+            # provider-safe summary fields; custom adapters may still emit it.
+            delta_content = self._chunk_field(delta, "content")
+            if delta_content:
+                content_parts.append(str(delta_content))
+                yield ModelStreamChunk(kind="delta", channel="assistant", text=str(delta_content))
+
+            # Tool-call deltas.
+            raw_tool_calls = self._chunk_field(delta, "tool_calls") or []  # type: ignore[reportUnknownVariableType]
+            for tc_delta in raw_tool_calls:  # type: ignore[reportUnknownVariableType]
+                idx = self._chunk_field(tc_delta, "index", 0)
+                builder = tool_call_builders.setdefault(
+                    idx, {"id": "", "name": "", "arguments": ""}
+                )
+                tc_id = self._chunk_field(tc_delta, "id")
+                if tc_id:
+                    builder["id"] = str(tc_id)
+                func = self._chunk_field(tc_delta, "function")
+                if func is not None:
+                    fn_name = self._chunk_field(func, "name")
+                    if fn_name:
+                        builder["name"] = str(fn_name)
+                    fn_args = self._chunk_field(func, "arguments")
+                    if fn_args:
+                        builder["arguments"] += str(fn_args)
+
+        # Assemble final response.
+        final_content = "".join(content_parts) if content_parts else None
+
+        tool_calls_list: list[ModelToolCall] = []
+        for idx in sorted(tool_call_builders.keys()):
+            builder = tool_call_builders[idx]
+            tc_name = builder["name"]
+            tc_args_str = builder["arguments"]
+            tc_id = builder["id"] or f"call_{idx}"
+            if tc_name:
+                try:
+                    args: Any = json.loads(tc_args_str) if tc_args_str else {}
+                except json.JSONDecodeError as e:
+                    msg = (
+                        f"model returned malformed streamed tool-call arguments "
+                        f"in stage '{stage_id}': {e}"
+                    )
+                    raise ModelOutputValidationError(msg) from e
+                if not isinstance(args, dict):
+                    msg = (
+                        f"streamed tool-call arguments must be an object, got {type(args).__name__}"
+                    )
+                    raise ModelOutputValidationError(msg)
+                tool_calls_list.append(
+                    ModelToolCall(id=tc_id, name=tc_name, arguments=args)  # type: ignore[reportUnknownArgumentType]
+                )
+
+        final_response = ModelResponse(
+            content=final_content,
+            tool_calls=tuple(tool_calls_list),
+        )
+        yield ModelStreamChunk(kind="completed", response=final_response)
 
 
 def _resolve_spec(config: str | Mapping[str, Any] | ModelSpec) -> ModelSpec:
@@ -444,13 +586,16 @@ class ModelStageExecutor:
         self._tools = tools
         self._max_tool_rounds = max_tool_rounds
 
-    async def execute(self, ctx: StageContext) -> dict[str, Any]:
+    async def execute(self, ctx: StageContext) -> dict[str, Any]:  # noqa: C901, PLR0912
         adapter = model_for_stage(self._model, ctx.stage.id)
         output_schema = output_schema_for_stage(ctx.stage)
         stage_tools = self._tools.tools_for_capabilities(ctx.allowed_capabilities)
         tool_schemas = tuple(tool_schema(t) for t in stage_tools)
 
         messages = self._build_initial_messages(ctx, output_schema)
+
+        emitter = ctx.event_emitter
+        use_streaming = emitter is not None and emitter.has_sink and supports_streaming(adapter)
 
         tool_rounds = 0
         while True:
@@ -460,7 +605,16 @@ class ModelStageExecutor:
                 tools=tool_schemas,
                 output_schema=output_schema,
             )
-            response = await adapter.complete(request)
+
+            if use_streaming:
+                response = await self._stream_adapter_response(adapter, request, ctx, emitter)
+            else:
+                response = await adapter.complete(request)
+                if emitter is not None:
+                    await emitter.emit(
+                        "model_completed",
+                        stage_id=ctx.stage.id,
+                    )
 
             if response.tool_calls:
                 if tool_rounds >= self._max_tool_rounds:
@@ -500,6 +654,34 @@ class ModelStageExecutor:
                     )
                     raise ModelOutputValidationError(msg)
                 return normalize_stage_output(ctx.stage, parsed)  # type: ignore[reportUnknownArgumentType]
+
+    @staticmethod
+    async def _stream_adapter_response(
+        adapter: Any,
+        request: ModelRequest,
+        ctx: StageContext,
+        emitter: Any,
+    ) -> ModelResponse:
+        """Consume a streaming adapter and emit workflow events for deltas."""
+        final_response: ModelResponse | None = None
+        async for chunk in adapter.stream(request):
+            if chunk.kind == "delta":
+                await emitter.emit(
+                    "model_delta",
+                    stage_id=ctx.stage.id,
+                    channel=chunk.channel,
+                    text=chunk.text,
+                )
+            elif chunk.kind == "completed":
+                final_response = chunk.response
+                await emitter.emit(
+                    "model_completed",
+                    stage_id=ctx.stage.id,
+                )
+        if final_response is None:
+            msg = f"streaming adapter returned no completed chunk for stage '{ctx.stage.id}'"
+            raise ModelOutputValidationError(msg)
+        return final_response
 
     @staticmethod
     def _build_initial_messages(

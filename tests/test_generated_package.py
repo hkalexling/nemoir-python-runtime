@@ -21,6 +21,7 @@ from typing import Any
 import pytest  # type: ignore[import-untyped]
 
 from nemoir_runtime import Tool, ToolContext, ToolRegistry
+from nemoir_runtime.models import ModelResponse, ModelStreamChunk, ModelToolCall
 
 REPO_ROOT = Path(__file__).parents[3]
 NEMO_BIN = REPO_ROOT / "compiler" / "target" / "debug" / "nemo"
@@ -563,6 +564,235 @@ def test_generated_package_agent_run_policy_gated_tool_calls(tmp_path: Path) -> 
         {"path": "/tmp/changes.txt", "content": "diff"},
     )
     assert len(tool_calls_log) == 4
+
+
+# ------------------------------------------------------------------
+# Phase 5: generated Agent.stream() integration tests
+# ------------------------------------------------------------------
+
+
+class _StreamingFakeAdapter:
+    """Fake adapter with both complete() and stream() for generated-package tests."""
+
+    def __init__(self, stage_responses: dict[str, str] | None = None) -> None:
+        self.calls: list[Any] = []
+        self._responses = stage_responses or {
+            "Triage": '{"summary": "triaged"}',
+            "Plan": '{"plan": "the plan"}',
+            "Propose": '{"ok": true}',
+            "Apply": '{"summary": "applied"}',
+            "Fin": '{"summary": "streaming-done"}',
+        }
+
+    async def complete(self, request: Any) -> ModelResponse:
+        self.calls.append(request)
+        content = self._responses.get(request.stage_id, '{"summary": "ok"}')
+        return ModelResponse(content=content)
+
+    async def stream(self, request: Any) -> Any:
+        self.calls.append(request)
+        content = self._responses.get(request.stage_id, '{"summary": "ok"}')
+        # Emit content as deltas then a completed chunk.
+        words = content.split()
+        for i, word in enumerate(words):
+            text = word if i == 0 else " " + word
+            yield ModelStreamChunk(kind="delta", channel="assistant", text=text)
+        yield ModelStreamChunk(kind="completed", response=ModelResponse(content=content))
+
+
+class _ToolCallStreamingAdapter:
+    """Streaming adapter that returns tool calls for Triage + Apply."""
+
+    def __init__(self) -> None:
+        self.calls: list[Any] = []
+        self._tool_call_made: set[str] = set()
+
+    async def complete(self, request: Any) -> ModelResponse:
+        self.calls.append(request)
+        return self._make_response(request.stage_id)
+
+    async def stream(self, request: Any) -> Any:
+        self.calls.append(request)
+        resp = self._make_response(request.stage_id)
+        # Yield a single completed chunk with the full response.
+        yield ModelStreamChunk(kind="completed", response=resp)
+
+    def _make_response(self, stage_id: str) -> ModelResponse:
+        if stage_id == "Triage" and "Triage" not in self._tool_call_made:
+            self._tool_call_made.add("Triage")
+            return ModelResponse(
+                content=None,
+                tool_calls=(
+                    ModelToolCall(id="call_s1", name="read", arguments={"path": "/tmp/README.md"}),
+                ),
+            )
+        if stage_id == "Apply" and "Apply" not in self._tool_call_made:
+            self._tool_call_made.add("Apply")
+            return ModelResponse(
+                content=None,
+                tool_calls=(
+                    ModelToolCall(
+                        id="call_s2",
+                        name="write_file",
+                        arguments={"path": "/tmp/changes.txt", "content": "diff"},
+                    ),
+                ),
+            )
+        outputs: dict[str, str] = {
+            "Triage": '{"summary": "triaged"}',
+            "Plan": '{"plan": "do the thing"}',
+            "Propose": '{"ok": true}',
+            "Apply": '{"summary": "applied"}',
+            "Fin": '{"summary": "s-done"}',
+        }
+        return ModelResponse(content=outputs.get(stage_id, '{"summary": "ok"}'))
+
+
+def test_generated_package_stream_yields_events(tmp_path: Path) -> None:
+    """Agent.stream() yields lifecycle + model_delta events with typed result."""
+    out_dir = tmp_path / "gen"
+    out_dir.mkdir()
+    _generate_package(out_dir)
+    coding_agent = _import_generated_package(out_dir)
+
+    adapter = _StreamingFakeAdapter()
+    agent = coding_agent.Agent(model=adapter, tools=_make_tools())
+
+    events: list[Any] = []  # WorkflowEvent — dynamic import, typed as Any
+
+    async def collect() -> None:
+        async for event in agent.stream(coding_agent.AgentInput(task="t", cwd=Path("/tmp"))):
+            events.append(event)
+
+    asyncio.run(collect())
+
+    kinds = [e.kind for e in events]
+    assert "run_started" in kinds
+    assert "stage_started" in kinds
+    assert "model_delta" in kinds
+    assert "model_completed" in kinds
+    assert "stage_completed" in kinds
+    assert "run_completed" in kinds
+
+    # Typed run_completed result.
+    rc = [e for e in events if e.kind == "run_completed"]
+    assert len(rc) == 1
+    assert isinstance(rc[0].result, coding_agent.AgentResult)
+    assert isinstance(rc[0].result.output, coding_agent.AgentOutput)
+    assert rc[0].result.output.summary == "streaming-done"
+
+    # At least one model_delta on the assistant channel.
+    deltas = [e for e in events if e.kind == "model_delta"]
+    assert len(deltas) >= 1
+    assistant_deltas = [d for d in deltas if d.channel == "assistant"]
+    assert len(assistant_deltas) >= 1
+
+
+def test_generated_package_stream_policy_required_tool_events(tmp_path: Path) -> None:
+    """Agent.stream() includes policy-required tool events (High-1 regression)."""
+    out_dir = tmp_path / "gen"
+    out_dir.mkdir()
+    _generate_package(out_dir)
+    coding_agent = _import_generated_package(out_dir)
+
+    tool_calls_log: list[tuple[str, dict[str, Any]]] = []
+
+    async def read_recorder(*, path: Path, ctx: ToolContext) -> str:
+        tool_calls_log.append(("fs.read", {"path": str(path)}))
+        return "ok"
+
+    async def write_recorder(*, path: Path, content: str, ctx: ToolContext) -> None:
+        tool_calls_log.append(("fs.write", {"path": str(path), "content": content}))
+
+    async def confirm_recorder(*, message: str, ctx: ToolContext) -> bool:
+        tool_calls_log.append(("user.confirm", {"message": message}))
+        return True
+
+    async def shell_recorder(*, command: str, ctx: ToolContext) -> str:
+        return "ok"
+
+    async def elicit_recorder(*, question: str, ctx: ToolContext) -> str:
+        return "y"
+
+    tools = ToolRegistry(
+        [
+            Tool(
+                name="read",
+                capability="fs.read",
+                description="r",
+                input_schema={"path": Path},
+                handler=read_recorder,
+            ),
+            Tool(
+                name="write_file",
+                capability="fs.write",
+                description="w",
+                input_schema={"path": Path, "content": str},
+                handler=write_recorder,
+            ),
+            Tool(
+                name="confirm",
+                capability="user.confirm",
+                description="c",
+                input_schema={"message": str},
+                handler=confirm_recorder,
+            ),
+            Tool(
+                name="elicit",
+                capability="user.elicit",
+                description="e",
+                input_schema={"question": str},
+                handler=elicit_recorder,
+            ),
+            Tool(
+                name="shell",
+                capability="os.shell",
+                description="s",
+                input_schema={"command": str},
+                handler=shell_recorder,
+            ),
+        ]
+    )
+
+    adapter = _ToolCallStreamingAdapter()
+    agent = coding_agent.Agent(model=adapter, tools=tools)
+
+    events: list[Any] = []  # WorkflowEvent — dynamic import, typed as Any
+
+    async def collect() -> None:
+        async for event in agent.stream(coding_agent.AgentInput(task="t", cwd=Path("/tmp"))):
+            events.append(event)
+
+    asyncio.run(collect())
+
+    # Triage: 1x fs.read (model-requested via tool_calls).
+    # Apply: policy-required chain (fs.read + user.confirm) then fs.write proper.
+    assert len(tool_calls_log) == 4
+    assert tool_calls_log[0] == ("fs.read", {"path": "/tmp/README.md"})
+    assert tool_calls_log[1] == ("fs.read", {"path": "/tmp/changes.txt"})
+    assert tool_calls_log[2][0] == "user.confirm"
+    assert tool_calls_log[3] == (
+        "fs.write",
+        {"path": "/tmp/changes.txt", "content": "diff"},
+    )
+
+    # Check that policy-required tool_call_started events are in the stream.
+    tool_call_started_names = [e.tool_name for e in events if e.kind == "tool_call_started"]
+    # The list should include: read (Triage), read (before-policy),
+    # confirm (before-policy), write_file (Apply).
+    assert tool_call_started_names.count("read") == 2, (
+        f"expected 2 read tool_call_started events "
+        f"(Triage + before-policy), got: {tool_call_started_names}"
+    )
+    assert "confirm" in tool_call_started_names, (
+        f"expected confirm tool_call_started event (before-policy), got: {tool_call_started_names}"
+    )
+    assert "write_file" in tool_call_started_names
+
+    tool_call_completed_names = [e.tool_name for e in events if e.kind == "tool_call_completed"]
+    assert tool_call_completed_names.count("read") == 2
+    assert "confirm" in tool_call_completed_names
+    assert "write_file" in tool_call_completed_names
 
 
 def test_nemo_binary_is_present() -> None:

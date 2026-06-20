@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
@@ -15,10 +18,11 @@ from nemoir_runtime.errors import (
     StageOutputValidationError,
     WorkflowValidationError,
 )
+from nemoir_runtime.events import WorkflowEvent, WorkflowEventEmitter, WorkflowEventSink
 from nemoir_runtime.tools import ToolContext, ToolRegistry
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Mapping
+    from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 
 # ---------------------------------------------------------------------------
 # Manifest dataclasses (mirror Rust IR shape)
@@ -162,6 +166,7 @@ class StageContext:
     allowed_capabilities: frozenset[str]
     options: RunOptions
     call_tool: Callable[[str, Mapping[str, Any]], Awaitable[Any]]
+    event_emitter: WorkflowEventEmitter | None = None
 
 
 class StageExecutor(Protocol):
@@ -228,37 +233,70 @@ class WorkflowRuntime:
         inputs: Mapping[str, Any],
         *,
         options: RunOptions | None = None,
+        event_sink: WorkflowEventSink | None = None,
     ) -> WorkflowResult:
         opts = options if options is not None else RunOptions()
         stage_outputs: dict[str, dict[str, Any]] = {}
         current_id = self._manifest.entry_stage_id
         steps = 0
+        run_id = uuid.uuid4().hex
+        emitter = WorkflowEventEmitter(run_id=run_id, sink=event_sink)
 
-        while True:
-            if steps >= opts.max_steps:
-                msg = f"Workflow '{self._manifest.workflow_id}' exceeded max_steps={opts.max_steps}"
-                raise MaxStepsExceededError(msg)
+        await emitter.emit(
+            "run_started",
+            metadata={"workflow_id": self._manifest.workflow_id, "entry": current_id},
+        )
 
-            stage = self._require_stage(current_id)
-            readable = self._resolve_reads(stage, inputs, stage_outputs)
-            ctx = self._make_stage_context(stage, inputs, readable, opts)
-            raw_output = await self._stage_executor.execute(ctx)
-            self._validate_output(stage, raw_output)
-            stage_outputs[stage.id] = dict(raw_output)
-            steps += 1
+        try:
+            while True:
+                if steps >= opts.max_steps:
+                    msg = (
+                        f"Workflow '{self._manifest.workflow_id}' "
+                        f"exceeded max_steps={opts.max_steps}"
+                    )
+                    raise MaxStepsExceededError(msg)  # noqa: TRY301
 
-            if stage.id in self._exit_ids:
-                return WorkflowResult(
-                    output=raw_output,
-                    state=WorkflowState(
-                        current_stage_id=stage.id,
-                        stage_outputs=dict(stage_outputs),
-                        steps=steps,
-                    ),
+                stage = self._require_stage(current_id)
+                readable = self._resolve_reads(stage, inputs, stage_outputs)
+                ctx = self._make_stage_context(stage, inputs, readable, opts, emitter)
+                await emitter.emit("stage_started", stage_id=stage.id)
+                raw_output = await self._stage_executor.execute(ctx)
+                self._validate_output(stage, raw_output)
+                stage_outputs[stage.id] = dict(raw_output)
+                steps += 1
+                await emitter.emit(
+                    "stage_completed",
+                    stage_id=stage.id,
+                    output=dict(raw_output),
                 )
 
-            next_id = self._select_transition(stage, inputs, stage_outputs)
-            current_id = next_id
+                if stage.id in self._exit_ids:
+                    result = WorkflowResult(
+                        output=raw_output,
+                        state=WorkflowState(
+                            current_stage_id=stage.id,
+                            stage_outputs=dict(stage_outputs),
+                            steps=steps,
+                        ),
+                    )
+                    await emitter.emit("run_completed", result=result)
+                    return result
+
+                selected = self._select_transition(stage, inputs, stage_outputs)
+                await emitter.emit(
+                    "transition_selected",
+                    stage_id=stage.id,
+                    transition_to=selected.to,
+                    metadata={"reason": selected.reason, "priority": selected.priority},
+                )
+                current_id = selected.to
+        except Exception as exc:
+            await emitter.emit(
+                "run_failed",
+                error=str(exc),
+                metadata={"reason": type(exc).__name__},
+            )
+            raise
 
     # ------------------------------------------------------------------
     # Read resolution
@@ -311,11 +349,11 @@ class WorkflowRuntime:
         stage: StageSpec,
         inputs: Mapping[str, Any],
         stage_outputs: Mapping[str, Mapping[str, Any]],
-    ) -> str:
+    ) -> TransitionSpec:
         sorted_transitions = sorted(stage.transitions, key=lambda t: t.priority)
         for trans in sorted_transitions:
             if WorkflowRuntime._evaluate_guard(trans.guard, inputs, stage_outputs):
-                return trans.to
+                return trans
         msg = f"Stage '{stage.id}': no transition matched"
         raise NoTransitionMatchedError(msg)
 
@@ -356,6 +394,7 @@ class WorkflowRuntime:
         inputs: Mapping[str, Any],
         readable: Mapping[str, Any],
         options: RunOptions,
+        emitter: WorkflowEventEmitter,
     ) -> StageContext:
         return StageContext(
             workflow_id=self._manifest.workflow_id,
@@ -364,7 +403,8 @@ class WorkflowRuntime:
             readable_context=readable,
             allowed_capabilities=stage.requires,
             options=options,
-            call_tool=self._make_tool_caller(stage, inputs, options),
+            call_tool=self._make_tool_caller(stage, inputs, options, emitter),
+            event_emitter=emitter,
         )
 
     def _make_tool_caller(
@@ -372,9 +412,10 @@ class WorkflowRuntime:
         stage: StageSpec,
         inputs: Mapping[str, Any],
         run_opts: RunOptions,
+        emitter: WorkflowEventEmitter,
     ) -> Callable[[str, Mapping[str, Any]], Awaitable[Any]]:
         async def call_tool(capability: str, args: Mapping[str, Any]) -> Any:
-            return await self._enforce_and_call(stage, capability, args, inputs, run_opts)
+            return await self._enforce_and_call(stage, capability, args, inputs, run_opts, emitter)
 
         return call_tool
 
@@ -389,12 +430,13 @@ class WorkflowRuntime:
         args: Mapping[str, Any],
         inputs: Mapping[str, Any],
         run_opts: RunOptions,
+        emitter: WorkflowEventEmitter,
     ) -> Any:
         if capability not in stage.requires:
             msg = f"capability '{capability}' is not available in stage '{stage.id}'"
             raise MissingCapabilityError(msg)
         return await self._enforce_and_call_with_policies(
-            capability, args, inputs, stage, allow_before=True, run_opts=run_opts
+            capability, args, inputs, stage, allow_before=True, run_opts=run_opts, emitter=emitter
         )
 
     async def _enforce_policy_call(
@@ -404,12 +446,19 @@ class WorkflowRuntime:
         inputs: Mapping[str, Any],
         stage: StageSpec,
         run_opts: RunOptions,
+        emitter: WorkflowEventEmitter,
     ) -> Any:
         return await self._enforce_and_call_with_policies(
-            capability, args, inputs, stage, allow_before=False, run_opts=run_opts
+            capability,
+            args,
+            inputs,
+            stage,
+            allow_before=False,
+            run_opts=run_opts,
+            emitter=emitter,
         )
 
-    async def _enforce_and_call_with_policies(
+    async def _enforce_and_call_with_policies(  # noqa: C901
         self,
         capability: str,
         args: Mapping[str, Any],
@@ -418,6 +467,7 @@ class WorkflowRuntime:
         *,
         allow_before: bool,
         run_opts: RunOptions,
+        emitter: WorkflowEventEmitter,
     ) -> Any:
         policies = self._policies_by_trigger.get(capability, [])
 
@@ -435,12 +485,40 @@ class WorkflowRuntime:
                         capability=capability,
                     )
                 except DataUnavailableError as e:
+                    await emitter.emit(
+                        "policy_checked",
+                        stage_id=stage.id,
+                        capability=capability,
+                        metadata={
+                            "policy_id": policy.id,
+                            "policy_kind": "deny",
+                            "denied": True,
+                            "error": str(e),
+                        },
+                    )
                     msg = (
                         f"Policy '{policy.id}': condition evaluation failed "
                         f"for capability '{capability}': {e}"
                     )
                     raise PolicyEvaluationError(msg) from e
+                await emitter.emit(
+                    "policy_checked",
+                    stage_id=stage.id,
+                    capability=capability,
+                    metadata={
+                        "policy_id": policy.id,
+                        "policy_kind": "deny",
+                        "denied": denied,
+                    },
+                )
                 if denied:
+                    await emitter.emit(
+                        "policy_denied",
+                        stage_id=stage.id,
+                        capability=capability,
+                        error=f"Policy '{policy.id}' denied capability '{capability}'",
+                        metadata={"policy_id": policy.id},
+                    )
                     msg = f"Policy '{policy.id}' denied capability '{capability}'"
                     raise PolicyDeniedError(msg)
 
@@ -449,6 +527,18 @@ class WorkflowRuntime:
                 bound_args = self._bind_trigger_args(
                     policy.trigger, args, policy_id=policy.id, capability=capability
                 )
+                if emitter.has_sink:
+                    required_caps = [req.capability for req in policy.requires]
+                    await emitter.emit(
+                        "policy_checked",
+                        stage_id=stage.id,
+                        capability=capability,
+                        metadata={
+                            "policy_id": policy.id,
+                            "policy_kind": "before",
+                            "required_capabilities": required_caps,
+                        },
+                    )
                 for req in policy.requires:
                     req_args = self._resolve_required_args(
                         req, inputs, bound_args, policy_id=policy.id, capability=capability
@@ -459,14 +549,32 @@ class WorkflowRuntime:
                         req.capability, req_args, policy_id=policy.id, capability=capability
                     )
                     result = await self._enforce_policy_call(
-                        req.capability, req_args, inputs, stage, run_opts
+                        req.capability, req_args, inputs, stage, run_opts, emitter
                     )
                     if req.capability == "user.confirm" and result is False:
+                        await emitter.emit(
+                            "policy_denied",
+                            stage_id=stage.id,
+                            capability=capability,
+                            error=f"user.confirm returned False for policy '{policy.id}'",
+                            metadata={"policy_id": policy.id},
+                        )
                         msg = (
                             f"Policy '{policy.id}': user.confirm returned False, "
                             f"blocking capability '{capability}'"
                         )
                         raise PolicyDeniedError(msg)
+
+        # Emit tool_call_started before the handler runs.
+        tool_obj = self._tools.get(capability)
+        tool_name = tool_obj.name if tool_obj else capability
+        await emitter.emit(
+            "tool_call_started",
+            stage_id=stage.id,
+            capability=capability,
+            tool_name=tool_name,
+            args=dict(args),
+        )
 
         ctx = ToolContext(
             workflow_id=self._manifest.workflow_id,
@@ -474,7 +582,25 @@ class WorkflowRuntime:
             inputs=inputs,
             metadata=run_opts.metadata,
         )
-        return await self._tools.call(capability, args, ctx)
+        try:
+            result = await self._tools.call(capability, args, ctx)
+        except Exception:
+            await emitter.emit(
+                "tool_call_failed",
+                stage_id=stage.id,
+                capability=capability,
+                tool_name=tool_name,
+                error=str(_active_exception()),
+            )
+            raise
+        await emitter.emit(
+            "tool_call_completed",
+            stage_id=stage.id,
+            capability=capability,
+            tool_name=tool_name,
+            metadata={"result_preview": _safe_result_preview(result)},
+        )
+        return result
 
     @staticmethod
     def _bind_trigger_args(
@@ -534,6 +660,49 @@ class WorkflowRuntime:
                     f"for original capability '{capability}'"
                 )
                 raise PolicyEvaluationError(msg)
+
+    # ------------------------------------------------------------------
+    # Streaming
+    # ------------------------------------------------------------------
+
+    async def stream(
+        self,
+        inputs: Mapping[str, Any],
+        *,
+        options: RunOptions | None = None,
+    ) -> AsyncIterator[WorkflowEvent]:
+        queue: asyncio.Queue[WorkflowEvent | _RunDone] = asyncio.Queue()
+
+        async def sink(event: WorkflowEvent) -> None:
+            await queue.put(event)
+
+        async def run_task() -> None:
+            try:
+                await self.run(inputs, options=options, event_sink=sink)
+            except BaseException as exc:
+                await queue.put(_RunDone(error=exc))
+            else:
+                await queue.put(_RunDone(error=None))
+
+        task = asyncio.create_task(run_task())
+        try:
+            while True:
+                item = await queue.get()
+                if isinstance(item, _RunDone):
+                    if item.error is not None:
+                        raise item.error  # noqa: TRY301
+                    return
+                yield item
+        except (asyncio.CancelledError, GeneratorExit):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            raise
+        except BaseException:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            raise
 
     # ------------------------------------------------------------------
     # Helpers
@@ -764,3 +933,60 @@ def _eval_method_call(
         return False
     msg = f"Unknown method '{method}'"
     raise DataUnavailableError(msg)
+
+
+# ---------------------------------------------------------------------------
+# Streaming helpers (internal)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _RunDone:
+    """Sentinel pushed to the stream queue when a run finishes."""
+
+    error: BaseException | None = None
+
+
+# ---------------------------------------------------------------------------
+# Event helpers (internal)
+# ---------------------------------------------------------------------------
+
+
+def _active_exception() -> str:
+    """Return the current active exception as a string."""
+    import sys  # noqa: PLC0415
+
+    exc = sys.exc_info()[1]
+    if exc is not None:
+        return f"{type(exc).__name__}: {exc}"
+    return "unknown"
+
+
+_RESULT_PREVIEW_MAX_LEN = 200
+
+
+def _safe_result_preview(value: Any) -> str | None:  # noqa: PLR0911
+    """Return a short, safe preview of a tool result for event metadata.
+
+    Large results are truncated to avoid bloating events.
+    """
+    if value is None:
+        return "null"
+    if isinstance(value, str):
+        if len(value) > _RESULT_PREVIEW_MAX_LEN:
+            return value[:_RESULT_PREVIEW_MAX_LEN] + "..."
+        return value
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (list, dict)):
+        import json  # noqa: PLC0415
+
+        s = json.dumps(value, default=str)
+        if len(s) > _RESULT_PREVIEW_MAX_LEN:
+            return s[:_RESULT_PREVIEW_MAX_LEN] + "..."
+        return s
+    return str(type(value).__name__)

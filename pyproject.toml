@@ -46,3 +46,6 @@ ignore = [
     "B017",
     "ANN001",
 ]
+"tests/test_events.py" = ["PERF401"]
+"tests/test_models.py" = ["PERF401"]
+"tests/test_generated_package.py" = ["PERF401"]
