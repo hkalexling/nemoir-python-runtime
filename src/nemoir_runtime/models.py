@@ -32,6 +32,7 @@ class ModelToolCall:
 class ModelResponse:
     content: str | None = None
     tool_calls: tuple[ModelToolCall, ...] = ()
+    reasoning: str | None = None
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,7 @@ class ModelSpec:
     temperature: float | None = None
     max_tokens: int | None = None
     structured_outputs: bool = False
+    reasoning: Literal["none", "raw"] = "none"
     extra: Mapping[str, Any] = field(default_factory=dict)  # type: ignore[reportUnknownVariableType]
 
 
@@ -93,6 +95,7 @@ class LiteLLMModelAdapter:
     temperature: float | None
     max_tokens: int | None
     structured_outputs: bool
+    reasoning: Literal["none", "raw"]
     extra: Mapping[str, Any]
 
     def __init__(
@@ -106,6 +109,7 @@ class LiteLLMModelAdapter:
         self.temperature = self._spec.temperature
         self.max_tokens = self._spec.max_tokens
         self.structured_outputs = self._spec.structured_outputs
+        self.reasoning = self._spec.reasoning
         self.extra = self._spec.extra
         self._acompletion = _acompletion
 
@@ -117,7 +121,10 @@ class LiteLLMModelAdapter:
         except Exception as e:
             msg = f"LiteLLM provider error for model '{self.name}': {e}"
             raise ModelProviderError(msg) from e
-        return _normalize_litellm_response(response, request.stage_id)
+        reasoning_mode = _resolve_reasoning_mode(
+            self.reasoning, request.options.get("reasoning", "none")
+        )
+        return _normalize_litellm_response(response, request.stage_id, reasoning=reasoning_mode)
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamChunk]:
         kwargs = self._completion_kwargs(request, stream=True)
@@ -130,7 +137,14 @@ class LiteLLMModelAdapter:
             msg = f"LiteLLM provider error for model '{self.name}': {e}"
             raise ModelProviderError(msg) from e
         try:
-            async for chunk in self._normalize_stream(response, request.stage_id):
+            async for chunk in self._normalize_stream(
+                response,
+                request.stage_id,
+                reasoning=_resolve_reasoning_mode(
+                    self.reasoning,
+                    request.options.get("reasoning", "none"),
+                ),
+            ):
                 yield chunk
         except ModelOutputValidationError:  # validation errors are not provider errors
             raise
@@ -173,11 +187,12 @@ class LiteLLMModelAdapter:
             return obj.get(key, default)  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
         return getattr(obj, key, default)
 
-    async def _normalize_stream(  # noqa: C901, PLR0912
-        self, response: Any, stage_id: str
+    async def _normalize_stream(  # noqa: C901, PLR0912, PLR0915
+        self, response: Any, stage_id: str, *, reasoning: str = "none"
     ) -> AsyncIterator[ModelStreamChunk]:
         """Normalize a LiteLLM streaming response into ModelStreamChunk values."""
         content_parts: list[str] = []
+        reasoning_parts: list[str] = []
         # Accumulate tool-call deltas indexed by position.
         tool_call_builders: dict[int, dict[str, Any]] = {}
 
@@ -194,14 +209,21 @@ class LiteLLMModelAdapter:
             if delta is None:
                 continue
 
+            # Raw provider reasoning (e.g. delta.reasoning_content in
+            # DeepSeek/Qwen).  LiteLLM also normalises the Cerebras/Groq
+            # ``reasoning`` alias onto ``reasoning_content`` upstream.
+            # Forwarded on the new ``reasoning`` channel only when the
+            # effective mode is ``"raw"`` (opt-in).  Reasoning text is
+            # kept in a separate buffer so it never pollutes the final
+            # structured-output ``ModelResponse.content``.
+            if reasoning == "raw":
+                delta_reasoning = self._chunk_field(delta, "reasoning_content")
+                if delta_reasoning:
+                    reasoning_str = str(delta_reasoning)
+                    reasoning_parts.append(reasoning_str)
+                    yield ModelStreamChunk(kind="delta", channel="reasoning", text=reasoning_str)
+
             # Text delta.
-            #
-            # Note: provider reasoning fields (e.g. delta.reasoning_content in
-            # DeepSeek/Qwen/OpenAI-compatible endpoints) are NOT forwarded here.
-            # Those fields contain full chain-of-thought (hidden/private per
-            # PYTHON_BACKEND_PHASE5_PLAN.md), not a safe public summary. The
-            # `reasoning_summary` WorkflowEventChannel is reserved for future
-            # provider-safe summary fields; custom adapters may still emit it.
             delta_content = self._chunk_field(delta, "content")
             if delta_content:
                 content_parts.append(str(delta_content))
@@ -256,8 +278,27 @@ class LiteLLMModelAdapter:
         final_response = ModelResponse(
             content=final_content,
             tool_calls=tuple(tool_calls_list),
+            reasoning="".join(reasoning_parts) if reasoning_parts else None,
         )
         yield ModelStreamChunk(kind="completed", response=final_response)
+
+
+def _resolve_reasoning_mode(
+    adapter_reasoning: str,
+    override: str,
+) -> str:
+    """Resolve the effective reasoning mode for a LiteLLM request.
+
+    *adapter_reasoning* comes from ``ModelSpec.reasoning`` (stored on the
+    adapter).  *override* comes from ``RunOptions.reasoning`` via
+    ``request.options["reasoning"]``.  The override wins when it is not
+    ``"none"``; otherwise the adapter default is used.
+
+    Returns ``"raw"`` or ``"none"``.
+    """
+    if override and override != "none":
+        return override
+    return adapter_reasoning
 
 
 def _resolve_spec(config: str | Mapping[str, Any] | ModelSpec) -> ModelSpec:
@@ -270,13 +311,25 @@ def _resolve_spec(config: str | Mapping[str, Any] | ModelSpec) -> ModelSpec:
         if not name or not isinstance(name, str):
             msg = "model config mapping must have a string 'name' key"
             raise TypeError(msg)
-        reserved = {"name", "temperature", "max_tokens", "structured_outputs"}
+        reserved = {"name", "temperature", "max_tokens", "structured_outputs", "reasoning"}
         extra = {k: v for k, v in config.items() if k not in reserved}
+
+        reasoning_raw = config.get("reasoning", "none")
+        if reasoning_raw is True or reasoning_raw == "raw":
+            reasoning: Literal["none", "raw"] = "raw"
+        elif reasoning_raw is False or reasoning_raw == "none":
+            reasoning = "none"
+        elif isinstance(reasoning_raw, str):
+            reasoning = reasoning_raw  # type: ignore[assignment]
+        else:
+            reasoning = "none"
+
         return ModelSpec(
             name=name,
             temperature=config.get("temperature"),
             max_tokens=config.get("max_tokens"),
             structured_outputs=config.get("structured_outputs", False),
+            reasoning=reasoning,
             extra=extra,
         )
     msg = f"unsupported model spec type: {type(config).__name__}"
@@ -637,8 +690,18 @@ class ModelStageExecutor:
         self._tools = tools
         self._max_tool_rounds = max_tool_rounds
 
-    async def execute(self, ctx: StageContext) -> dict[str, Any]:  # noqa: C901, PLR0912
+    async def execute(self, ctx: StageContext) -> dict[str, Any]:  # noqa: C901, PLR0912, PLR0915
         adapter = model_for_stage(self._model, ctx.stage.id)
+
+        # Resolve the effective reasoning mode: RunOptions overrides adapter.
+        opts = ctx.options
+        if isinstance(opts, dict):
+            effective_reasoning: str = opts.get("reasoning", "none")  # type: ignore[union-attr]
+        else:
+            effective_reasoning = opts.reasoning
+        if effective_reasoning == "none":
+            effective_reasoning = getattr(adapter, "reasoning", "none")
+
         output_schema = output_schema_for_stage(ctx.stage)
         stage_tools = self._tools.tools_for_capabilities(ctx.allowed_capabilities)
         tool_schemas = tuple(tool_schema(t) for t in stage_tools)
@@ -655,6 +718,7 @@ class ModelStageExecutor:
                 messages=tuple(messages),
                 tools=tool_schemas,
                 output_schema=output_schema,
+                options={"reasoning": effective_reasoning},
             )
 
             if use_streaming:
@@ -796,7 +860,9 @@ class ModelStageExecutor:
 # ---------------------------------------------------------------------------
 
 
-def _normalize_litellm_response(response: Any, stage_id: str) -> ModelResponse:
+def _normalize_litellm_response(  # noqa: C901
+    response: Any, stage_id: str, *, reasoning: str = "none"
+) -> ModelResponse:
     try:
         choice = response.choices[0]
     except (AttributeError, IndexError, TypeError) as e:
@@ -809,6 +875,13 @@ def _normalize_litellm_response(response: Any, stage_id: str) -> ModelResponse:
         raise ModelProviderError(msg)
 
     content: str | None = getattr(message, "content", None)
+
+    # Raw provider reasoning on the non-streaming path.
+    reasoning_text: str | None = None
+    if reasoning == "raw":
+        rc = getattr(message, "reasoning_content", None)
+        if rc and isinstance(rc, str):
+            reasoning_text = rc
 
     tool_calls_list: list[ModelToolCall] = []
     raw_tool_calls = getattr(message, "tool_calls", None) or []  # type: ignore[reportUnknownVariableType]
@@ -841,4 +914,8 @@ def _normalize_litellm_response(response: Any, stage_id: str) -> ModelResponse:
             )
         )
 
-    return ModelResponse(content=content, tool_calls=tuple(tool_calls_list))
+    return ModelResponse(
+        content=content,
+        tool_calls=tuple(tool_calls_list),
+        reasoning=reasoning_text,
+    )

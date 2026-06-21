@@ -80,6 +80,35 @@ The `user.elicit` and `user.confirm` tools use the console and will raise on
 non-interactive environments.  Provide your own tool implementations for such
 deployments.
 
+## Reasoning channel
+
+`WorkflowEventChannel` includes a dedicated `"reasoning"` value for **raw
+provider chain-of-thought** (DeepSeek `delta.reasoning_content`, Qwen, etc.).
+It is distinct from `"reasoning_summary"`, which is reserved for future
+curated public summaries (Anthropic thinking, OpenAI o-series).
+
+Reasoning forwarding is **opt-in** (default off) to preserve the default
+posture of not exposing hidden/private chain-of-thought.  Enable it via
+`ModelSpec.reasoning` or a model config mapping:
+
+```python
+agent = Agent(
+    model={"name": "openai/deepseek-v4-flash", "reasoning": "raw", ...},
+    tools=tools,
+)
+
+async for event in agent.stream(inputs):
+    if event.kind == "model_delta" and event.channel == "reasoning":
+        print(f"[reasoning] {event.text}", end="", flush=True)
+    elif event.kind == "model_delta" and event.channel == "assistant":
+        print(event.text, end="", flush=True)
+```
+
+Or per-run via `RunOptions(reasoning="raw")`.
+
+Reasoning text is **never merged into the final structured-output content**;
+stage output validation is unaffected.
+
 ## Requirements
 
 - Python ≥ 3.11

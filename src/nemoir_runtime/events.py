@@ -31,6 +31,7 @@ WorkflowEventKind = Literal[
 WorkflowEventChannel = Literal[
     "assistant",
     "progress",
+    "reasoning",
     "reasoning_summary",
     "debug",
 ]

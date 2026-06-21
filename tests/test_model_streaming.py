@@ -178,6 +178,36 @@ async def test_streaming_adapter_yields_reasoning_channel() -> None:
     assert deltas[0].text == "I should say hello"
 
 
+async def test_streaming_adapter_yields_reasoning_channel_new() -> None:
+    """Executor forwards 'reasoning' channel deltas as model_delta events."""
+    collected: list[WorkflowEvent] = []
+
+    async def sink(event: WorkflowEvent) -> None:
+        collected.append(event)
+
+    emitter = WorkflowEventEmitter(run_id="r1", sink=sink)
+    ctx = _make_stage_ctx(
+        writes=(WriteSpec(name="summary", type="string", optional=False),),
+        emitter=emitter,
+    )
+
+    adapter = _fake_streaming_adapter(
+        [
+            ModelStreamChunk(kind="delta", channel="reasoning", text="thinking..."),
+            ModelStreamChunk(kind="completed", response=ModelResponse(content='{"summary": "hi"}')),
+        ]
+    )
+    tools = ToolRegistry([])
+    executor = ModelStageExecutor(model=adapter, tools=tools)
+
+    await executor.execute(ctx)
+
+    deltas = [e for e in collected if e.kind == "model_delta"]
+    assert len(deltas) == 1
+    assert deltas[0].channel == "reasoning"
+    assert deltas[0].text == "thinking..."
+
+
 async def test_streaming_adapter_with_tool_calls() -> None:
     collected: list[WorkflowEvent] = []
 

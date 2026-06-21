@@ -925,3 +925,117 @@ def test_generated_package_stream_with_official_tools(tmp_path: Path) -> None:
     assert len(rc) == 1
     assert isinstance(rc[0].result, coding_agent.AgentResult)
     assert rc[0].result.output.summary == "official-stream-done"
+
+
+def test_generated_package_stream_reasoning_channel(tmp_path: Path) -> None:  # noqa: C901
+    """Generated Agent.stream() forwards 'reasoning' channel model_delta events."""
+    out_dir = tmp_path / "gen"
+    out_dir.mkdir()
+    _generate_package(out_dir)
+
+    coding_agent = _import_generated_package(out_dir)
+
+    stage_responses = {
+        "Triage": '{"summary": "triaged"}',
+        "Plan": '{"plan": "do the thing"}',
+        "Propose": '{"ok": true}',
+        "Apply": '{"summary": "applied"}',
+        "Fin": '{"summary": "reasoning-stream-done"}',
+    }
+
+    class StreamingReasoningAdapter:
+        def __init__(self) -> None:
+            self.calls: list[Any] = []
+
+        async def complete(self, request: Any) -> ModelResponse:
+            self.calls.append(request)
+            content = stage_responses.get(request.stage_id, '{"summary": "ok"}')
+            return ModelResponse(content=content)
+
+        async def stream(self, request: Any) -> Any:
+            self.calls.append(request)
+            content = stage_responses.get(request.stage_id, '{"summary": "ok"}')
+            yield ModelStreamChunk(kind="delta", channel="reasoning", text="thinking...")
+            yield ModelStreamChunk(kind="delta", channel="assistant", text=content)
+            yield ModelStreamChunk(kind="completed", response=ModelResponse(content=content))
+
+    adapter = StreamingReasoningAdapter()
+
+    # coding_agent requires several capabilities; provide minimal fake tools.
+    async def fake_elicit(*, question: str, ctx: ToolContext) -> str:
+        return "fake answer"
+
+    async def fake_confirm(*, message: str, ctx: ToolContext) -> bool:
+        return True
+
+    async def fake_read(*, path: Path, ctx: ToolContext) -> str:
+        return "fake content"
+
+    async def fake_write(*, path: Path, content: str, ctx: ToolContext) -> None:
+        return None
+
+    async def fake_shell(*, command: str, ctx: ToolContext) -> str:
+        return "fake output"
+
+    tools = ToolRegistry(
+        [
+            Tool(
+                name="fake_elicit",
+                capability="user.elicit",
+                description="f",
+                input_schema={"question": str},
+                handler=fake_elicit,
+            ),
+            Tool(
+                name="fake_confirm",
+                capability="user.confirm",
+                description="f",
+                input_schema={"message": str},
+                handler=fake_confirm,
+            ),
+            Tool(
+                name="fake_read",
+                capability="fs.read",
+                description="f",
+                input_schema={"path": Path},
+                handler=fake_read,
+            ),
+            Tool(
+                name="fake_write",
+                capability="fs.write",
+                description="f",
+                input_schema={"path": Path, "content": str},
+                handler=fake_write,
+            ),
+            Tool(
+                name="fake_shell",
+                capability="os.shell",
+                description="f",
+                input_schema={"command": str},
+                handler=fake_shell,
+            ),
+        ]
+    )
+    agent = coding_agent.Agent(model=adapter, tools=tools)
+
+    events: list[Any] = []
+
+    async def collect() -> None:
+        async for event in agent.stream(coding_agent.AgentInput(task="t", cwd=Path("/tmp"))):
+            events.append(event)
+
+    asyncio.run(collect())
+
+    deltas = [e for e in events if e.kind == "model_delta"]
+    assert len(deltas) >= 1
+
+    reasoning_deltas = [d for d in deltas if d.channel == "reasoning"]
+    assert len(reasoning_deltas) >= 1
+    assert reasoning_deltas[0].text == "thinking..."
+
+    assistant_deltas = [d for d in deltas if d.channel == "assistant"]
+    assert len(assistant_deltas) >= 1
+
+    rc = [e for e in events if e.kind == "run_completed"]
+    assert len(rc) == 1
+    assert rc[0].result.output.summary == "reasoning-stream-done"

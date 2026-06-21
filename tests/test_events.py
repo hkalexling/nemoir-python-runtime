@@ -892,3 +892,24 @@ async def test_stream_tool_handler_exception_emits_tool_call_failed() -> None:
     rf = [e for e in events if e.kind == "run_failed"]
     assert len(rf) == 1
     assert "disk full" in (rf[0].error or "")
+
+
+async def test_workflow_event_channel_includes_reasoning() -> None:
+    """The ``reasoning`` channel value is a valid WorkflowEventChannel."""
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    from nemoir_runtime.events import WorkflowEventChannel  # noqa: PLC0415
+
+    # Confirm the literal value is declared.
+    assert "reasoning" in WorkflowEventChannel.__args__  # type: ignore[attr-defined]
+
+    event = WorkflowEvent(
+        kind="model_delta",
+        run_id="r1",
+        sequence=1,
+        timestamp=datetime(2025, 1, 1, tzinfo=UTC),
+        channel="reasoning",
+        text="thinking...",
+    )
+    assert event.channel == "reasoning"
+    assert event.text == "thinking..."

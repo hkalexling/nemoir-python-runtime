@@ -137,6 +137,7 @@ class RunOptions:
     # Accepted but not enforced in Phase 2. Only max_steps is enforced.
     timeout_s: float | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)  # type: ignore[reportUnknownVariableType]
+    reasoning: Literal["none", "raw"] = "none"
 
 
 @dataclass(frozen=True)

@@ -15,6 +15,8 @@ from nemoir_runtime.models import (
     ModelRouter,
     ModelSpec,
     ModelToolCall,
+    _normalize_litellm_response,  # type: ignore[reportPrivateUsage]
+    _resolve_spec,  # type: ignore[reportPrivateUsage]
     model_for_stage,
     normalize_model,
     normalize_stage_output,
@@ -1095,3 +1097,204 @@ def test_manual_tool_required_extra_param_enforced_in_normalize() -> None:
     # All three present succeeds.
     result = normalize_tool_args(t, {"path": "/tmp", "content": "old", "new_content": "new"})
     assert result["new_content"] == "new"
+
+
+# ------------------------------------------------------------------
+# Reasoning streaming tests
+# ------------------------------------------------------------------
+
+
+def _make_reasoning_chunk(
+    content_text: str | None = None,
+    reasoning_text: str | None = None,
+) -> Any:
+    """Create an attribute-shaped chunk carrying reasoning_content."""
+    delta_kwargs: dict[str, Any] = {}
+    if content_text is not None:
+        delta_kwargs["content"] = content_text
+    if reasoning_text is not None:
+        delta_kwargs["reasoning_content"] = reasoning_text
+    delta = type("Delta", (), delta_kwargs)()
+    choice = type("Choice", (), {"delta": delta})()
+    return type("Chunk", (), {"choices": [choice]})()
+
+
+def _make_reasoning_dict_chunk(
+    content_text: str | None = None,
+    reasoning_text: str | None = None,
+) -> dict[str, Any]:
+    """Create a dict-shaped chunk carrying reasoning_content."""
+    delta: dict[str, Any] = {}
+    if content_text is not None:
+        delta["content"] = content_text
+    if reasoning_text is not None:
+        delta["reasoning_content"] = reasoning_text
+    return {"choices": [{"delta": delta}]}
+
+
+async def test_litellm_normalize_stream_reasoning_content_raw_mode() -> None:
+    """With reasoning='raw', reasoning_content deltas are forwarded on the
+    'reasoning' channel and never merged into the final content."""
+    adapter = LiteLLMModelAdapter("openai/deepseek-v4-flash")
+    response = _aiter(
+        [
+            _make_reasoning_chunk(reasoning_text="I should say hello"),
+            _make_reasoning_chunk(reasoning_text=" and be polite"),
+            _make_reasoning_chunk(content_text='{"summary": "hi"}'),
+        ]
+    )
+
+    chunks: list[Any] = []
+    async for chunk in adapter._normalize_stream(  # type: ignore[reportPrivateUsage]  # noqa: SLF001
+        response, "test", reasoning="raw"
+    ):
+        chunks.append(chunk)
+
+    deltas = [c for c in chunks if c.kind == "delta"]
+    assert len(deltas) == 3
+
+    reasoning_deltas = [d for d in deltas if d.channel == "reasoning"]
+    assert len(reasoning_deltas) == 2
+    assert reasoning_deltas[0].text == "I should say hello"
+    assert reasoning_deltas[1].text == " and be polite"
+
+    assistant_deltas = [d for d in deltas if d.channel == "assistant"]
+    assert len(assistant_deltas) == 1
+    assert assistant_deltas[0].text == '{"summary": "hi"}'
+
+    completed = [c for c in chunks if c.kind == "completed"]
+    assert len(completed) == 1
+    resp = completed[0].response
+    assert resp is not None
+    # Reasoning must not pollute the final content.
+    assert resp.content == '{"summary": "hi"}'
+    # Reasoning is captured on the response for non-streaming parity.
+    assert resp.reasoning == "I should say hello and be polite"
+
+
+async def test_litellm_normalize_stream_reasoning_content_none_mode() -> None:
+    """With reasoning='none' (default), reasoning_content is silently discarded."""
+    adapter = LiteLLMModelAdapter("openai/deepseek-v4-flash")
+    response = _aiter(
+        [
+            _make_reasoning_chunk(reasoning_text="hidden thoughts"),
+            _make_reasoning_chunk(content_text='{"summary": "ok"}'),
+        ]
+    )
+
+    chunks: list[Any] = []
+    async for chunk in adapter._normalize_stream(  # type: ignore[reportPrivateUsage]  # noqa: SLF001
+        response, "test", reasoning="none"
+    ):
+        chunks.append(chunk)
+
+    deltas = [c for c in chunks if c.kind == "delta"]
+    reasoning_deltas = [d for d in deltas if d.channel == "reasoning"]
+    assert len(reasoning_deltas) == 0
+
+    assistant_deltas = [d for d in deltas if d.channel == "assistant"]
+    assert len(assistant_deltas) == 1
+    assert assistant_deltas[0].text == '{"summary": "ok"}'
+
+    completed = [c for c in chunks if c.kind == "completed"]
+    assert len(completed) == 1
+    assert completed[0].response is not None
+    assert completed[0].response.content == '{"summary": "ok"}'
+    assert completed[0].response.reasoning is None
+
+
+async def test_litellm_normalize_stream_reasoning_dict_shaped() -> None:
+    """Dict-shaped chunks with reasoning_content work like attribute-shaped."""
+    adapter = LiteLLMModelAdapter("openai/deepseek-v4-flash")
+    response = _aiter(
+        [
+            _make_reasoning_dict_chunk(reasoning_text="thinking..."),
+            _make_reasoning_dict_chunk(content_text='{"result": 1}'),
+        ]
+    )
+
+    chunks: list[Any] = []
+    async for chunk in adapter._normalize_stream(  # type: ignore[reportPrivateUsage]  # noqa: SLF001
+        response, "test", reasoning="raw"
+    ):
+        chunks.append(chunk)
+
+    reasoning_deltas = [c for c in chunks if c.kind == "delta" and c.channel == "reasoning"]
+    assert len(reasoning_deltas) == 1
+    assert reasoning_deltas[0].text == "thinking..."
+
+    completed = [c for c in chunks if c.kind == "completed"]
+    assert completed[0].response is not None
+    assert completed[0].response.reasoning == "thinking..."
+
+
+async def test_litellm_normalize_litellm_response_reasoning_raw() -> None:
+    """Non-streaming: with reasoning='raw', message.reasoning_content is captured."""
+
+    # Build a fake LiteLLM response object with message.reasoning_content.
+    msg = type(
+        "Msg",
+        (),
+        {
+            "content": '{"answer": 42}',
+            "reasoning_content": "Let me think about this.",
+        },
+    )()
+    choice = type("Choice", (), {"message": msg})()
+    response = type("Response", (), {"choices": [choice]})()
+
+    result = _normalize_litellm_response(response, "test", reasoning="raw")
+    assert result.content == '{"answer": 42}'
+    assert result.reasoning == "Let me think about this."
+
+
+async def test_litellm_normalize_litellm_response_reasoning_none() -> None:
+    """Non-streaming: with reasoning='none', reasoning_content is ignored."""
+
+    msg = type(
+        "Msg",
+        (),
+        {
+            "content": '{"answer": 42}',
+            "reasoning_content": "Should be hidden.",
+        },
+    )()
+    choice = type("Choice", (), {"message": msg})()
+    response = type("Response", (), {"choices": [choice]})()
+
+    result = _normalize_litellm_response(response, "test", reasoning="none")
+    assert result.content == '{"answer": 42}'
+    assert result.reasoning is None
+
+
+def test_model_spec_resolve_reasoning_from_mapping() -> None:
+    """_resolve_spec accepts reasoning='raw', reasoning=True, reasoning=False."""
+
+    # String "raw"
+    spec = _resolve_spec({"name": "x", "reasoning": "raw"})
+    assert spec.reasoning == "raw"
+
+    # True bool → "raw"
+    spec = _resolve_spec({"name": "x", "reasoning": True})
+    assert spec.reasoning == "raw"
+
+    # False bool → "none"
+    spec = _resolve_spec({"name": "x", "reasoning": False})
+    assert spec.reasoning == "none"
+
+    # Absent → default "none"
+    spec = _resolve_spec({"name": "x"})
+    assert spec.reasoning == "none"
+
+    # "reasoning" is reserved and not leaked into extra.
+    spec = _resolve_spec({"name": "x", "reasoning": "raw", "temperature": 0.3})
+    assert spec.reasoning == "raw"
+    assert "reasoning" not in spec.extra
+    # temperature should still be consumed, not in extra either.
+    assert "temperature" not in spec.extra
+
+
+def test_model_spec_reasoning_default() -> None:
+    """ModelSpec default is 'none'."""
+    s = ModelSpec(name="x")
+    assert s.reasoning == "none"
