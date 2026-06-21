@@ -24,7 +24,7 @@ from nemoir_runtime.models import (
     tool_schema,
 )
 from nemoir_runtime.runtime import StageSpec, WriteSpec
-from nemoir_runtime.tools import Tool
+from nemoir_runtime.tools import Tool, ToolContext
 
 
 class FakeAdapter:
@@ -1047,3 +1047,51 @@ async def test_litellm_stream_mid_stream_exception_raises_model_provider_error()
 
     # Verify _acompletion was still called (connection succeeded).
     mock_acompletion.assert_called_once()
+
+
+# ------------------------------------------------------------------
+# Medium-1 regression: manual Tool with tool-specific required parameter
+# ------------------------------------------------------------------
+
+
+def test_manual_tool_required_extra_param_in_schema() -> None:
+    """Manual Tool with tool-specific required param surfaces it in required set."""
+
+    async def handler(*, path: Path, content: str, new_content: str, ctx: ToolContext) -> None:
+        pass
+
+    t = Tool(
+        name="edit",
+        capability="fs.write",
+        description="edit",
+        input_schema={"path": Path, "content": str, "new_content": str},
+        handler=handler,
+    )
+    schema = tool_schema(t)
+    required = schema["function"]["parameters"]["required"]
+    assert "path" in required
+    assert "content" in required
+    assert "new_content" in required, (
+        f"tool-specific required param 'new_content' missing from required={required}"
+    )
+
+
+def test_manual_tool_required_extra_param_enforced_in_normalize() -> None:
+    """normalize_tool_args rejects omission of tool-specific required param."""
+
+    async def handler(*, path: Path, content: str, new_content: str, ctx: ToolContext) -> None:
+        pass
+
+    t = Tool(
+        name="edit",
+        capability="fs.write",
+        description="edit",
+        input_schema={"path": Path, "content": str, "new_content": str},
+        handler=handler,
+    )
+    # Missing new_content raises.
+    with pytest.raises(ModelOutputValidationError, match="missing required"):  # type: ignore[reportUnknownMemberType]
+        normalize_tool_args(t, {"path": "/tmp", "content": "old"})
+    # All three present succeeds.
+    result = normalize_tool_args(t, {"path": "/tmp", "content": "old", "new_content": "new"})
+    assert result["new_content"] == "new"

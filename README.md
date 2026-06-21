@@ -45,6 +45,41 @@ print(result.output)
 
 See the [NemoIR project](https://github.com/nemoir) for the full compiler workflow (DSL → IR → generated package).
 
+## Official tools
+
+`nemoir-runtime` ships with official, importable `Tool` implementations for every
+capability in the catalog.  Import exactly the tools you need:
+
+```python
+from nemoir_runtime import ToolRegistry
+from nemoir_runtime.official_tools import (
+    ask_user,
+    confirm_user,
+    edit_file,
+    read_file,
+    run_shell,
+    write_file,
+)
+
+tools = ToolRegistry([read_file, write_file, edit_file, run_shell, ask_user, confirm_user])
+```
+
+Pick a subset if you don't need every capability:
+
+```python
+tools = ToolRegistry([read_file, edit_file, run_shell])
+```
+
+### Policy boundary
+
+Official tools validate inputs and perform the operation.  They do **not** enforce
+workflow policy — path containment, write confirmation, shell allowlists, and
+similar authorization remain owned by NemoIR policies.
+
+The `user.elicit` and `user.confirm` tools use the console and will raise on
+non-interactive environments.  Provide your own tool implementations for such
+deployments.
+
 ## Requirements
 
 - Python ≥ 3.11

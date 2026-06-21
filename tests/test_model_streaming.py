@@ -188,7 +188,9 @@ async def test_streaming_adapter_with_tool_calls() -> None:
 
     tool_calls_log: list[tuple[str, dict[str, Any]]] = []
 
-    async def call_tool(capability: str, args: dict[str, Any]) -> str:
+    async def call_tool(
+        capability: str, args: dict[str, Any], *, tool_name: str | None = None
+    ) -> str:
         tool_calls_log.append((capability, args))
         return "ok"
 

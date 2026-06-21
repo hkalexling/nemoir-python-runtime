@@ -802,3 +802,126 @@ def test_nemo_binary_is_present() -> None:
         f"expected `nemo` binary at {NEMO_BIN}; run `cargo build` in compiler/ first"
     )
     assert shutil.which("python3") is not None, "python3 not found on PATH"
+
+
+# ------------------------------------------------------------------
+# Plan Medium-Tests-1: official tools wired through generated package
+# ------------------------------------------------------------------
+
+
+def test_generated_package_run_with_official_tools(tmp_path: Path) -> None:
+    """Generated Agent.run() succeeds with all six official tools registered."""
+    out_dir = tmp_path / "gen"
+    out_dir.mkdir()
+    _generate_package(out_dir)
+
+    coding_agent = _import_generated_package(out_dir)
+
+    from nemoir_runtime.official_tools import (  # noqa: PLC0415
+        ask_user,
+        confirm_user,
+        edit_file,
+        read_file,
+        run_shell,
+        write_file,
+    )
+
+    official_tools = ToolRegistry(
+        [read_file, write_file, edit_file, run_shell, ask_user, confirm_user]
+    )
+
+    class StageAwareAdapter:
+        def __init__(self) -> None:
+            self.calls: list[Any] = []
+
+        def _output_for(self, stage_id: str) -> str:
+            outputs: dict[str, str] = {
+                "Triage": '{"summary": "triaged"}',
+                "Plan": '{"plan": "do the thing"}',
+                "Propose": '{"ok": true}',
+                "Apply": '{"summary": "applied"}',
+                "Fin": '{"summary": "official-tools-done"}',
+            }
+            return outputs.get(stage_id, '{"summary": "ok"}')
+
+        async def complete(self, request: Any) -> ModelResponse:
+            self.calls.append(request)
+            return ModelResponse(content=self._output_for(request.stage_id))
+
+    fake = StageAwareAdapter()
+    agent = coding_agent.Agent(model=fake, tools=official_tools)
+    result = asyncio.run(agent.run(coding_agent.AgentInput(task="t", cwd=Path("/tmp"))))
+    assert isinstance(result, coding_agent.AgentResult)
+    assert isinstance(result.output, coding_agent.AgentOutput)
+    assert result.output.summary == "official-tools-done"
+    # Happy path: Triage → Plan → Propose → Apply → Fin (5 stages).
+    assert len(fake.calls) == 5
+
+
+def test_generated_package_stream_with_official_tools(tmp_path: Path) -> None:
+    """Agent.stream() yields events with official tools in registry."""
+    out_dir = tmp_path / "gen"
+    out_dir.mkdir()
+    _generate_package(out_dir)
+
+    coding_agent = _import_generated_package(out_dir)
+
+    from nemoir_runtime.official_tools import (  # noqa: PLC0415
+        ask_user,
+        confirm_user,
+        edit_file,
+        read_file,
+        run_shell,
+        write_file,
+    )
+
+    official_tools = ToolRegistry(
+        [read_file, write_file, edit_file, run_shell, ask_user, confirm_user]
+    )
+
+    stage_responses = {
+        "Triage": '{"summary": "triaged"}',
+        "Plan": '{"plan": "do the thing"}',
+        "Propose": '{"ok": true}',
+        "Apply": '{"summary": "applied"}',
+        "Fin": '{"summary": "official-stream-done"}',
+    }
+
+    class StreamingAdapter:
+        def __init__(self) -> None:
+            self.calls: list[Any] = []
+
+        async def complete(self, request: Any) -> ModelResponse:
+            self.calls.append(request)
+            content = stage_responses.get(request.stage_id, '{"summary": "ok"}')
+            return ModelResponse(content=content)
+
+        async def stream(self, request: Any) -> Any:
+            self.calls.append(request)
+            content = stage_responses.get(request.stage_id, '{"summary": "ok"}')
+            yield ModelStreamChunk(kind="delta", channel="assistant", text=content)
+            yield ModelStreamChunk(kind="completed", response=ModelResponse(content=content))
+
+    adapter = StreamingAdapter()
+    agent = coding_agent.Agent(model=adapter, tools=official_tools)
+
+    events: list[Any] = []
+
+    async def collect() -> None:
+        async for event in agent.stream(coding_agent.AgentInput(task="t", cwd=Path("/tmp"))):
+            events.append(event)
+
+    asyncio.run(collect())
+
+    kinds = [e.kind for e in events]
+    assert "run_started" in kinds
+    assert "stage_started" in kinds
+    assert "model_delta" in kinds
+    assert "model_completed" in kinds
+    assert "stage_completed" in kinds
+    assert "run_completed" in kinds
+
+    rc = [e for e in events if e.kind == "run_completed"]
+    assert len(rc) == 1
+    assert isinstance(rc[0].result, coding_agent.AgentResult)
+    assert rc[0].result.output.summary == "official-stream-done"

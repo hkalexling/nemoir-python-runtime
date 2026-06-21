@@ -811,3 +811,282 @@ async def test_before_required_call_missing_catalog_args_raises() -> None:
     with pytest.raises(PolicyEvaluationError, match="missing catalog-required argument"):  # type: ignore[reportUnknownMemberType]
         await runtime.run({"task": "test"})
     assert not calls  # No handlers run
+
+
+# ------------------------------------------------------------------
+# Plan Medium-Tests-1: policy applies to both write_file and edit_file
+# ------------------------------------------------------------------
+
+
+async def test_before_policy_triggers_for_both_write_file_and_edit_file(
+    tmp_path: Path,
+) -> None:
+    """before fs.write(path) requires fs.read(path), user.confirm
+    triggers before both official write_file and edit_file."""
+    from nemoir_runtime.official_tools import edit_file, write_file  # noqa: PLC0415
+
+    policy_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def read_stub(*, path: Path, ctx: ToolContext) -> str:
+        policy_calls.append(("fs.read", {"path": str(path)}))
+        return "ok"
+
+    async def confirm_stub(*, message: str, ctx: ToolContext) -> bool:
+        policy_calls.append(("user.confirm", {"message": message}))
+        return True
+
+    read_tool = Tool(
+        name="read_file",
+        capability="fs.read",
+        description="r",
+        input_schema={"path": Path},
+        handler=read_stub,
+    )
+    confirm_tool = Tool(
+        name="confirm",
+        capability="user.confirm",
+        description="c",
+        input_schema={"message": str},
+        handler=confirm_stub,
+    )
+    registry = ToolRegistry([read_tool, write_file, edit_file, confirm_tool])
+
+    before_policy = PolicySpec(
+        id="before fs.write(path) requires fs.read(path), user.confirm",
+        kind="before",
+        trigger=TriggerSpec(capability="fs.write", bind={"path": "path"}),
+        requires=(
+            RequiredCapabilitySpec(
+                capability="fs.read",
+                args={"path": RefSpec(kind="bound", name="path")},
+            ),
+            RequiredCapabilitySpec(capability="user.confirm", args={}),
+        ),
+    )
+    stages = (
+        StageSpec(
+            id="A",
+            prompt="A",
+            reads=(),
+            writes=(WriteSpec(name="out_a", type="string", optional=False),),
+            requires=frozenset({"fs.write"}),
+            transitions=(),
+        ),
+    )
+    manifest = WorkflowManifest(
+        workflow_id="Test",
+        entry_stage_id="A",
+        exit_stage_ids=frozenset({"A"}),
+        inputs=(InputSpec(name="cwd", type="path"),),
+        capabilities=frozenset({"fs.read", "fs.write", "user.confirm"}),
+        policies=(before_policy,),
+        stages=stages,
+    )
+
+    # First: call write_file via tool_name (write_file creates the file).
+    target = tmp_path / "f.txt"
+
+    class CallWriteFile:
+        async def execute(self, ctx: StageContext) -> Mapping[str, object]:
+            await ctx.call_tool(
+                "fs.write",
+                {"path": target, "content": "hello"},
+                tool_name="write_file",
+            )
+            return {"out_a": "done"}
+
+    runtime = WorkflowRuntime(manifest=manifest, tools=registry, stage_executor=CallWriteFile())
+    await runtime.run({"cwd": str(tmp_path)})
+
+    # write_file: before-policy fs.read + user.confirm, then handler.
+    assert policy_calls[0] == ("fs.read", {"path": str(target)})
+    assert policy_calls[1][0] == "user.confirm"
+    assert target.read_text() == "hello"
+
+    # Now: call edit_file via tool_name.
+    target.write_text("hello old end")
+    policy_calls.clear()
+
+    class CallEditFile:
+        async def execute(self, ctx: StageContext) -> Mapping[str, object]:
+            await ctx.call_tool(
+                "fs.write",
+                {
+                    "path": target,
+                    "content": "old",
+                    "new_content": "new",
+                },
+                tool_name="edit_file",
+            )
+            return {"out_a": "done"}
+
+    runtime2 = WorkflowRuntime(manifest=manifest, tools=registry, stage_executor=CallEditFile())
+    await runtime2.run({"cwd": str(tmp_path)})
+
+    # edit_file: before-policy fs.read + user.confirm, then handler.
+    assert policy_calls[0] == ("fs.read", {"path": str(target)})
+    assert policy_calls[1][0] == "user.confirm"
+    assert target.read_text() == "hello new end"
+
+
+async def test_deny_policy_denies_edit_file_outside_cwd(tmp_path: Path) -> None:
+    """deny fs.write(path) if not cwd.contains(path) denies edit_file."""
+    from nemoir_runtime.official_tools import edit_file, write_file  # noqa: PLC0415
+
+    async def read_stub(*, path: Path, ctx: ToolContext) -> str:
+        return "ok"
+
+    read_tool = Tool(
+        name="read_file",
+        capability="fs.read",
+        description="r",
+        input_schema={"path": Path},
+        handler=read_stub,
+    )
+    registry = ToolRegistry([read_tool, write_file, edit_file])
+
+    deny_policy = PolicySpec(
+        id="deny fs.write(path) if not cwd.contains(path)",
+        kind="deny",
+        trigger=TriggerSpec(capability="fs.write", bind={"path": "path"}),
+        condition=ExprSpec(
+            kind="not",
+            expr=ExprSpec(
+                kind="method_call",
+                receiver=ExprSpec(kind="ref", ref=RefSpec(kind="input", name="cwd")),
+                method="contains",
+                args=(ExprSpec(kind="ref", ref=RefSpec(kind="bound", name="path")),),
+            ),
+        ),
+    )
+    stages = (
+        StageSpec(
+            id="A",
+            prompt="A",
+            reads=(),
+            writes=(WriteSpec(name="out_a", type="string", optional=False),),
+            requires=frozenset({"fs.write"}),
+            transitions=(),
+        ),
+    )
+    manifest = WorkflowManifest(
+        workflow_id="Test",
+        entry_stage_id="A",
+        exit_stage_ids=frozenset({"A"}),
+        inputs=(
+            InputSpec(name="task", type="string"),
+            InputSpec(name="cwd", type="path"),
+        ),
+        capabilities=frozenset({"fs.read", "fs.write"}),
+        policies=(deny_policy,),
+        stages=stages,
+    )
+
+    class CallEditFileOutside:
+        async def execute(self, ctx: StageContext) -> Mapping[str, object]:
+            await ctx.call_tool(
+                "fs.write",
+                {
+                    "path": Path("/etc/passwd"),
+                    "content": "old",
+                    "new_content": "new",
+                },
+                tool_name="edit_file",
+            )
+            return {"out_a": "never"}
+
+    runtime = WorkflowRuntime(
+        manifest=manifest,
+        tools=registry,
+        stage_executor=CallEditFileOutside(),
+    )
+    with pytest.raises(PolicyDeniedError, match="denied"):  # type: ignore[reportUnknownMemberType]
+        await runtime.run({"task": "t", "cwd": Path("/tmp/work")})
+
+
+async def test_confirm_false_blocks_both_write_tools(tmp_path: Path) -> None:
+    """user.confirm=False blocks both write_file and edit_file via before."""
+    from nemoir_runtime.official_tools import edit_file, write_file  # noqa: PLC0415
+
+    async def read_stub(*, path: Path, ctx: ToolContext) -> str:
+        return "ok"
+
+    async def confirm_false(*, message: str, ctx: ToolContext) -> bool:
+        return False
+
+    read_tool = Tool(
+        name="read_file",
+        capability="fs.read",
+        description="r",
+        input_schema={"path": Path},
+        handler=read_stub,
+    )
+    confirm_tool = Tool(
+        name="confirm",
+        capability="user.confirm",
+        description="c",
+        input_schema={"message": str},
+        handler=confirm_false,
+    )
+    registry = ToolRegistry([read_tool, write_file, edit_file, confirm_tool])
+
+    before_policy = PolicySpec(
+        id="before fs.write requires user.confirm",
+        kind="before",
+        trigger=TriggerSpec(capability="fs.write", bind={"path": "path"}),
+        requires=(RequiredCapabilitySpec(capability="user.confirm", args={}),),
+    )
+    stages = (
+        StageSpec(
+            id="A",
+            prompt="A",
+            reads=(),
+            writes=(WriteSpec(name="out_a", type="string", optional=False),),
+            requires=frozenset({"fs.write"}),
+            transitions=(),
+        ),
+    )
+    manifest = WorkflowManifest(
+        workflow_id="Test",
+        entry_stage_id="A",
+        exit_stage_ids=frozenset({"A"}),
+        inputs=(InputSpec(name="cwd", type="path"),),
+        capabilities=frozenset({"fs.read", "fs.write", "user.confirm"}),
+        policies=(before_policy,),
+        stages=stages,
+    )
+
+    # Block write_file.
+    class CallWriteFile:
+        async def execute(self, ctx: StageContext) -> Mapping[str, object]:
+            target = tmp_path / "w.txt"
+            await ctx.call_tool(
+                "fs.write",
+                {"path": target, "content": "x"},
+                tool_name="write_file",
+            )
+            return {"out_a": "never"}
+
+    runtime = WorkflowRuntime(manifest=manifest, tools=registry, stage_executor=CallWriteFile())
+    with pytest.raises(PolicyDeniedError, match=r"user\.confirm returned False"):  # type: ignore[reportUnknownMemberType]
+        await runtime.run({"cwd": str(tmp_path)})
+
+    # Block edit_file.
+    class CallEditFile:
+        async def execute(self, ctx: StageContext) -> Mapping[str, object]:
+            target = tmp_path / "e.txt"
+            target.write_text("hello old world")
+            await ctx.call_tool(
+                "fs.write",
+                {
+                    "path": target,
+                    "content": "old",
+                    "new_content": "new",
+                },
+                tool_name="edit_file",
+            )
+            return {"out_a": "never"}
+
+    runtime2 = WorkflowRuntime(manifest=manifest, tools=registry, stage_executor=CallEditFile())
+    with pytest.raises(PolicyDeniedError, match=r"user\.confirm returned False"):  # type: ignore[reportUnknownMemberType]
+        await runtime2.run({"cwd": str(tmp_path)})

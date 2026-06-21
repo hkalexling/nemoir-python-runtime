@@ -52,7 +52,9 @@ def _make_stage_ctx(
 ) -> StageContext:
     tool_calls = tool_calls or []
 
-    async def call_tool(capability: str, args: dict[str, Any]) -> str:
+    async def call_tool(
+        capability: str, args: dict[str, Any], *, tool_name: str | None = None
+    ) -> str:
         tool_calls.append((capability, args))
         return f"result-for-{capability}"
 
@@ -216,7 +218,9 @@ async def test_tool_call_single_then_content() -> None:
     writes = (WriteSpec(name="summary", type="string", optional=False),)
     tool_calls_log: list[tuple[str, dict[str, Any]]] = []
 
-    async def call_tool(capability: str, args: dict[str, Any]) -> str:
+    async def call_tool(
+        capability: str, args: dict[str, Any], *, tool_name: str | None = None
+    ) -> str:
         tool_calls_log.append((capability, args))
         return "ok"
 
@@ -265,7 +269,9 @@ async def test_tool_call_path_arg_coerced() -> None:
     writes = (WriteSpec(name="summary", type="string", optional=False),)
     tool_calls_log: list[tuple[str, dict[str, Any]]] = []
 
-    async def call_tool(capability: str, args: dict[str, Any]) -> str:
+    async def call_tool(
+        capability: str, args: dict[str, Any], *, tool_name: str | None = None
+    ) -> str:
         tool_calls_log.append((capability, args))
         assert isinstance(args["path"], Path)
         return "ok"
@@ -476,7 +482,9 @@ async def test_one_tool_round_then_output_succeeds_with_max_tool_rounds_1() -> N
     writes = (WriteSpec(name="summary", type="string", optional=False),)
     tool_calls_log: list[tuple[str, dict[str, Any]]] = []
 
-    async def call_tool(capability: str, args: dict[str, Any]) -> str:
+    async def call_tool(
+        capability: str, args: dict[str, Any], *, tool_name: str | None = None
+    ) -> str:
         tool_calls_log.append((capability, args))
         return "ok"
 
@@ -529,3 +537,120 @@ async def test_two_tool_rounds_fail_with_max_tool_rounds_1() -> None:
     )
     with pytest.raises(ModelOutputValidationError, match="exceeded max_tool_rounds"):  # type: ignore[reportUnknownMemberType]
         await executor.execute(ctx)
+
+
+# ------------------------------------------------------------------
+# Multi-fs.write routing + policy (plan Medium-Tests-1)
+# ------------------------------------------------------------------
+
+
+async def test_model_executor_routes_edit_file_through_fs_write_policy(
+    tmp_path: Path,
+) -> None:
+    """Model requests edit_file; executor calls edit_file not write_file,
+    and the ``before fs.write`` policy still applies."""
+    from nemoir_runtime.official_tools import edit_file, write_file  # noqa: PLC0415
+    from nemoir_runtime.runtime import (  # noqa: PLC0415
+        InputSpec,
+        PolicySpec,
+        RefSpec,
+        RequiredCapabilitySpec,
+        TriggerSpec,
+        WorkflowManifest,
+        WorkflowRuntime,
+    )
+
+    # Pre-create a file for edit_file to operate on.
+    target = tmp_path / "target.txt"
+    target.write_text("hello old world")
+
+    policy_calls: list[str] = []
+
+    async def read_stub(*, path: Path, ctx: ToolContext) -> str:
+        policy_calls.append("fs.read")
+        return "ok"
+
+    async def confirm_stub(*, message: str, ctx: ToolContext) -> bool:
+        policy_calls.append("user.confirm")
+        return True
+
+    read_tool = Tool(
+        name="read_file",
+        capability="fs.read",
+        description="r",
+        input_schema={"path": Path},
+        handler=read_stub,
+    )
+    confirm_tool = Tool(
+        name="confirm",
+        capability="user.confirm",
+        description="c",
+        input_schema={"message": str},
+        handler=confirm_stub,
+    )
+
+    tools = ToolRegistry([read_tool, write_file, edit_file, confirm_tool])
+
+    before_policy = PolicySpec(
+        id="before fs.write(path) requires fs.read(path), user.confirm",
+        kind="before",
+        trigger=TriggerSpec(capability="fs.write", bind={"path": "path"}),
+        requires=(
+            RequiredCapabilitySpec(
+                capability="fs.read",
+                args={"path": RefSpec(kind="bound", name="path")},
+            ),
+            RequiredCapabilitySpec(capability="user.confirm", args={}),
+        ),
+    )
+
+    stages = (
+        StageSpec(
+            id="S",
+            prompt="p",
+            reads=(),
+            writes=(WriteSpec(name="out", type="string", optional=False),),
+            requires=frozenset({"fs.write"}),
+            transitions=(),
+        ),
+    )
+    manifest = WorkflowManifest(
+        workflow_id="TestRoute",
+        entry_stage_id="S",
+        exit_stage_ids=frozenset({"S"}),
+        inputs=(InputSpec(name="cwd", type="path"),),
+        capabilities=frozenset({"fs.read", "fs.write", "user.confirm"}),
+        policies=(before_policy,),
+        stages=stages,
+    )
+
+    adapter = _fake_adapter(
+        [
+            ModelResponse(
+                content=None,
+                tool_calls=(
+                    ModelToolCall(
+                        id="c1",
+                        name="edit_file",
+                        arguments={
+                            "path": str(target),
+                            "content": "old",
+                            "new_content": "new",
+                        },
+                    ),
+                ),
+            ),
+            ModelResponse(content='{"out": "done"}'),
+        ]
+    )
+
+    executor = ModelStageExecutor(model=adapter, tools=tools)
+    runtime = WorkflowRuntime(manifest=manifest, tools=tools, stage_executor=executor)
+    result = await runtime.run({"cwd": str(tmp_path)})
+
+    assert result.output["out"] == "done"
+    # The before-policy chain must have run: fs.read then user.confirm
+    # before the fs.write handler.
+    assert policy_calls == ["fs.read", "user.confirm"]
+    # edit_file replaced "old"→"new".
+    assert target.read_text() == "hello new world"

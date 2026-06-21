@@ -121,13 +121,12 @@ def test_tool_extra_optional_param_allowed() -> None:
     ToolRegistry([with_extra])
 
 
-def test_tool_extra_required_param_rejected_at_registry() -> None:
+def test_tool_extra_required_param_accepted_at_registry() -> None:
     @tool(capability="fs.read", description="extra required")
     async def with_req_extra(*, path: Path, ctx: ToolContext, extra: int) -> str:
         return str(extra)
 
-    with pytest.raises(ToolValidationError, match="unsupported required extra"):  # type: ignore[reportUnknownMemberType]
-        ToolRegistry([with_req_extra])
+    ToolRegistry([with_req_extra])
 
 
 def test_tool_return_annotation_ignored() -> None:
@@ -138,7 +137,7 @@ def test_tool_return_annotation_ignored() -> None:
     ToolRegistry([returns_int])
 
 
-def test_registry_duplicate_capability_rejected() -> None:
+def test_registry_multiple_tools_per_capability_accepted() -> None:
     @tool(capability="fs.read", description="first")
     async def read1(*, path: Path, ctx: ToolContext) -> str:
         return ""
@@ -147,8 +146,9 @@ def test_registry_duplicate_capability_rejected() -> None:
     async def read2(*, path: Path, ctx: ToolContext) -> str:
         return ""
 
-    with pytest.raises(ToolValidationError, match="Duplicate capability"):  # type: ignore[reportUnknownMemberType]
-        ToolRegistry([read1, read2])
+    registry = ToolRegistry([read1, read2])
+    assert registry.get("fs.read") is not None
+    assert len(registry.tools_for_capabilities({"fs.read"})) == 2
 
 
 def test_registry_require_capabilities_missing_rejected() -> None:
@@ -355,3 +355,52 @@ def test_tools_for_capabilities_empty_returns_empty() -> None:
     )
     registry = ToolRegistry([t])
     assert registry.tools_for_capabilities(set()) == ()
+
+
+# ------------------------------------------------------------------
+# Medium-2 regression: unannotated tool-specific params rejected
+# ------------------------------------------------------------------
+
+
+def test_unannotated_required_extra_param_rejected() -> None:
+    """A required tool-specific param without annotation is rejected."""
+
+    async def handler(
+        *,
+        path: Path,
+        ctx: ToolContext,
+        extra,  # type: ignore[no-untyped-def]
+    ) -> str:
+        return str(extra)  # type: ignore[reportUnknownArgumentType]
+
+    t = Tool(
+        name="bad",
+        capability="fs.read",
+        description="bad",
+        input_schema={"path": Path},
+        handler=handler,  # type: ignore[reportUnknownArgumentType]
+    )
+    with pytest.raises(ToolValidationError, match="missing a type annotation"):  # type: ignore[reportUnknownMemberType]
+        ToolRegistry([t])
+
+
+def test_unannotated_optional_extra_param_rejected() -> None:
+    """An optional tool-specific param without annotation is rejected."""
+
+    async def handler(
+        *,
+        path: Path,
+        ctx: ToolContext,
+        extra="fallback",  # type: ignore[no-untyped-def]
+    ) -> str:
+        return str(extra)  # type: ignore[reportUnknownArgumentType]
+
+    t = Tool(
+        name="bad",
+        capability="fs.read",
+        description="bad",
+        input_schema={"path": Path},
+        handler=handler,  # type: ignore[reportUnknownArgumentType]
+    )
+    with pytest.raises(ToolValidationError, match="missing a type annotation"):  # type: ignore[reportUnknownMemberType]
+        ToolRegistry([t])

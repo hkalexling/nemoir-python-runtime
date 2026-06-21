@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
@@ -7,6 +8,10 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from nemoir_runtime.capabilities import CAPABILITY_CATALOG
 from nemoir_runtime.errors import ModelOutputValidationError, ModelProviderError
+from nemoir_runtime.tools import (
+    _is_list_str,  # type: ignore[reportPrivateUsage]
+    _is_optional_list_str,  # type: ignore[reportPrivateUsage]
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping
@@ -412,24 +417,52 @@ def _required_tool_params(tool: Tool) -> frozenset[str]:
     return frozenset(p.name for p in spec.required_params)
 
 
+def _non_defaulted_params(tool: Tool) -> frozenset[str]:
+    """Return the set of input_schema parameters that have no default value.
+
+    Always computed from the handler signature intersected with
+    ``tool.input_schema``, plus the catalog-required set.  This makes the
+    behavior identical for ``@tool``-decorated and ad-hoc ``Tool(...)``
+    instances.
+
+    Logic: catalog-required params are always required (per plan guarantee
+    they never have defaults).  Additionally, every ``input_schema`` param
+    that appears in the handler signature without a default is required.
+    """
+    required: set[str] = set(_required_tool_params(tool))
+    sig = inspect.signature(tool.handler)
+    for name in tool.input_schema:
+        param = sig.parameters.get(name)
+        if param is not None and param.default is inspect.Parameter.empty:
+            required.add(name)
+    return frozenset(required)
+
+
+def _param_type_to_json_schema(param_type: Any, param_name: str, tool_name: str) -> dict[str, Any]:
+    """Convert a tool parameter type annotation into a JSON Schema property."""
+    json_type = _TOOL_ARG_TYPE_TO_JSON.get(param_type)
+    if json_type is not None:
+        return json_type
+    if _is_optional_list_str(param_type):
+        return {"type": "array", "items": {"type": "string"}}
+    if _is_list_str(param_type):
+        return {"type": "array", "items": {"type": "string"}}
+    msg = (
+        f"unsupported tool parameter type '{getattr(param_type, '__name__', str(param_type))}' "
+        f"for parameter '{param_name}' in tool '{tool_name}'"
+    )
+    raise ModelOutputValidationError(msg)
+
+
 def tool_schema(tool: Tool) -> dict[str, Any]:
     properties: dict[str, Any] = {}
     required: list[str] = []
 
-    catalog_required = _required_tool_params(tool)
+    non_defaulted = _non_defaulted_params(tool)
 
     for param_name, param_type in tool.input_schema.items():
-        json_type = _TOOL_ARG_TYPE_TO_JSON.get(param_type)
-        if json_type is None and param_type == list[str]:
-            json_type = {"type": "array", "items": {"type": "string"}}
-        if json_type is None:
-            msg = (
-                f"unsupported tool parameter type '{param_type.__name__}' "
-                f"for parameter '{param_name}' in tool '{tool.name}'"
-            )
-            raise ModelOutputValidationError(msg)
-        properties[param_name] = json_type
-        if param_name in catalog_required:
+        properties[param_name] = _param_type_to_json_schema(param_type, param_name, tool.name)
+        if param_name in non_defaulted:
             required.append(param_name)
 
     return {
@@ -447,7 +480,7 @@ def tool_schema(tool: Tool) -> dict[str, Any]:
     }
 
 
-def normalize_tool_args(tool: Tool, raw_args: Mapping[str, Any]) -> dict[str, Any]:  # noqa: C901, PLR0912
+def normalize_tool_args(tool: Tool, raw_args: Mapping[str, Any]) -> dict[str, Any]:  # noqa: C901, PLR0912, PLR0915
     known = set(tool.input_schema.keys())
     for key in raw_args:
         if key not in known:
@@ -456,7 +489,10 @@ def normalize_tool_args(tool: Tool, raw_args: Mapping[str, Any]) -> dict[str, An
             )
             raise ModelOutputValidationError(msg)
 
-    for name in _required_tool_params(tool):
+    # All non-defaulted params (catalog-required + tool-specific required) must
+    # be present.
+    non_defaulted = _non_defaulted_params(tool)
+    for name in non_defaulted:
         if name not in raw_args:
             msg = (
                 f"missing required argument '{name}' for tool "
@@ -510,7 +546,7 @@ def normalize_tool_args(tool: Tool, raw_args: Mapping[str, Any]) -> dict[str, An
                 )
                 raise ModelOutputValidationError(msg)
             result[param_name] = float(val)
-        elif param_type == list[str]:
+        elif _is_list_str(param_type):
             if not isinstance(val, list) or not all(
                 isinstance(v, str)
                 for v in val  # type: ignore[reportUnknownVariableType]
@@ -518,9 +554,24 @@ def normalize_tool_args(tool: Tool, raw_args: Mapping[str, Any]) -> dict[str, An
                 msg = f"expected list[str] for parameter '{param_name}' in tool '{tool.name}'"
                 raise ModelOutputValidationError(msg)
             result[param_name] = list(val)  # type: ignore[reportUnknownArgumentType]
+        elif _is_optional_list_str(param_type):
+            if val is None:
+                result[param_name] = None
+            elif isinstance(val, list) and all(
+                isinstance(v, str)
+                for v in val  # type: ignore[reportUnknownVariableType]
+            ):
+                result[param_name] = list(val)  # type: ignore[reportUnknownArgumentType]
+            else:
+                val_type_name: str = getattr(type(val), "__name__", "unknown")  # type: ignore[reportUnknownArgumentType]
+                msg = (
+                    f"expected list[str] | None for parameter '{param_name}' "
+                    f"in tool '{tool.name}', got {val_type_name}"
+                )
+                raise ModelOutputValidationError(msg)
         else:
             msg = (
-                f"unsupported parameter type '{param_type.__name__}' "
+                f"unsupported parameter type '{getattr(param_type, '__name__', str(param_type))}' "
                 f"for parameter '{param_name}' in tool '{tool.name}'"
             )
             raise ModelOutputValidationError(msg)
@@ -635,7 +686,9 @@ class ModelStageExecutor:
                         )
                         raise ModelOutputValidationError(msg)
                     normalized_args = normalize_tool_args(tool, tc.arguments)
-                    result = await ctx.call_tool(tool.capability, normalized_args)
+                    result = await ctx.call_tool(
+                        tool.capability, normalized_args, tool_name=tool.name
+                    )
                     result_content = tool_result_to_model_content(result)
                     messages.append(self._tool_result_message(tc.id, result_content))
             else:

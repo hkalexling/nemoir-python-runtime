@@ -165,7 +165,7 @@ class StageContext:
     readable_context: Mapping[str, Any]
     allowed_capabilities: frozenset[str]
     options: RunOptions
-    call_tool: Callable[[str, Mapping[str, Any]], Awaitable[Any]]
+    call_tool: Callable[..., Awaitable[Any]]
     event_emitter: WorkflowEventEmitter | None = None
 
 
@@ -413,9 +413,16 @@ class WorkflowRuntime:
         inputs: Mapping[str, Any],
         run_opts: RunOptions,
         emitter: WorkflowEventEmitter,
-    ) -> Callable[[str, Mapping[str, Any]], Awaitable[Any]]:
-        async def call_tool(capability: str, args: Mapping[str, Any]) -> Any:
-            return await self._enforce_and_call(stage, capability, args, inputs, run_opts, emitter)
+    ) -> Callable[..., Awaitable[Any]]:
+        async def call_tool(
+            capability: str,
+            args: Mapping[str, Any],
+            *,
+            tool_name: str | None = None,
+        ) -> Any:
+            return await self._enforce_and_call(
+                stage, capability, args, inputs, run_opts, emitter, tool_name=tool_name
+            )
 
         return call_tool
 
@@ -431,12 +438,21 @@ class WorkflowRuntime:
         inputs: Mapping[str, Any],
         run_opts: RunOptions,
         emitter: WorkflowEventEmitter,
+        *,
+        tool_name: str | None = None,
     ) -> Any:
         if capability not in stage.requires:
             msg = f"capability '{capability}' is not available in stage '{stage.id}'"
             raise MissingCapabilityError(msg)
         return await self._enforce_and_call_with_policies(
-            capability, args, inputs, stage, allow_before=True, run_opts=run_opts, emitter=emitter
+            capability,
+            args,
+            inputs,
+            stage,
+            allow_before=True,
+            run_opts=run_opts,
+            emitter=emitter,
+            tool_name=tool_name,
         )
 
     async def _enforce_policy_call(
@@ -458,7 +474,7 @@ class WorkflowRuntime:
             emitter=emitter,
         )
 
-    async def _enforce_and_call_with_policies(  # noqa: C901
+    async def _enforce_and_call_with_policies(  # noqa: C901, PLR0912
         self,
         capability: str,
         args: Mapping[str, Any],
@@ -468,6 +484,7 @@ class WorkflowRuntime:
         allow_before: bool,
         run_opts: RunOptions,
         emitter: WorkflowEventEmitter,
+        tool_name: str | None = None,
     ) -> Any:
         policies = self._policies_by_trigger.get(capability, [])
 
@@ -566,13 +583,18 @@ class WorkflowRuntime:
                         raise PolicyDeniedError(msg)
 
         # Emit tool_call_started before the handler runs.
-        tool_obj = self._tools.get(capability)
-        tool_name = tool_obj.name if tool_obj else capability
+        # Prefer the caller-provided tool_name; fall back to the first
+        # registered tool for the capability.
+        if tool_name is not None:
+            resolved_name = tool_name
+        else:
+            tool_obj = self._tools.get(capability)
+            resolved_name = tool_obj.name if tool_obj else capability
         await emitter.emit(
             "tool_call_started",
             stage_id=stage.id,
             capability=capability,
-            tool_name=tool_name,
+            tool_name=resolved_name,
             args=dict(args),
         )
 
@@ -583,13 +605,13 @@ class WorkflowRuntime:
             metadata=run_opts.metadata,
         )
         try:
-            result = await self._tools.call(capability, args, ctx)
+            result = await self._tools.call(capability, args, ctx, tool_name=tool_name)
         except Exception:
             await emitter.emit(
                 "tool_call_failed",
                 stage_id=stage.id,
                 capability=capability,
-                tool_name=tool_name,
+                tool_name=resolved_name,
                 error=str(_active_exception()),
             )
             raise
@@ -597,7 +619,7 @@ class WorkflowRuntime:
             "tool_call_completed",
             stage_id=stage.id,
             capability=capability,
-            tool_name=tool_name,
+            tool_name=resolved_name,
             metadata={"result_preview": _safe_result_preview(result)},
         )
         return result
