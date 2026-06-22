@@ -7,7 +7,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from nemoir_runtime.capabilities import CAPABILITY_CATALOG
-from nemoir_runtime.errors import ModelOutputValidationError, ModelProviderError
+from nemoir_runtime.errors import (
+    ModelOutputValidationError,
+    ModelProviderError,
+    ToolInvocationError,
+)
 from nemoir_runtime.tools import (
     _is_list_str,  # type: ignore[reportPrivateUsage]
     _is_optional_list_str,  # type: ignore[reportPrivateUsage]
@@ -407,6 +411,8 @@ def normalize_stage_output(stage: StageSpec, raw: Mapping[str, Any]) -> dict[str
     result: dict[str, Any] = {}
     for write in stage.writes:
         val = raw.get(write.name)
+        if write.optional and isinstance(val, list) and len(val) == 0 and write.type.endswith("[]"):  # type: ignore[reportUnknownArgumentType]
+            val = None
         if val is None:
             if not write.optional:
                 msg = f"missing required output field '{write.name}' in stage '{stage.id}'"
@@ -677,6 +683,9 @@ def _json_schema_response_format(stage_id: str, schema: Mapping[str, Any]) -> di
 # ---------------------------------------------------------------------------
 
 
+_INVALID_CONTENT_PREVIEW_MAX = 500
+
+
 class ModelStageExecutor:
     def __init__(
         self,
@@ -690,6 +699,74 @@ class ModelStageExecutor:
         self._tools = tools
         self._max_tool_rounds = max_tool_rounds
 
+    # ----------------------------------------------------------------
+    # Retry / error helpers
+    # ----------------------------------------------------------------
+
+    @staticmethod
+    def _max_model_retries(opts: object) -> int:
+        if isinstance(opts, dict):
+            return opts.get("max_model_retries", 3)  # type: ignore[reportUnknownMemberType]
+        return getattr(opts, "max_model_retries", 3)
+
+    @staticmethod
+    async def _emit_model_retry(
+        emitter: object | None,
+        *,
+        stage_id: str,
+        error_msg: str,
+        category: str,
+        attempt: int,
+        max_retries: int,
+    ) -> None:
+        if emitter is None:
+            return
+        await emitter.emit(  # type: ignore[union-attr]
+            "model_retry",
+            stage_id=stage_id,
+            error=error_msg,
+            metadata={
+                "attempt": attempt,
+                "max_retries": max_retries,
+                "category": category,
+            },
+        )
+
+    @staticmethod
+    def _stage_retry_message(
+        *,
+        stage: Any,
+        error_msg: str,
+        output_schema: Mapping[str, Any],
+        invalid_content: str | None = None,
+    ) -> dict[str, Any]:
+        content = (
+            f"The previous response for stage '{stage.id}' was invalid. "
+            f"Correct the errors and retry.\n\nError:\n{error_msg}\n\n"
+            f"Return only a JSON object matching this schema:\n"
+            f"{json.dumps(output_schema, indent=2)}"
+        )
+        if invalid_content:
+            preview = (
+                invalid_content[:_INVALID_CONTENT_PREVIEW_MAX]
+                if len(invalid_content) > _INVALID_CONTENT_PREVIEW_MAX
+                else invalid_content
+            )
+            content += f"\n\nYour previous output was:\n{preview}"
+        return {"role": "user", "content": content}
+
+    @staticmethod
+    def _tool_error_content(error_msg: str) -> str:
+        return json.dumps({"ok": False, "error": error_msg, "retryable": True})
+
+    @staticmethod
+    def _canonical_tool_call_id(tc: Any, index: int) -> str:
+        return tc.id or f"call_{index}"
+
+    # ----------------------------------------------------------------
+    # Main execution loop
+    # ----------------------------------------------------------------
+
     async def execute(self, ctx: StageContext) -> dict[str, Any]:  # noqa: C901, PLR0912, PLR0915
         adapter = model_for_stage(self._model, ctx.stage.id)
 
@@ -702,11 +779,14 @@ class ModelStageExecutor:
         if effective_reasoning == "none":
             effective_reasoning = getattr(adapter, "reasoning", "none")
 
+        max_retries = self._max_model_retries(opts)
+        retry_count = 0
+
         output_schema = output_schema_for_stage(ctx.stage)
         stage_tools = self._tools.tools_for_capabilities(ctx.allowed_capabilities)
         tool_schemas = tuple(tool_schema(t) for t in stage_tools)
 
-        messages = self._build_initial_messages(ctx, output_schema)
+        messages: list[dict[str, Any]] = self._build_initial_messages(ctx, output_schema)
 
         emitter = ctx.event_emitter
         use_streaming = emitter is not None and emitter.has_sink and supports_streaming(adapter)
@@ -721,15 +801,38 @@ class ModelStageExecutor:
                 options={"reasoning": effective_reasoning},
             )
 
-            if use_streaming:
-                response = await self._stream_adapter_response(adapter, request, ctx, emitter)
-            else:
-                response = await adapter.complete(request)
-                if emitter is not None:
-                    await emitter.emit(
-                        "model_completed",
-                        stage_id=ctx.stage.id,
+            # Acquire model response; catch provider-level parse errors
+            # (e.g. malformed streamed tool-call JSON) so they are retryable.
+            try:
+                if use_streaming:
+                    response = await self._stream_adapter_response(adapter, request, ctx, emitter)
+                else:
+                    response = await adapter.complete(request)
+                    if emitter is not None:
+                        await emitter.emit(
+                            "model_completed",
+                            stage_id=ctx.stage.id,
+                        )
+            except ModelOutputValidationError as e:
+                if retry_count >= max_retries:
+                    raise
+                retry_count += 1
+                await self._emit_model_retry(
+                    emitter,
+                    stage_id=ctx.stage.id,
+                    error_msg=str(e),
+                    category="model_tool_call_parse",
+                    attempt=retry_count,
+                    max_retries=max_retries,
+                )
+                messages.append(
+                    self._stage_retry_message(
+                        stage=ctx.stage,
+                        error_msg=str(e),
+                        output_schema=output_schema,
                     )
+                )
+                continue
 
             if response.tool_calls:
                 if tool_rounds >= self._max_tool_rounds:
@@ -737,40 +840,101 @@ class ModelStageExecutor:
                     raise ModelOutputValidationError(msg)
                 tool_rounds += 1
                 messages.append(self._assistant_tool_call_message(response))
-                for tc in response.tool_calls:
-                    tool = self._tools.get_by_name(tc.name)
-                    if tool is None:
-                        msg = f"model requested unknown tool '{tc.name}' in stage '{ctx.stage.id}'"
-                        raise ModelOutputValidationError(msg)
-                    if tool.capability not in ctx.allowed_capabilities:
-                        msg = (
-                            f"tool '{tc.name}' has capability "
-                            f"'{tool.capability}' which is not allowed "
-                            f"in stage '{ctx.stage.id}'"
+
+                # Execute every tool call; report errors individually and
+                # retry at the response level when any call fails.
+                had_error = False
+                first_error_msg = ""
+                for i, tc in enumerate(response.tool_calls):
+                    tc_id = self._canonical_tool_call_id(tc, i)
+                    try:
+                        tool = self._tools.get_by_name(tc.name)
+                        if tool is None:
+                            msg = (
+                                f"model requested unknown tool "
+                                f"'{tc.name}' in stage '{ctx.stage.id}'"
+                            )
+                            raise ModelOutputValidationError(msg)  # noqa: TRY301
+                        if tool.capability not in ctx.allowed_capabilities:
+                            msg = (
+                                f"tool '{tc.name}' has capability "
+                                f"'{tool.capability}' which is not allowed "
+                                f"in stage '{ctx.stage.id}'"
+                            )
+                            raise ModelOutputValidationError(msg)  # noqa: TRY301
+                        normalized_args = normalize_tool_args(tool, tc.arguments)
+                        result = await ctx.call_tool(
+                            tool.capability, normalized_args, tool_name=tool.name
                         )
-                        raise ModelOutputValidationError(msg)
-                    normalized_args = normalize_tool_args(tool, tc.arguments)
-                    result = await ctx.call_tool(
-                        tool.capability, normalized_args, tool_name=tool.name
+                        result_content = tool_result_to_model_content(result)
+                        messages.append(self._tool_result_message(tc_id, result_content))
+                    except ModelOutputValidationError as e:
+                        if not had_error:
+                            first_error_msg = str(e)
+                        had_error = True
+                        messages.append(
+                            self._tool_result_message(tc_id, self._tool_error_content(str(e)))
+                        )
+                    except ToolInvocationError as e:
+                        if not had_error:
+                            first_error_msg = str(e)
+                        had_error = True
+                        messages.append(
+                            self._tool_result_message(tc_id, self._tool_error_content(str(e)))
+                        )
+
+                if had_error:
+                    if retry_count >= max_retries:
+                        raise ModelOutputValidationError(first_error_msg)
+                    retry_count += 1
+                    await self._emit_model_retry(
+                        emitter,
+                        stage_id=ctx.stage.id,
+                        error_msg="One or more tool calls failed validation or execution",
+                        category="tool_args",
+                        attempt=retry_count,
+                        max_retries=max_retries,
                     )
-                    result_content = tool_result_to_model_content(result)
-                    messages.append(self._tool_result_message(tc.id, result_content))
+                    continue
             else:
-                if not response.content:
-                    msg = f"model returned empty content in stage '{ctx.stage.id}'"
-                    raise ModelOutputValidationError(msg)
+                # Parse and validate final stage output.
                 try:
-                    parsed = json.loads(response.content)  # type: ignore[reportUnknownArgumentType]
-                except json.JSONDecodeError as e:
-                    msg = f"model returned invalid JSON in stage '{ctx.stage.id}': {e}"
-                    raise ModelOutputValidationError(msg) from e
-                if not isinstance(parsed, dict):
-                    msg = (
-                        f"model returned {type(parsed).__name__} "
-                        f"instead of object in stage '{ctx.stage.id}'"
+                    if not response.content:
+                        msg = f"model returned empty content in stage '{ctx.stage.id}'"
+                        raise ModelOutputValidationError(msg)  # noqa: TRY301
+                    try:
+                        parsed = json.loads(response.content)  # type: ignore[reportUnknownArgumentType]
+                    except json.JSONDecodeError as e:
+                        msg = f"model returned invalid JSON in stage '{ctx.stage.id}': {e}"
+                        raise ModelOutputValidationError(msg) from e
+                    if not isinstance(parsed, dict):
+                        msg = (
+                            f"model returned {type(parsed).__name__} "
+                            f"instead of object in stage '{ctx.stage.id}'"
+                        )
+                        raise ModelOutputValidationError(msg)  # noqa: TRY301
+                    return normalize_stage_output(ctx.stage, parsed)  # type: ignore[reportUnknownArgumentType]
+                except ModelOutputValidationError as e:
+                    if retry_count >= max_retries:
+                        raise
+                    retry_count += 1
+                    await self._emit_model_retry(
+                        emitter,
+                        stage_id=ctx.stage.id,
+                        error_msg=str(e),
+                        category="stage_output",
+                        attempt=retry_count,
+                        max_retries=max_retries,
                     )
-                    raise ModelOutputValidationError(msg)
-                return normalize_stage_output(ctx.stage, parsed)  # type: ignore[reportUnknownArgumentType]
+                    messages.append(
+                        self._stage_retry_message(
+                            stage=ctx.stage,
+                            error_msg=str(e),
+                            output_schema=output_schema,
+                            invalid_content=response.content or None,
+                        )
+                    )
+                    continue
 
     @staticmethod
     async def _stream_adapter_response(

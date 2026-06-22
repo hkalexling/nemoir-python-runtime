@@ -274,6 +274,60 @@ def test_generated_package_run_with_model_router(tmp_path: Path) -> None:
     assert len(mock_default.calls) > 0
 
 
+class _TriageEmptyArrayExecutor:
+    """Regression: Triage returns unclear_points=[] (empty optional array).
+
+    This must normalize to None so the has_value guard evaluates False
+    and the workflow proceeds to Plan, not Clarify.
+    """
+
+    def __init__(self) -> None:
+        self.stages_seen: list[str] = []
+
+    async def execute(self, ctx: Any) -> dict[str, Any]:
+        self.stages_seen.append(ctx.stage.id)
+        if ctx.stage.id == "Triage":
+            return {"summary": "clear", "unclear_points": []}
+        if ctx.stage.id == "Plan":
+            return {"plan": "the plan"}
+        if ctx.stage.id == "Propose":
+            return {"ok": True}
+        if ctx.stage.id == "Apply":
+            return {"summary": "applied"}
+        if ctx.stage.id == "Fin":
+            return {"summary": "done"}
+        if ctx.stage.id == "Clarify":
+            return {"answers": []}
+        msg = f"unhandled stage {ctx.stage.id}"
+        raise RuntimeError(msg)
+
+
+def test_empty_optional_array_skips_clarify(tmp_path: Path) -> None:
+    """Triage with unclear_points=[] must skip Clarify (empty array -> None).
+
+    Regression: before the fix, unclear_points=[] was treated as "has value"
+    causing an infinite Triage<->Clarify loop.
+    """
+    out_dir = tmp_path / "gen"
+    out_dir.mkdir()
+    _generate_package(out_dir)
+    coding_agent = _import_generated_package(out_dir)
+
+    executor = _TriageEmptyArrayExecutor()
+    agent = coding_agent.Agent(model="bogus", tools=_make_tools())
+    result = asyncio.run(
+        agent._run_with_executor(  # noqa: SLF001
+            coding_agent.AgentInput(task="t", cwd=Path("/tmp")),
+            executor=executor,
+        )
+    )
+    assert result.output.summary == "done"
+    # Must skip Clarify entirely.
+    assert "Clarify" not in executor.stages_seen
+    assert "Plan" in executor.stages_seen
+    assert executor.stages_seen == ["Triage", "Plan", "Propose", "Apply", "Fin"]
+
+
 def test_generated_package_run_with_executor_backdoor_still_works(tmp_path: Path) -> None:
     """_run_with_executor backdoor remains intact."""
     out_dir = tmp_path / "gen"

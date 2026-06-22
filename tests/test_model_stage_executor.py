@@ -49,6 +49,7 @@ def _make_stage_ctx(
     allowed_capabilities: frozenset[str] = frozenset(),
     readable_context: dict[str, Any] | None = None,
     tool_calls: list[tuple[str, dict[str, Any]]] | None = None,
+    options: dict[str, Any] | None = None,
 ) -> StageContext:
     tool_calls = tool_calls or []
 
@@ -57,6 +58,8 @@ def _make_stage_ctx(
     ) -> str:
         tool_calls.append((capability, args))
         return f"result-for-{capability}"
+
+    opts: dict[str, Any] = options if options is not None else {}
 
     return StageContext(
         workflow_id="TestWorkflow",
@@ -71,7 +74,7 @@ def _make_stage_ctx(
         inputs={},
         readable_context=readable_context or {},
         allowed_capabilities=allowed_capabilities,
-        options={},  # type: ignore[arg-type]
+        options=opts,  # type: ignore[arg-type]
         call_tool=call_tool,  # type: ignore[arg-type]
     )
 
@@ -127,6 +130,7 @@ async def test_content_only_invalid_json_raises() -> None:
     executor = ModelStageExecutor(model=adapter, tools=tools)
     ctx = _make_stage_ctx(
         writes=(WriteSpec(name="summary", type="string", optional=False),),
+        options={"max_model_retries": 0},
     )
     with pytest.raises(ModelOutputValidationError, match="invalid JSON"):  # type: ignore[reportUnknownMemberType]
         await executor.execute(ctx)
@@ -138,6 +142,7 @@ async def test_content_only_json_array_raises() -> None:
     executor = ModelStageExecutor(model=adapter, tools=tools)
     ctx = _make_stage_ctx(
         writes=(WriteSpec(name="summary", type="string", optional=False),),
+        options={"max_model_retries": 0},
     )
     with pytest.raises(ModelOutputValidationError, match="list instead of object"):  # type: ignore[reportUnknownMemberType]
         await executor.execute(ctx)
@@ -149,6 +154,7 @@ async def test_content_only_json_number_raises() -> None:
     executor = ModelStageExecutor(model=adapter, tools=tools)
     ctx = _make_stage_ctx(
         writes=(WriteSpec(name="summary", type="string", optional=False),),
+        options={"max_model_retries": 0},
     )
     with pytest.raises(ModelOutputValidationError, match="int instead of object"):  # type: ignore[reportUnknownMemberType]
         await executor.execute(ctx)
@@ -160,6 +166,7 @@ async def test_content_only_missing_required_field_raises() -> None:
     executor = ModelStageExecutor(model=adapter, tools=tools)
     ctx = _make_stage_ctx(
         writes=(WriteSpec(name="summary", type="string", optional=False),),
+        options={"max_model_retries": 0},
     )
     with pytest.raises(ModelOutputValidationError, match="missing required"):  # type: ignore[reportUnknownMemberType]
         await executor.execute(ctx)
@@ -171,6 +178,7 @@ async def test_content_only_unknown_field_raises() -> None:
     executor = ModelStageExecutor(model=adapter, tools=tools)
     ctx = _make_stage_ctx(
         writes=(WriteSpec(name="summary", type="string", optional=False),),
+        options={"max_model_retries": 0},
     )
     with pytest.raises(ModelOutputValidationError, match="unknown output"):  # type: ignore[reportUnknownMemberType]
         await executor.execute(ctx)
@@ -204,6 +212,7 @@ async def test_content_only_string_array_non_string_raises() -> None:
     executor = ModelStageExecutor(model=adapter, tools=tools)
     ctx = _make_stage_ctx(
         writes=(WriteSpec(name="items", type="string[]", optional=False),),
+        options={"max_model_retries": 0},
     )
     with pytest.raises(ModelOutputValidationError, match="expected list"):  # type: ignore[reportUnknownMemberType]
         await executor.execute(ctx)
@@ -333,6 +342,7 @@ async def test_unknown_tool_name_raises() -> None:
     ctx = _make_stage_ctx(
         writes=(WriteSpec(name="summary", type="string", optional=False),),
         allowed_capabilities=frozenset({"fs.read"}),
+        options={"max_model_retries": 0},
     )
     with pytest.raises(ModelOutputValidationError, match="unknown tool"):  # type: ignore[reportUnknownMemberType]
         await executor.execute(ctx)
@@ -383,6 +393,7 @@ async def test_tool_outside_allowed_capabilities_raises() -> None:
     ctx = _make_stage_ctx(
         writes=writes,
         allowed_capabilities=frozenset({"fs.read"}),
+        options={"max_model_retries": 0},
     )
 
     # The executor's capability visibility check fires BEFORE calling ctx.call_tool.
@@ -654,3 +665,372 @@ async def test_model_executor_routes_edit_file_through_fs_write_policy(
     assert policy_calls == ["fs.read", "user.confirm"]
     # edit_file replaced "old"→"new".
     assert target.read_text() == "hello new world"
+
+
+# ------------------------------------------------------------------
+# Retry behavior: recoverable model errors
+# ------------------------------------------------------------------
+
+
+async def test_invalid_json_retry_then_success() -> None:
+    """Invalid JSON on first attempt, valid JSON on retry succeeds."""
+    writes = (WriteSpec(name="summary", type="string", optional=False),)
+    adapter = _fake_adapter(
+        [
+            ModelResponse(content="not json"),
+            ModelResponse(content='{"summary": "done"}'),
+        ]
+    )
+    tools = ToolRegistry([_read_tool()])
+    executor = ModelStageExecutor(model=adapter, tools=tools)
+    ctx = _make_stage_ctx(writes=writes)
+    result = await executor.execute(ctx)
+    assert result == {"summary": "done"}
+    # Two calls: initial + retry
+    assert len(adapter.calls) == 2
+
+
+async def test_missing_required_output_retry_then_success() -> None:
+    """Missing required field on first attempt, valid on retry succeeds."""
+    writes = (WriteSpec(name="summary", type="string", optional=False),)
+    adapter = _fake_adapter(
+        [
+            ModelResponse(content="{}"),
+            ModelResponse(content='{"summary": "done"}'),
+        ]
+    )
+    tools = ToolRegistry([_read_tool()])
+    executor = ModelStageExecutor(model=adapter, tools=tools)
+    ctx = _make_stage_ctx(writes=writes)
+    result = await executor.execute(ctx)
+    assert result == {"summary": "done"}
+    assert len(adapter.calls) == 2
+
+
+async def test_invalid_json_exhausts_retries_raises() -> None:
+    """Persistent invalid JSON after max retries raises."""
+    writes = (WriteSpec(name="summary", type="string", optional=False),)
+    adapter = _fake_adapter(
+        [
+            ModelResponse(content="not json"),
+            ModelResponse(content="also not json"),
+            ModelResponse(content="still not json"),
+            ModelResponse(content="yet again not json"),
+        ]
+    )
+    tools = ToolRegistry([_read_tool()])
+    executor = ModelStageExecutor(model=adapter, tools=tools)
+    ctx = _make_stage_ctx(
+        writes=writes,
+        options={"max_model_retries": 2},
+    )
+    with pytest.raises(ModelOutputValidationError, match="invalid JSON"):  # type: ignore[reportUnknownMemberType]
+        await executor.execute(ctx)
+    # Initial + 2 retries = 3 calls
+    assert len(adapter.calls) == 3
+
+
+async def test_invalid_tool_args_retry_then_success() -> None:
+    """Invalid tool args on first call, valid on retry succeeds."""
+    writes = (WriteSpec(name="summary", type="string", optional=False),)
+    tools = ToolRegistry([_read_tool()])
+
+    adapter = _fake_adapter(
+        [
+            # First: tool call with missing required arg 'path'
+            ModelResponse(
+                content=None,
+                tool_calls=(
+                    ModelToolCall(
+                        id="c1",
+                        name="read",
+                        arguments={"wrong_arg": 1},
+                    ),
+                ),
+            ),
+            # Retry: valid tool call then final output
+            ModelResponse(
+                content=None,
+                tool_calls=(
+                    ModelToolCall(
+                        id="c2",
+                        name="read",
+                        arguments={"path": "/tmp/x"},
+                    ),
+                ),
+            ),
+            ModelResponse(content='{"summary": "done"}'),
+        ]
+    )
+    executor = ModelStageExecutor(model=adapter, tools=tools)
+    ctx = _make_stage_ctx(
+        writes=writes,
+        allowed_capabilities=frozenset({"fs.read"}),
+    )
+    result = await executor.execute(ctx)
+    assert result == {"summary": "done"}
+    # Initial tool-call + retry tool-call + final output = 3 model calls
+    assert len(adapter.calls) == 3
+
+
+async def test_unknown_tool_retry_then_success() -> None:
+    """Unknown tool on first call, valid tool on retry succeeds."""
+    writes = (WriteSpec(name="summary", type="string", optional=False),)
+    tools = ToolRegistry([_read_tool()])
+
+    adapter = _fake_adapter(
+        [
+            ModelResponse(
+                content=None,
+                tool_calls=(
+                    ModelToolCall(
+                        id="c1",
+                        name="nonexistent",
+                        arguments={},
+                    ),
+                ),
+            ),
+            ModelResponse(content='{"summary": "done"}'),
+        ]
+    )
+    executor = ModelStageExecutor(model=adapter, tools=tools)
+    ctx = _make_stage_ctx(
+        writes=writes,
+        allowed_capabilities=frozenset({"fs.read"}),
+    )
+    result = await executor.execute(ctx)
+    assert result == {"summary": "done"}
+    assert len(adapter.calls) == 2
+
+
+async def test_tool_invocation_error_retry_then_success() -> None:
+    """Tool handler ToolInvocationError on first call, valid on retry succeeds."""
+    writes = (WriteSpec(name="summary", type="string", optional=False),)
+
+    call_count = 0
+
+    async def flaky_handler(*, path: Path, ctx: ToolContext) -> str:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            msg = "simulated handler failure"
+            raise RuntimeError(msg)
+        return f"read:{path}"
+
+    flaky_tool = Tool(
+        name="flaky",
+        capability="fs.read",
+        description="Flaky tool",
+        input_schema={"path": Path},
+        handler=flaky_handler,
+    )
+    tools = ToolRegistry([flaky_tool])
+
+    # Use a real ToolRegistry.call-based call_tool that exercises the handler
+    async def real_call_tool(
+        capability: str, args: dict[str, Any], *, tool_name: str | None = None
+    ) -> Any:
+        return await tools.call(
+            capability,
+            args,
+            ToolContext(
+                workflow_id="Test",
+                stage_id="Test",
+                inputs={},
+            ),
+            tool_name=tool_name,
+        )
+
+    adapter = _fake_adapter(
+        [
+            ModelResponse(
+                content=None,
+                tool_calls=(
+                    ModelToolCall(
+                        id="c1",
+                        name="flaky",
+                        arguments={"path": "/tmp/x"},
+                    ),
+                ),
+            ),
+            # Retry: same valid tool call + final output
+            ModelResponse(
+                content=None,
+                tool_calls=(
+                    ModelToolCall(
+                        id="c2",
+                        name="flaky",
+                        arguments={"path": "/tmp/x"},
+                    ),
+                ),
+            ),
+            ModelResponse(content='{"summary": "done"}'),
+        ]
+    )
+    executor = ModelStageExecutor(model=adapter, tools=tools)
+    ctx = StageContext(
+        workflow_id="Test",
+        stage=StageSpec(
+            id="Test",
+            prompt="test",
+            reads=(),
+            writes=writes,
+            requires=frozenset({"fs.read"}),
+            transitions=(),
+        ),
+        inputs={},
+        readable_context={},
+        allowed_capabilities=frozenset({"fs.read"}),
+        options={"max_model_retries": 3},  # type: ignore[arg-type]
+        call_tool=real_call_tool,  # type: ignore[arg-type]
+    )
+    result = await executor.execute(ctx)
+    assert result == {"summary": "done"}
+    assert len(adapter.calls) == 3
+    assert call_count == 2
+
+
+async def test_model_retry_event_emitted_during_stage_output_retry() -> None:
+    """model_retry event is emitted when stage output validation retries."""
+    from nemoir_runtime.events import WorkflowEvent, WorkflowEventEmitter  # noqa: PLC0415
+
+    writes = (WriteSpec(name="summary", type="string", optional=False),)
+    collected: list[WorkflowEvent] = []
+
+    async def sink(event: WorkflowEvent) -> None:
+        collected.append(event)
+
+    async def noop_call_tool(*args: Any, **kwargs: Any) -> str:
+        return "ok"
+
+    emitter = WorkflowEventEmitter(run_id="r1", sink=sink)
+    adapter = _fake_adapter(
+        [
+            ModelResponse(content="not json"),
+            ModelResponse(content='{"summary": "done"}'),
+        ]
+    )
+    tools = ToolRegistry([_read_tool()])
+    executor = ModelStageExecutor(model=adapter, tools=tools)
+    ctx = StageContext(
+        workflow_id="Test",
+        stage=StageSpec(
+            id="Test",
+            prompt="p",
+            reads=(),
+            writes=writes,
+            requires=frozenset(),
+            transitions=(),
+        ),
+        inputs={},
+        readable_context={},
+        allowed_capabilities=frozenset(),
+        options={"max_model_retries": 3},  # type: ignore[arg-type]
+        call_tool=noop_call_tool,  # type: ignore[arg-type]
+        event_emitter=emitter,
+    )
+    result = await executor.execute(ctx)
+    assert result == {"summary": "done"}
+
+    retries = [e for e in collected if e.kind == "model_retry"]
+    assert len(retries) == 1
+    assert retries[0].stage_id == "Test"
+    assert retries[0].metadata is not None
+    assert retries[0].metadata.get("category") == "stage_output"  # type: ignore[union-attr]
+    assert retries[0].metadata.get("attempt") == 1  # type: ignore[union-attr]
+
+
+async def test_tool_call_retry_emits_model_retry_event() -> None:
+    """model_retry event is emitted when a tool-call error triggers retry."""
+    from nemoir_runtime.events import WorkflowEvent, WorkflowEventEmitter  # noqa: PLC0415
+
+    writes = (WriteSpec(name="summary", type="string", optional=False),)
+    collected: list[WorkflowEvent] = []
+    tools = ToolRegistry([_read_tool()])
+
+    async def sink(event: WorkflowEvent) -> None:
+        collected.append(event)
+
+    async def noop_call_tool(*args: Any, **kwargs: Any) -> str:
+        return "ok"
+
+    emitter = WorkflowEventEmitter(run_id="r1", sink=sink)
+
+    adapter = _fake_adapter(
+        [
+            ModelResponse(
+                content=None,
+                tool_calls=(
+                    ModelToolCall(
+                        id="c1",
+                        name="read",
+                        arguments={"missing": "path"},
+                    ),
+                ),
+            ),
+            ModelResponse(content='{"summary": "done"}'),
+        ]
+    )
+    executor = ModelStageExecutor(model=adapter, tools=tools)
+    ctx = StageContext(
+        workflow_id="Test",
+        stage=StageSpec(
+            id="Test",
+            prompt="p",
+            reads=(),
+            writes=writes,
+            requires=frozenset({"fs.read"}),
+            transitions=(),
+        ),
+        inputs={},
+        readable_context={},
+        allowed_capabilities=frozenset({"fs.read"}),
+        options={"max_model_retries": 3},  # type: ignore[arg-type]
+        call_tool=noop_call_tool,  # type: ignore[arg-type]
+        event_emitter=emitter,
+    )
+    result = await executor.execute(ctx)
+    assert result == {"summary": "done"}
+
+    retries = [e for e in collected if e.kind == "model_retry"]
+    assert len(retries) == 1
+    assert retries[0].stage_id == "Test"
+    assert retries[0].metadata is not None
+    assert retries[0].metadata.get("category") == "tool_args"  # type: ignore[union-attr]
+
+
+async def test_max_model_retries_zero_preserves_hard_fail() -> None:
+    """max_model_retries=0 preserves original hard-fail behavior."""
+    writes = (WriteSpec(name="summary", type="string", optional=False),)
+    adapter = _fake_adapter([ModelResponse(content="not json")])
+    tools = ToolRegistry([_read_tool()])
+    executor = ModelStageExecutor(model=adapter, tools=tools)
+    ctx = _make_stage_ctx(
+        writes=writes,
+        options={"max_model_retries": 0},
+    )
+    with pytest.raises(ModelOutputValidationError):  # type: ignore[reportUnknownMemberType]
+        await executor.execute(ctx)
+    # Only one call — no retry attempted
+    assert len(adapter.calls) == 1
+
+
+async def test_retry_respects_default_max_model_retries_from_options() -> None:
+    """When options has no max_model_retries key, default 3 is used."""
+    writes = (WriteSpec(name="summary", type="string", optional=False),)
+    # 5 invalid responses; default max_retries=3 means 4 total attempts then raise
+    adapter = _fake_adapter(
+        [
+            ModelResponse(content="not json 1"),
+            ModelResponse(content="not json 2"),
+            ModelResponse(content="not json 3"),
+            ModelResponse(content="not json 4"),
+        ]
+    )
+    tools = ToolRegistry([_read_tool()])
+    executor = ModelStageExecutor(model=adapter, tools=tools)
+    ctx = _make_stage_ctx(writes=writes, options={})
+    with pytest.raises(ModelOutputValidationError):  # type: ignore[reportUnknownMemberType]
+        await executor.execute(ctx)
+    # Initial + 3 retries = 4 calls
+    assert len(adapter.calls) == 4

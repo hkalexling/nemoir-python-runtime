@@ -134,6 +134,7 @@ class WorkflowManifest:
 @dataclass(frozen=True)
 class RunOptions:
     max_steps: int = 64
+    max_model_retries: int = 3
     # Accepted but not enforced in Phase 2. Only max_steps is enforced.
     timeout_s: float | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)  # type: ignore[reportUnknownVariableType]
@@ -263,12 +264,13 @@ class WorkflowRuntime:
                 await emitter.emit("stage_started", stage_id=stage.id)
                 raw_output = await self._stage_executor.execute(ctx)
                 self._validate_output(stage, raw_output)
-                stage_outputs[stage.id] = dict(raw_output)
+                normalized = self._normalize_optional_empty_arrays(stage, raw_output)
+                stage_outputs[stage.id] = normalized
                 steps += 1
                 await emitter.emit(
                     "stage_completed",
                     stage_id=stage.id,
-                    output=dict(raw_output),
+                    output=dict(normalized),
                 )
 
                 if stage.id in self._exit_ids:
@@ -340,6 +342,31 @@ class WorkflowRuntime:
             val = output.get(write.name)
             if val is not None:
                 _validate_write_type(val, write.type, write.name, stage.id)
+
+    @staticmethod
+    def _normalize_optional_empty_arrays(
+        stage: StageSpec,
+        output: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Treat empty lists for optional array outputs as None.
+
+        LLMs often emit ``[]`` for optional array outputs when they mean
+        "no items".  The runtime treats ``[]`` as a truthy value, which
+        causes ``has_value`` guards to fire when they shouldn't.  This
+        normalizes empty optional arrays to ``None`` so that the
+        ``has_value`` guard evaluates to ``False`` and the workflow
+        proceeds correctly.
+        """
+        result = dict(output)
+        for write in stage.writes:
+            if not write.optional:
+                continue
+            if not write.type.endswith("[]"):
+                continue
+            val = result.get(write.name)
+            if isinstance(val, list) and len(val) == 0:  # type: ignore[reportUnknownArgumentType]
+                result[write.name] = None
+        return result
 
     # ------------------------------------------------------------------
     # Transition evaluation

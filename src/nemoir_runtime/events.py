@@ -17,6 +17,7 @@ WorkflowEventKind = Literal[
     "stage_started",
     "model_delta",
     "model_completed",
+    "model_retry",
     "tool_call_started",
     "tool_call_completed",
     "tool_call_failed",

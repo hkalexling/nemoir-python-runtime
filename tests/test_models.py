@@ -598,6 +598,42 @@ def test_normalize_stage_output_bool_wrong_type_raises() -> None:
         normalize_stage_output(stage, {"ok": "true"})  # type: ignore[arg-type]
 
 
+# === Empty optional array normalized to None ===
+
+
+def test_normalize_stage_output_optional_array_empty_is_none() -> None:
+    """Optional string[] with empty list -> None."""
+    stage = _make_stage(
+        writes=(
+            WriteSpec(name="summary", type="string", optional=False),
+            WriteSpec(name="unclear_points", type="string[]", optional=True),
+        ),
+    )
+    result = normalize_stage_output(stage, {"summary": "x", "unclear_points": []})
+    assert result == {"summary": "x", "unclear_points": None}
+
+
+def test_normalize_stage_output_optional_array_nonempty_is_kept() -> None:
+    """Optional string[] with non-empty list is preserved."""
+    stage = _make_stage(
+        writes=(
+            WriteSpec(name="summary", type="string", optional=False),
+            WriteSpec(name="unclear_points", type="string[]", optional=True),
+        ),
+    )
+    result = normalize_stage_output(stage, {"summary": "x", "unclear_points": ["q"]})
+    assert result == {"summary": "x", "unclear_points": ["q"]}
+
+
+def test_normalize_stage_output_required_array_empty_is_kept() -> None:
+    """Required string[] with empty list is NOT normalized to None."""
+    stage = _make_stage(
+        writes=(WriteSpec(name="items", type="string[]", optional=False),),
+    )
+    result = normalize_stage_output(stage, {"items": []})
+    assert result == {"items": []}
+
+
 # ------------------------------------------------------------------
 # tool_schema
 # ------------------------------------------------------------------
