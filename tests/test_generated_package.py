@@ -25,7 +25,7 @@ from nemoir_runtime.models import ModelResponse, ModelStreamChunk, ModelToolCall
 
 REPO_ROOT = Path(__file__).parents[3]
 NEMO_BIN = REPO_ROOT / "compiler" / "target" / "debug" / "nemo"
-CODING_AGENT_NEMO = REPO_ROOT / "coding-agent.nemo"
+CODING_AGENT_NEMO = REPO_ROOT / "demos" / "coding-agent" / "coding-agent.nemo"
 RUNTIME_SRC = REPO_ROOT / "python" / "nemoir-runtime" / "src"
 
 
