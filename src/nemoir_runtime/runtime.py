@@ -135,6 +135,7 @@ class WorkflowManifest:
 class RunOptions:
     max_steps: int = 64
     max_model_retries: int = 3
+    max_tool_rounds: int | None = 32  # None = unlimited
     # Accepted but not enforced in Phase 2. Only max_steps is enforced.
     timeout_s: float | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)  # type: ignore[reportUnknownVariableType]

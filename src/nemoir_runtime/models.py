@@ -692,7 +692,7 @@ class ModelStageExecutor:
         *,
         model: object,
         tools: ToolRegistry,
-        max_tool_rounds: int = 8,
+        max_tool_rounds: int | None = 32,  # None = unlimited
     ) -> None:
         normalized = normalize_model(model)
         self._model: ModelAdapter | ModelRouter = normalized
@@ -835,7 +835,7 @@ class ModelStageExecutor:
                 continue
 
             if response.tool_calls:
-                if tool_rounds >= self._max_tool_rounds:
+                if self._max_tool_rounds is not None and tool_rounds >= self._max_tool_rounds:
                     msg = f"stage '{ctx.stage.id}' exceeded max_tool_rounds={self._max_tool_rounds}"
                     raise ModelOutputValidationError(msg)
                 tool_rounds += 1
