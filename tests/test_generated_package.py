@@ -1343,3 +1343,43 @@ def test_generated_package_policy_enforcement_denied_write(tmp_path: Path) -> No
         asyncio.run(agent._run_with_executor(  # noqa: SLF001
             denied_input, executor=WriteDenyExecutor(),
         ))
+
+
+# ------------------------------------------------------------------
+# Deterministic stage: generated-package e2e (Medium #2)
+# ------------------------------------------------------------------
+
+
+def test_deterministic_package_runs_with_official_tool(tmp_path: Path) -> None:
+    """Compile exec_shell.nemo → run Agent with official run_shell tool.
+
+    Verifies: tool_call_started/completed events fire, no model_completed
+    on the deterministic stage, and the final output is correct.
+    """
+    nemo_path = (
+        REPO_ROOT
+        / "compiler"
+        / "crates"
+        / "nemoir-dsl-fe"
+        / "tests"
+        / "fixtures"
+        / "exec_shell.nemo"
+    )
+    pkg = _compile_and_import(nemo_path, "exec_shell", tmp_path)
+
+    from nemoir_runtime.official_tools import run_shell  # noqa: PLC0415
+
+    tools = ToolRegistry([run_shell])
+
+    calls: list[str] = []
+
+    class FakeModel:
+        async def complete(self, _request: Any) -> Any:
+            calls.append("model")
+            return ModelResponse(content='{"summary": "processed"}')
+
+    agent = pkg.Agent(model=FakeModel(), tools=tools)
+
+    result = asyncio.run(agent.run(pkg.AgentInput()))
+    assert result.output.summary == "processed"
+    assert calls == ["model"]

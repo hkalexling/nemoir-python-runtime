@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import collections.abc
 import contextlib
+import dataclasses
+import inspect
 import os
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol, get_origin
 
 from nemoir_runtime.capabilities import CAPABILITY_CATALOG, CapabilityParamType
 from nemoir_runtime.errors import (
@@ -20,7 +23,7 @@ from nemoir_runtime.errors import (
     WorkflowValidationError,
 )
 from nemoir_runtime.events import WorkflowEvent, WorkflowEventEmitter, WorkflowEventSink
-from nemoir_runtime.tools import ToolContext, ToolRegistry
+from nemoir_runtime.tools import Tool, ToolContext, ToolRegistry
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -87,6 +90,13 @@ class TransitionSpec:
 
 
 @dataclass(frozen=True)
+class StageExecutionSpec:
+    kind: Literal["model", "tool"] = "model"
+    capability: str | None = None
+    args: Mapping[str, ExprSpec] = field(default_factory=dict)  # type: ignore[reportUnknownVariableType]
+
+
+@dataclass(frozen=True)
 class StageSpec:
     id: str
     prompt: str
@@ -94,6 +104,7 @@ class StageSpec:
     writes: tuple[WriteSpec, ...]
     requires: frozenset[str]
     transitions: tuple[TransitionSpec, ...]
+    execution: StageExecutionSpec = field(default_factory=StageExecutionSpec)
 
 
 @dataclass(frozen=True)
@@ -179,6 +190,131 @@ class StageExecutor(Protocol):
 
 
 # ---------------------------------------------------------------------------
+# DeterministicStageExecutor
+# ---------------------------------------------------------------------------
+
+
+class DeterministicStageExecutor:
+    """Executes a stage by calling one fixed capability with resolved args.
+
+    No model call.  Routes through ``ctx.call_tool`` so policies, capability
+    visibility, events, and output validation are all enforced.
+    """
+
+    def __init__(
+        self,
+        *,
+        tools: ToolRegistry,
+        tool_for_stage: Mapping[str, str],
+    ) -> None:
+        self._tools = tools
+        self._tool_for_stage = tool_for_stage
+
+    async def execute(self, ctx: StageContext) -> Mapping[str, Any]:
+        exec_spec = ctx.stage.execution
+        capability = exec_spec.capability or ""
+
+        tool_name = self._tool_for_stage[ctx.stage.id]
+
+        # Resolve args
+        resolved_args: dict[str, Any] = {}
+        for arg_name, expr in exec_spec.args.items():
+            resolved_args[arg_name] = self._resolve_exec_arg(
+                expr, ctx.inputs, ctx.readable_context
+            )
+
+        # Coerce catalog path args from str -> Path
+        resolved_args = self._coerce_path_args(capability, resolved_args)
+
+        # Call through ctx.call_tool (policy enforcement, events)
+        result = await ctx.call_tool(
+            capability, resolved_args, tool_name=tool_name
+        )
+
+        # Output normalization (§1.9)
+        return self._normalize_deterministic_output(ctx.stage, result)
+
+    @staticmethod
+    def _resolve_exec_arg(
+        expr: ExprSpec,
+        inputs: Mapping[str, Any],
+        readable_context: Mapping[str, Any],
+    ) -> Any:
+        """Resolve a single exec arg expression to a concrete value."""
+        if expr.kind == "literal":
+            return expr.value
+        if expr.kind == "ref":
+            if expr.ref is None:
+                msg = "Exec arg expression has no ref"
+                raise DataUnavailableError(msg)
+            if expr.ref.kind == "input":
+                name = expr.ref.name
+                return inputs.get(name) if name is not None else None
+            if expr.ref.kind == "node_output":
+                node = expr.ref.node or ""
+                field = expr.ref.field or ""
+                return readable_context.get(f"{node}.{field}")
+        msg = f"Unsupported exec arg expression kind '{expr.kind}'"
+        raise DataUnavailableError(msg)
+
+    @staticmethod
+    def _coerce_path_args(
+        capability: str,
+        args: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Coerce catalog path-typed args from str to Path."""
+        spec = CAPABILITY_CATALOG.get(capability)
+        if spec is None:
+            return args
+        for param in spec.required_params:
+            if param.type == CapabilityParamType.PATH and param.name in args:
+                val = args[param.name]
+                if isinstance(val, str):
+                    args[param.name] = Path(val)
+        return args
+
+    @staticmethod
+    def _normalize_deterministic_output(
+        stage: StageSpec,
+        result: Any,
+    ) -> dict[str, Any]:
+        """Normalize a deterministic tool result to stage outputs.
+
+        Implements §1.9: empty writes → {}, Mapping → dict(), dataclass →
+        asdict(), project to declared writes, coerce path str → Path.
+        """
+        if not stage.writes:
+            return {}
+
+        # Normalize result to a plain dict
+        if isinstance(result, collections.abc.Mapping):
+            raw: dict[str, Any] = dict(result)  # type: ignore[reportUnknownArgumentType]
+        elif dataclasses.is_dataclass(result) and not isinstance(result, type):
+            raw = dataclasses.asdict(result)
+        else:
+            msg = (
+                f"deterministic stage '{stage.id}' requires a Mapping or "
+                f"dataclass result; got {type(result).__name__}"
+            )
+            raise StageOutputValidationError(msg)
+
+        # Project: keep only declared write names
+        output: dict[str, Any] = {}
+        for w in stage.writes:
+            if w.name in raw:
+                output[w.name] = raw[w.name]
+
+        # Coerce path-typed outputs from str to Path
+        for w in stage.writes:
+            if w.type == "path" and w.name in output:
+                val = output[w.name]
+                if isinstance(val, str):
+                    output[w.name] = Path(val)
+
+        return output
+
+
+# ---------------------------------------------------------------------------
 # WorkflowRuntime
 # ---------------------------------------------------------------------------
 
@@ -228,6 +364,54 @@ class WorkflowRuntime:
         self._policies_by_trigger: dict[str, list[PolicySpec]] = {}
         for p in manifest.policies:
             self._policies_by_trigger.setdefault(p.trigger.capability, []).append(p)
+
+        # Build deterministic tool-selection plan: stage_id -> tool_name
+        self._tool_for_stage: dict[str, str] = {}
+        for s in manifest.stages:
+            if s.execution.kind != "tool":
+                continue
+            self._tool_for_stage[s.id] = self._select_deterministic_tool(s)
+
+        self._deterministic_executor = DeterministicStageExecutor(
+            tools=tools,
+            tool_for_stage=self._tool_for_stage,
+        )
+
+    def _select_deterministic_tool(self, stage: StageSpec) -> str:
+        """Select the concrete tool for a deterministic stage.
+
+        Returns the tool name.  Raises ``WorkflowValidationError`` if no
+        tool matches or if multiple tools equally satisfy the stage.
+        """
+        exec_spec = stage.execution
+        capability = exec_spec.capability or ""
+        candidates: list[str] = []
+        for t in self._tools.tools_for_capabilities({capability}):
+            # Filter by input params: all exec args must be present in
+            # the tool's non-defaulted params.
+            exec_arg_names = set(exec_spec.args.keys())
+            non_defaulted = _non_defaulted_tool_params(t)
+            if not exec_arg_names.issuperset(non_defaulted - {"ctx"}):
+                continue
+            # Filter by output shape
+            if tool_satisfies_stage_outputs(t.output_schema, stage.writes):
+                candidates.append(t.name)
+
+        if not candidates:
+            msg = (
+                f"Deterministic stage '{stage.id}' (capability '{capability}'): "
+                f"no registered tool satisfies the required input params and output schema"
+            )
+            raise WorkflowValidationError(msg)
+        if len(candidates) > 1:
+            msg = (
+                f"Deterministic stage '{stage.id}' (capability '{capability}'): "
+                f"multiple tools equally satisfy the stage: {', '.join(candidates)}. "
+                f"Register fewer matching tools for '{capability}', or declare "
+                f"additional required stage outputs so only one tool matches."
+            )
+            raise WorkflowValidationError(msg)
+        return candidates[0]
 
     def _coerce_path_inputs(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Coerce path-typed workflow inputs from str to Path.
@@ -282,7 +466,10 @@ class WorkflowRuntime:
                 readable = self._resolve_reads(stage, inputs, stage_outputs)
                 ctx = self._make_stage_context(stage, inputs, readable, opts, emitter)
                 await emitter.emit("stage_started", stage_id=stage.id)
-                raw_output = await self._stage_executor.execute(ctx)
+                if stage.execution.kind == "tool":
+                    raw_output = await self._deterministic_executor.execute(ctx)
+                else:
+                    raw_output = await self._stage_executor.execute(ctx)
                 self._validate_output(stage, raw_output)
                 normalized = self._normalize_optional_empty_arrays(stage, raw_output)
                 stage_outputs[stage.id] = normalized
@@ -873,6 +1060,52 @@ def _read_display_key(ref: RefSpec) -> str:
 # ---------------------------------------------------------------------------
 # Write type validation
 # ---------------------------------------------------------------------------
+
+
+def tool_satisfies_stage_outputs(
+    tool_output_schema: Mapping[str, type] | None, writes: tuple[WriteSpec, ...]
+) -> bool:
+    """Check whether a tool's output schema satisfies a stage's write requirements."""
+    if tool_output_schema is None:
+        return all(w.optional for w in writes)
+    for w in writes:
+        if w.optional:
+            continue
+        if w.name not in tool_output_schema:
+            return False
+        field_type = tool_output_schema[w.name]
+        if not _type_satisfies_write(field_type, w.type):
+            return False
+    return True
+
+
+def _type_satisfies_write(py_type: type, write_type: str) -> bool:
+    """Check whether a Python type is compatible with a NemoIR write type."""
+    if write_type == "string":
+        return py_type is str
+    if write_type == "bool":
+        return py_type is bool
+    if write_type == "path":
+        return py_type in (str, Path)
+    if write_type == "string[]":
+        origin = get_origin(py_type)
+        if origin is list:
+            return True
+        return py_type is list
+    return False
+
+
+def _non_defaulted_tool_params(tool: Tool) -> frozenset[str]:
+    """Return the set of tool params that have no default value."""
+    required: set[str] = set()
+    sig = inspect.signature(tool.handler)
+    for name in tool.input_schema:
+        if name == "ctx":
+            continue
+        param = sig.parameters.get(name)
+        if param is not None and param.default is inspect.Parameter.empty:
+            required.add(name)
+    return frozenset(required)
 
 
 def _validate_write_type(value: Any, write_type: str, field_name: str, stage_id: str) -> None:

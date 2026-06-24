@@ -43,6 +43,7 @@ from nemoir_runtime.models import (
     supports_streaming,
 )
 from nemoir_runtime.runtime import (
+    DeterministicStageExecutor,
     ExprSpec,
     GuardSpec,
     InputSpec,
@@ -52,6 +53,7 @@ from nemoir_runtime.runtime import (
     RequiredCapabilitySpec,
     RunOptions,
     StageContext,
+    StageExecutionSpec,
     StageExecutor,
     StageSpec,
     TransitionSpec,
@@ -75,6 +77,7 @@ __all__ = [
     "CapabilityParamType",
     "CapabilitySpec",
     "DataUnavailableError",
+    "DeterministicStageExecutor",
     "ExprSpec",
     "GuardSpec",
     "InputSpec",
@@ -102,6 +105,7 @@ __all__ = [
     "RequiredCapabilitySpec",
     "RunOptions",
     "StageContext",
+    "StageExecutionSpec",
     "StageExecutor",
     "StageOutputValidationError",
     "StageSpec",

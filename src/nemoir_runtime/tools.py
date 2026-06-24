@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import typing
 from dataclasses import dataclass, field
@@ -40,20 +41,26 @@ class Tool:
     description: str
     input_schema: Mapping[str, type]
     handler: Callable[..., Any]
+    output_schema: Mapping[str, type] | None = None
 
 
 def tool(
     *,
     capability: str,
     description: str,
+    returns: Mapping[str, type] | None = None,
 ) -> Callable[[Callable[..., Any]], Tool]:
     def decorator(handler: Callable[..., Any]) -> Tool:
+        output_schema = returns
+        if output_schema is None:
+            output_schema = _derive_output_schema(handler)
         return Tool(
             name=handler.__name__,
             capability=capability,
             description=description,
             input_schema=_derive_input_schema(handler),
             handler=handler,
+            output_schema=output_schema,
         )
 
     return decorator
@@ -69,6 +76,69 @@ def _derive_input_schema(handler: Callable[..., Any]) -> Mapping[str, type]:
         if name in hints:
             schema[name] = hints[name]
     return schema
+
+
+def _derive_output_schema(handler: Callable[..., Any]) -> Mapping[str, type] | None:
+    """Derive tool output schema from the handler's return type annotation.
+
+    Returns a ``Mapping[str, type]`` when the return type is a dataclass
+    or TypedDict; returns ``None`` when the return type is unknown or
+    not derivable.
+    """
+    hints = typing.get_type_hints(handler)
+    ret_annotation = hints.get("return")
+    if ret_annotation is None:
+        return None
+
+    # TypedDict return type (check first — TypedDict is not a dataclass)
+    if typing.is_typeddict(ret_annotation):
+        try:
+            td_hints = typing.get_type_hints(ret_annotation)
+        except Exception:
+            return None
+        schema: dict[str, type] = {}
+        for f_name, f_type in td_hints.items():
+            mapped = _map_python_type_to_nemoir(f_name, f_type)
+            if mapped is not None:
+                schema[f_name] = mapped
+        return schema or None
+    # Dataclass return type
+    if isinstance(ret_annotation, type) and dataclasses.is_dataclass(ret_annotation):
+        try:
+            field_hints = typing.get_type_hints(ret_annotation)
+        except Exception:
+            return None
+        schema = {}
+        for f_name, f_type in field_hints.items():
+            mapped = _map_python_type_to_nemoir(f_name, f_type)
+            if mapped is not None:
+                schema[f_name] = mapped
+        return schema or None
+
+    return None
+
+
+def _map_python_type_to_nemoir(field_name: str, py_type: type) -> type | None:  # noqa: ARG001
+    """Map a Python type annotation to a NemoIR-compatible type.
+
+    Returns the Python type unchanged when it is compatible (str, bool,
+    Path); returns ``None`` when the type cannot be represented in
+    NemoIR's type system.
+    """
+    if py_type is str:
+        return str
+    if py_type is bool:
+        return bool
+    if py_type is Path:
+        return Path
+    # list[str] → list[str] for compatibility (the runtime compares structural
+    # types via get_origin + _type_satisfies_write)
+    origin = typing.get_origin(py_type)
+    if origin is list:
+        args = typing.get_args(py_type)
+        if args == (str,):
+            return list[str]  # type: ignore[return-value]
+    return None
 
 
 _SUPPORTED_TOOL_PARAM_TYPES: set[Any] = {
