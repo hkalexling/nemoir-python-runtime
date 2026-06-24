@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
-from nemoir_runtime.capabilities import CAPABILITY_CATALOG
+from nemoir_runtime.capabilities import CAPABILITY_CATALOG, CapabilityParamType
 from nemoir_runtime.errors import (
     DataUnavailableError,
     MaxStepsExceededError,
@@ -45,11 +46,12 @@ class RefSpec:
 
 @dataclass(frozen=True)
 class ExprSpec:
-    kind: Literal["not", "method_call", "ref", "literal"]
+    kind: Literal["not", "method_call", "ref", "literal", "and", "or"]
     expr: ExprSpec | None = None
     receiver: ExprSpec | None = None
     method: str | None = None
     args: tuple[ExprSpec, ...] = ()
+    exprs: tuple[ExprSpec, ...] = ()
     ref: RefSpec | None = None
     type: str | None = None
     value: Any = None
@@ -227,6 +229,22 @@ class WorkflowRuntime:
         for p in manifest.policies:
             self._policies_by_trigger.setdefault(p.trigger.capability, []).append(p)
 
+    def _coerce_path_inputs(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        """Coerce path-typed workflow inputs from str to Path.
+
+        This ensures that method dispatch in policy evaluation (e.g.
+        ``contains``, ``eq``) sees `Path` values for path-typed inputs,
+        matching the declared manifest types.  Path-typed inputs that
+        arrive as strings (common from CLI/env) become ``Path`` objects.
+        """
+        if not inputs:
+            return inputs
+        input_types: dict[str, str] = {s.name: s.type for s in self._manifest.inputs}
+        for k, v in inputs.items():
+            if input_types.get(k) == "path" and isinstance(v, str):
+                inputs[k] = Path(v)
+        return inputs
+
     # ------------------------------------------------------------------
     # Public execution
     # ------------------------------------------------------------------
@@ -239,6 +257,7 @@ class WorkflowRuntime:
         event_sink: WorkflowEventSink | None = None,
     ) -> WorkflowResult:
         opts = options if options is not None else RunOptions()
+        inputs = self._coerce_path_inputs(dict(inputs))
         stage_outputs: dict[str, dict[str, Any]] = {}
         current_id = self._manifest.entry_stage_id
         steps = 0
@@ -662,6 +681,10 @@ class WorkflowRuntime:
         capability: str,
     ) -> dict[str, Any]:
         bound: dict[str, Any] = {}
+        spec = CAPABILITY_CATALOG.get(capability)
+        bound_types: dict[str, CapabilityParamType] = (
+            {p.name: p.type for p in spec.required_params} if spec else {}
+        )
         for bound_var, arg_name in trigger.bind.items():
             if arg_name not in args:
                 msg = (
@@ -669,7 +692,10 @@ class WorkflowRuntime:
                     f"is missing from capability '{capability}' call args"
                 )
                 raise PolicyEvaluationError(msg)
-            bound[bound_var] = args[arg_name]
+            val = args[arg_name]
+            if bound_types.get(arg_name) == CapabilityParamType.PATH and isinstance(val, str):
+                val = Path(val)
+            bound[bound_var] = val
         return bound
 
     @staticmethod
@@ -950,6 +976,10 @@ def _eval_expr_impl(
         receiver_val = recurse(expr.receiver)
         arg_vals = [recurse(a) for a in expr.args]
         return _eval_method_call(expr.method, receiver_val, arg_vals)
+    if expr.kind == "and":
+        return all(recurse(e) for e in expr.exprs)
+    if expr.kind == "or":
+        return any(recurse(e) for e in expr.exprs)
     msg = f"Unknown expression kind '{expr.kind}'"
     raise DataUnavailableError(msg)
 
@@ -960,15 +990,33 @@ def _eval_method_call(
     arg_vals: list[Any],
 ) -> Any:
     if method == "contains":
-        if isinstance(receiver_val, str):
-            receiver_val = Path(receiver_val)
-        if not isinstance(receiver_val, Path):
-            msg = f"contains() receiver must be Path, got {type(receiver_val).__name__}"
+        return _method_contains(receiver_val, arg_vals)
+    if method == "eq":
+        return _method_eq(receiver_val, arg_vals)
+    if method == "starts_with":
+        return _method_starts_with(receiver_val, arg_vals)
+    msg = f"Unknown method '{method}'"
+    raise DataUnavailableError(msg)
+
+
+def _method_contains(receiver_val: Any, arg_vals: list[Any]) -> Any:
+    # Plan §5: contains accepts exactly 1 argument.
+    if len(arg_vals) != 1:
+        msg = "contains() requires exactly 1 argument"
+        raise DataUnavailableError(msg)
+    target = arg_vals[0]
+
+    if isinstance(receiver_val, str):
+        # string.contains(string) — substring match.
+        # string.contains(Path) is rejected (docs/dsl-and-ir.md §6); path-typed
+        # inputs and bound args are coerced at the runtime boundary instead.
+        if not isinstance(target, str):
+            msg = f"string.contains() argument must be string, got {type(target).__name__}"
             raise DataUnavailableError(msg)
-        if len(arg_vals) < 1:
-            msg = "contains() requires at least 1 argument"
-            raise DataUnavailableError(msg)
-        target = arg_vals[0]
+        return target in receiver_val
+
+    if isinstance(receiver_val, Path):
+        # Path.contains(Path|string) — path containment.
         if isinstance(target, str):
             target = Path(target)
         if isinstance(target, Path):
@@ -980,10 +1028,56 @@ def _eval_method_call(
             except (OSError, ValueError):
                 return False
             else:
-                return target_resolved == cwd_resolved or cwd_resolved in target_resolved.parents
+                return (
+                    target_resolved == cwd_resolved
+                    or cwd_resolved in target_resolved.parents
+                )
         return False
-    msg = f"Unknown method '{method}'"
+
+    msg = f"contains() receiver must be Path or string, got {type(receiver_val).__name__}"
     raise DataUnavailableError(msg)
+
+
+def _method_eq(receiver_val: Any, arg_vals: list[Any]) -> Any:
+    if len(arg_vals) != 1:
+        msg = "eq() requires exactly 1 argument"
+        raise DataUnavailableError(msg)
+    return _eq(receiver_val, arg_vals[0])
+
+
+def _method_starts_with(receiver_val: Any, arg_vals: list[Any]) -> Any:
+    if len(arg_vals) != 1:
+        msg = "starts_with() requires exactly 1 argument"
+        raise DataUnavailableError(msg)
+    if not isinstance(receiver_val, str):
+        msg = f"starts_with() receiver must be string, got {type(receiver_val).__name__}"
+        raise DataUnavailableError(msg)
+    arg = arg_vals[0]
+    if not isinstance(arg, str):
+        msg = f"starts_with() argument must be string, got {type(arg).__name__}"
+        raise DataUnavailableError(msg)
+    return receiver_val.startswith(arg)
+
+
+def _eq(a: Any, b: Any) -> bool:
+    a_is_path = isinstance(a, Path)
+    b_is_path = isinstance(b, Path)
+    if a_is_path or b_is_path:
+        # Plan §5.1: coerce string operands to Path, then
+        # absolute → resolve(strict=False), relative → lexical normpath.
+        a_p = Path(a) if not a_is_path else a
+        b_p = Path(b) if not b_is_path else b
+        if a_p.is_absolute() or b_p.is_absolute():
+            return a_p.resolve(strict=False) == b_p.resolve(strict=False)
+        # both relative: lexical normalized compare
+        return os.path.normpath(str(a_p)) == os.path.normpath(str(b_p))
+    # Both operands are strings (neither is a Path).  This branch is
+    # only reached for genuinely string-typed receivers (e.g. `command`
+    # from os.shell) — path-typed inputs and bound vars are coerced to
+    # Path at the binding boundary (see _bind_trigger_args,
+    # _coerce_path_inputs).  Raw equality is correct here because
+    # path-normalising a shell command would be wrong.
+    return a == b
 
 
 # ---------------------------------------------------------------------------

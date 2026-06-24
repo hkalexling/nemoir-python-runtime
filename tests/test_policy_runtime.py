@@ -1090,3 +1090,838 @@ async def test_confirm_false_blocks_both_write_tools(tmp_path: Path) -> None:
     runtime2 = WorkflowRuntime(manifest=manifest, tools=registry, stage_executor=CallEditFile())
     with pytest.raises(PolicyDeniedError, match=r"user\.confirm returned False"):  # type: ignore[reportUnknownMemberType]
         await runtime2.run({"cwd": str(tmp_path)})
+
+
+# ------------------------------------------------------------------
+# New predicate tests (Phase 2: eq, starts_with, string contains, and/or)
+# ------------------------------------------------------------------
+
+
+async def test_os_shell_command_eq_allowed(make_registry_with_log: Any) -> None:
+    """Exact command match allows the call."""
+    deny_policy = PolicySpec(
+        id='deny os.shell(command) if not command.eq("python run.py")',
+        kind="deny",
+        trigger=TriggerSpec(capability="os.shell", bind={"command": "command"}),
+        condition=ExprSpec(
+            kind="not",
+            expr=ExprSpec(
+                kind="method_call",
+                receiver=ExprSpec(kind="ref", ref=RefSpec(kind="bound", name="command")),
+                method="eq",
+                args=(ExprSpec(kind="literal", type="string", value="python run.py"),),
+            ),
+        ),
+    )
+    stages = (
+        StageSpec(
+            id="A", prompt="A", reads=(),
+            writes=(WriteSpec(name="out_a", type="string", optional=False),),
+            requires=frozenset({"os.shell"}), transitions=(),
+        ),
+    )
+    manifest = WorkflowManifest(
+        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        inputs=(InputSpec(name="task", type="string"),),
+        capabilities=frozenset({"os.shell"}),
+        policies=(deny_policy,),
+        stages=stages,
+    )
+    registry, calls = make_registry_with_log()
+
+    class Exec:
+        async def execute(self, ctx: StageContext) -> Mapping[str, object]:
+            await ctx.call_tool("os.shell", {"command": "python run.py"})
+            return {"out_a": "done"}
+
+    runtime = WorkflowRuntime(manifest=manifest, tools=registry, stage_executor=Exec())
+    await runtime.run({"task": "test"})
+    assert len(calls) == 1
+
+
+async def test_os_shell_command_eq_denied(make_registry_with_log: Any) -> None:
+    deny_policy = PolicySpec(
+        id='deny os.shell(command) if not command.eq("python run.py")',
+        kind="deny",
+        trigger=TriggerSpec(capability="os.shell", bind={"command": "command"}),
+        condition=ExprSpec(
+            kind="not",
+            expr=ExprSpec(
+                kind="method_call",
+                receiver=ExprSpec(kind="ref", ref=RefSpec(kind="bound", name="command")),
+                method="eq",
+                args=(ExprSpec(kind="literal", type="string", value="python run.py"),),
+            ),
+        ),
+    )
+    stages = (
+        StageSpec(
+            id="A", prompt="A", reads=(),
+            writes=(WriteSpec(name="out_a", type="string", optional=False),),
+            requires=frozenset({"os.shell"}), transitions=(),
+        ),
+    )
+    manifest = WorkflowManifest(
+        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        inputs=(InputSpec(name="task", type="string"),),
+        capabilities=frozenset({"os.shell"}),
+        policies=(deny_policy,),
+        stages=stages,
+    )
+    registry, calls = make_registry_with_log()
+
+    class Exec:
+        async def execute(self, ctx: StageContext) -> Mapping[str, object]:
+            await ctx.call_tool("os.shell", {"command": "rm -rf /"})
+            return {"out_a": "done"}
+
+    runtime = WorkflowRuntime(manifest=manifest, tools=registry, stage_executor=Exec())
+    with pytest.raises(PolicyDeniedError, match="denied"):
+        await runtime.run({"task": "test"})
+    assert not calls
+
+
+async def test_os_shell_command_starts_with_allowed(make_registry_with_log: Any) -> None:
+    deny_policy = PolicySpec(
+        id='deny os.shell(command) if not command.starts_with("python run.py")',
+        kind="deny",
+        trigger=TriggerSpec(capability="os.shell", bind={"command": "command"}),
+        condition=ExprSpec(
+            kind="not",
+            expr=ExprSpec(
+                kind="method_call",
+                receiver=ExprSpec(kind="ref", ref=RefSpec(kind="bound", name="command")),
+                method="starts_with",
+                args=(ExprSpec(kind="literal", type="string", value="python run.py"),),
+            ),
+        ),
+    )
+    stages = (
+        StageSpec(
+            id="A", prompt="A", reads=(),
+            writes=(WriteSpec(name="out_a", type="string", optional=False),),
+            requires=frozenset({"os.shell"}), transitions=(),
+        ),
+    )
+    manifest = WorkflowManifest(
+        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        inputs=(InputSpec(name="task", type="string"),),
+        capabilities=frozenset({"os.shell"}),
+        policies=(deny_policy,),
+        stages=stages,
+    )
+    registry, calls = make_registry_with_log()
+
+    class Exec:
+        async def execute(self, ctx: StageContext) -> Mapping[str, object]:
+            await ctx.call_tool("os.shell", {"command": "python run.py --flag"})
+            return {"out_a": "done"}
+
+    runtime = WorkflowRuntime(manifest=manifest, tools=registry, stage_executor=Exec())
+    await runtime.run({"task": "test"})
+    assert len(calls) == 1
+
+
+async def test_os_shell_command_contains_metachar_denied(make_registry_with_log: Any) -> None:
+    """command.contains("&&") should deny shell injection"""
+    deny_policy = PolicySpec(
+        id='deny os.shell(command) if command.contains("&&")',
+        kind="deny",
+        trigger=TriggerSpec(capability="os.shell", bind={"command": "command"}),
+        condition=ExprSpec(
+            kind="method_call",
+            receiver=ExprSpec(kind="ref", ref=RefSpec(kind="bound", name="command")),
+            method="contains",
+            args=(ExprSpec(kind="literal", type="string", value="&&"),),
+        ),
+    )
+    stages = (
+        StageSpec(
+            id="A", prompt="A", reads=(),
+            writes=(WriteSpec(name="out_a", type="string", optional=False),),
+            requires=frozenset({"os.shell"}), transitions=(),
+        ),
+    )
+    manifest = WorkflowManifest(
+        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        inputs=(InputSpec(name="task", type="string"),),
+        capabilities=frozenset({"os.shell"}),
+        policies=(deny_policy,),
+        stages=stages,
+    )
+    registry, calls = make_registry_with_log()
+
+    class Exec:
+        async def execute(self, ctx: StageContext) -> Mapping[str, object]:
+            await ctx.call_tool("os.shell", {"command": "echo hi && rm -rf /"})
+            return {"out_a": "done"}
+
+    runtime = WorkflowRuntime(manifest=manifest, tools=registry, stage_executor=Exec())
+    with pytest.raises(PolicyDeniedError, match="denied"):
+        await runtime.run({"task": "test"})
+    assert not calls
+
+
+async def test_fs_write_path_eq_allowed(make_registry_with_log: Any) -> None:
+    deny_policy = PolicySpec(
+        id="deny fs.write(path) if not path.eq(candidate_path)",
+        kind="deny",
+        trigger=TriggerSpec(capability="fs.write", bind={"path": "path"}),
+        condition=ExprSpec(
+            kind="not",
+            expr=ExprSpec(
+                kind="method_call",
+                receiver=ExprSpec(kind="ref", ref=RefSpec(kind="bound", name="path")),
+                method="eq",
+                args=(ExprSpec(kind="ref", ref=RefSpec(kind="input", name="candidate_path")),),
+            ),
+        ),
+    )
+    stages = (
+        StageSpec(
+            id="A", prompt="A", reads=(),
+            writes=(WriteSpec(name="out_a", type="string", optional=False),),
+            requires=frozenset({"fs.write"}), transitions=(),
+        ),
+    )
+    manifest = WorkflowManifest(
+        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        inputs=(
+            InputSpec(name="task", type="string"),
+            InputSpec(name="candidate_path", type="path"),
+        ),
+        capabilities=frozenset({"fs.write"}),
+        policies=(deny_policy,),
+        stages=stages,
+    )
+    registry, calls = make_registry_with_log()
+
+    class Exec:
+        async def execute(self, ctx: StageContext) -> Mapping[str, object]:
+            await ctx.call_tool("fs.write", {"path": Path("/tmp/candidate.py"), "content": "x"})
+            return {"out_a": "done"}
+
+    runtime = WorkflowRuntime(manifest=manifest, tools=registry, stage_executor=Exec())
+    await runtime.run({"task": "test", "candidate_path": Path("/tmp/candidate.py")})
+    assert len(calls) == 1
+
+
+async def test_fs_write_path_eq_denied(make_registry_with_log: Any) -> None:
+    deny_policy = PolicySpec(
+        id="deny fs.write(path) if not path.eq(candidate_path)",
+        kind="deny",
+        trigger=TriggerSpec(capability="fs.write", bind={"path": "path"}),
+        condition=ExprSpec(
+            kind="not",
+            expr=ExprSpec(
+                kind="method_call",
+                receiver=ExprSpec(kind="ref", ref=RefSpec(kind="bound", name="path")),
+                method="eq",
+                args=(ExprSpec(kind="ref", ref=RefSpec(kind="input", name="candidate_path")),),
+            ),
+        ),
+    )
+    stages = (
+        StageSpec(
+            id="A", prompt="A", reads=(),
+            writes=(WriteSpec(name="out_a", type="string", optional=False),),
+            requires=frozenset({"fs.write"}), transitions=(),
+        ),
+    )
+    manifest = WorkflowManifest(
+        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        inputs=(
+            InputSpec(name="task", type="string"),
+            InputSpec(name="candidate_path", type="path"),
+        ),
+        capabilities=frozenset({"fs.write"}),
+        policies=(deny_policy,),
+        stages=stages,
+    )
+    registry, calls = make_registry_with_log()
+
+    class Exec:
+        async def execute(self, ctx: StageContext) -> Mapping[str, object]:
+            await ctx.call_tool("fs.write", {"path": Path("/tmp/harness/eval.py"), "content": "x"})
+            return {"out_a": "done"}
+
+    runtime = WorkflowRuntime(manifest=manifest, tools=registry, stage_executor=Exec())
+    with pytest.raises(PolicyDeniedError, match="denied"):
+        await runtime.run({"task": "test", "candidate_path": Path("/tmp/candidate.py")})
+    assert not calls
+
+
+async def test_eq_path_relative_lexical(make_registry_with_log: Any) -> None:
+    """Relative path eq does lexical comparison without filesystem access."""
+    deny_policy = PolicySpec(
+        id='deny fs.write(path) if not path.eq("candidate.py")',
+        kind="deny",
+        trigger=TriggerSpec(capability="fs.write", bind={"path": "path"}),
+        condition=ExprSpec(
+            kind="not",
+            expr=ExprSpec(
+                kind="method_call",
+                receiver=ExprSpec(kind="ref", ref=RefSpec(kind="bound", name="path")),
+                method="eq",
+                args=(ExprSpec(kind="literal", type="string", value="candidate.py"),),
+            ),
+        ),
+    )
+    stages = (
+        StageSpec(
+            id="A", prompt="A", reads=(),
+            writes=(WriteSpec(name="out_a", type="string", optional=False),),
+            requires=frozenset({"fs.write"}), transitions=(),
+        ),
+    )
+    manifest = WorkflowManifest(
+        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        inputs=(InputSpec(name="task", type="string"),),
+        capabilities=frozenset({"fs.write"}),
+        policies=(deny_policy,),
+        stages=stages,
+    )
+    registry, calls = make_registry_with_log()
+
+    class Exec:
+        async def execute(self, ctx: StageContext) -> Mapping[str, object]:
+            await ctx.call_tool("fs.write", {"path": Path("candidate.py"), "content": "x"})
+            return {"out_a": "done"}
+
+    runtime = WorkflowRuntime(manifest=manifest, tools=registry, stage_executor=Exec())
+    await runtime.run({"task": "test"})
+    assert len(calls) == 1
+
+
+async def test_and_short_circuits(make_registry_with_log: Any) -> None:
+    """And expression short-circuits: first false means second never evaluated."""
+    # Build: deny if command.eq("bad") and missing_bound_ref.eq("x")
+    # command="good", so first operand (command.eq("bad")) is False
+    # AND short-circuits, never evaluating the second operand (which would fail)
+    deny_policy = PolicySpec(
+        id='deny os.shell(command) if command.eq("bad") and missing.eq("x")',
+        kind="deny",
+        trigger=TriggerSpec(capability="os.shell", bind={"command": "command"}),
+        condition=ExprSpec(
+            kind="and",
+            exprs=(
+                ExprSpec(
+                    kind="method_call",
+                    receiver=ExprSpec(kind="ref", ref=RefSpec(kind="bound", name="command")),
+                    method="eq",
+                    args=(ExprSpec(kind="literal", type="string", value="bad"),),
+                ),
+                ExprSpec(
+                    kind="method_call",
+                    receiver=ExprSpec(kind="ref", ref=RefSpec(kind="bound", name="missing")),
+                    method="eq",
+                    args=(ExprSpec(kind="literal", type="string", value="x"),),
+                ),
+            ),
+        ),
+    )
+    stages = (
+        StageSpec(
+            id="A", prompt="A", reads=(),
+            writes=(WriteSpec(name="out_a", type="string", optional=False),),
+            requires=frozenset({"os.shell"}), transitions=(),
+        ),
+    )
+    manifest = WorkflowManifest(
+        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        inputs=(InputSpec(name="task", type="string"),),
+        capabilities=frozenset({"os.shell"}),
+        policies=(deny_policy,),
+        stages=stages,
+    )
+    registry, calls = make_registry_with_log()
+
+    class Exec:
+        async def execute(self, ctx: StageContext) -> Mapping[str, object]:
+            await ctx.call_tool("os.shell", {"command": "good"})
+            return {"out_a": "done"}
+
+    runtime = WorkflowRuntime(manifest=manifest, tools=registry, stage_executor=Exec())
+    # Should succeed: first operand (command.eq("bad")) is False for command="good",
+    # so AND short-circuits and never evaluates the second operand.
+    await runtime.run({"task": "test"})
+    assert len(calls) == 1
+
+
+async def test_or_short_circuits(make_registry_with_log: Any) -> None:
+    """Or expression short-circuits: first true means second never evaluated."""
+    # Build: deny if command.eq("good") or missing_bound_ref.eq("x")
+    # command="good", so first operand is True, OR short-circuits,
+    # never evaluating the second operand (which would fail with missing ref)
+    deny_policy = PolicySpec(
+        id='deny os.shell(command) if command.eq("good") or missing.eq("x")',
+        kind="deny",
+        trigger=TriggerSpec(capability="os.shell", bind={"command": "command"}),
+        condition=ExprSpec(
+            kind="or",
+            exprs=(
+                ExprSpec(
+                    kind="method_call",
+                    receiver=ExprSpec(kind="ref", ref=RefSpec(kind="bound", name="command")),
+                    method="eq",
+                    args=(ExprSpec(kind="literal", type="string", value="good"),),
+                ),
+                ExprSpec(
+                    kind="method_call",
+                    receiver=ExprSpec(kind="ref", ref=RefSpec(kind="bound", name="missing")),
+                    method="eq",
+                    args=(ExprSpec(kind="literal", type="string", value="x"),),
+                ),
+            ),
+        ),
+    )
+    stages = (
+        StageSpec(
+            id="A", prompt="A", reads=(),
+            writes=(WriteSpec(name="out_a", type="string", optional=False),),
+            requires=frozenset({"os.shell"}), transitions=(),
+        ),
+    )
+    manifest = WorkflowManifest(
+        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        inputs=(InputSpec(name="task", type="string"),),
+        capabilities=frozenset({"os.shell"}),
+        policies=(deny_policy,),
+        stages=stages,
+    )
+    registry, calls = make_registry_with_log()
+
+    class Exec:
+        async def execute(self, ctx: StageContext) -> Mapping[str, object]:
+            await ctx.call_tool("os.shell", {"command": "good"})
+            return {"out_a": "done"}
+
+    runtime = WorkflowRuntime(manifest=manifest, tools=registry, stage_executor=Exec())
+    # Should raise PolicyDeniedError because first operand is True (denied),
+    # and OR short-circuits. Second operand (with missing bound ref) never reached.
+    with pytest.raises(PolicyDeniedError, match="denied"):
+        await runtime.run({"task": "test"})
+    assert not calls
+
+
+# ------------------------------------------------------------------
+# Missing §8.4 tests (starts_with denied, absolute eq, in-allowlist lowered,
+# edit/write gated with new eq predicate)
+# ------------------------------------------------------------------
+
+
+async def test_os_shell_command_starts_with_denied(make_registry_with_log: Any) -> None:
+    """Non-matching prefix should raise PolicyDeniedError."""
+    deny_policy = PolicySpec(
+        id='deny os.shell(command) if not command.starts_with("python run.py")',
+        kind="deny",
+        trigger=TriggerSpec(capability="os.shell", bind={"command": "command"}),
+        condition=ExprSpec(
+            kind="not",
+            expr=ExprSpec(
+                kind="method_call",
+                receiver=ExprSpec(kind="ref", ref=RefSpec(kind="bound", name="command")),
+                method="starts_with",
+                args=(ExprSpec(kind="literal", type="string", value="python run.py"),),
+            ),
+        ),
+    )
+    stages = (
+        StageSpec(
+            id="A", prompt="A", reads=(),
+            writes=(WriteSpec(name="out_a", type="string", optional=False),),
+            requires=frozenset({"os.shell"}), transitions=(),
+        ),
+    )
+    manifest = WorkflowManifest(
+        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        inputs=(InputSpec(name="task", type="string"),),
+        capabilities=frozenset({"os.shell"}),
+        policies=(deny_policy,),
+        stages=stages,
+    )
+    registry, calls = make_registry_with_log()
+
+    class Exec:
+        async def execute(self, ctx: StageContext) -> Mapping[str, object]:
+            await ctx.call_tool("os.shell", {"command": "rm -rf /"})
+            return {"out_a": "done"}
+
+    runtime = WorkflowRuntime(manifest=manifest, tools=registry, stage_executor=Exec())
+    with pytest.raises(PolicyDeniedError, match="denied"):
+        await runtime.run({"task": "test"})
+    assert not calls
+
+
+async def test_eq_path_absolute_resolves(make_registry_with_log: Any) -> None:
+    """Absolute path eq uses resolve(strict=False) from docs/dsl-and-ir.md §6.1."""
+    deny_policy = PolicySpec(
+        id='deny fs.write(path) if not path.eq("/tmp/work/candidate.py")',
+        kind="deny",
+        trigger=TriggerSpec(capability="fs.write", bind={"path": "path"}),
+        condition=ExprSpec(
+            kind="not",
+            expr=ExprSpec(
+                kind="method_call",
+                receiver=ExprSpec(kind="ref", ref=RefSpec(kind="bound", name="path")),
+                method="eq",
+                args=(ExprSpec(kind="literal", type="string", value="/tmp/work/candidate.py"),),
+            ),
+        ),
+    )
+    stages = (
+        StageSpec(
+            id="A", prompt="A", reads=(),
+            writes=(WriteSpec(name="out_a", type="string", optional=False),),
+            requires=frozenset({"fs.write"}), transitions=(),
+        ),
+    )
+    manifest = WorkflowManifest(
+        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        inputs=(InputSpec(name="task", type="string"),),
+        capabilities=frozenset({"fs.write"}),
+        policies=(deny_policy,),
+        stages=stages,
+    )
+    registry, calls = make_registry_with_log()
+
+    class Exec:
+        async def execute(self, ctx: StageContext) -> Mapping[str, object]:
+            await ctx.call_tool(
+                "fs.write",
+                {"path": Path("/tmp/work/candidate.py"), "content": "x"},
+            )
+            return {"out_a": "done"}
+
+    runtime = WorkflowRuntime(manifest=manifest, tools=registry, stage_executor=Exec())
+    await runtime.run({"task": "test"})
+    assert len(calls) == 1
+
+
+async def test_fs_write_path_in_allowlist_lowered(make_registry_with_log: Any) -> None:
+    """The lowered shape (Or of eq) from `in [...]` should allow matches."""
+    deny_policy = PolicySpec(
+        id="deny fs.write(path) if not (path.eq(x) or path.eq(y))",
+        kind="deny",
+        trigger=TriggerSpec(capability="fs.write", bind={"path": "path"}),
+        condition=ExprSpec(
+            kind="not",
+            expr=ExprSpec(
+                kind="or",
+                exprs=(
+                    ExprSpec(
+                        kind="method_call",
+                        receiver=ExprSpec(kind="ref", ref=RefSpec(kind="bound", name="path")),
+                        method="eq",
+                        args=(ExprSpec(kind="literal", type="string", value="a.py"),),
+                    ),
+                    ExprSpec(
+                        kind="method_call",
+                        receiver=ExprSpec(kind="ref", ref=RefSpec(kind="bound", name="path")),
+                        method="eq",
+                        args=(ExprSpec(kind="literal", type="string", value="b.py"),),
+                    ),
+                ),
+            ),
+        ),
+    )
+    stages = (
+        StageSpec(
+            id="A", prompt="A", reads=(),
+            writes=(WriteSpec(name="out_a", type="string", optional=False),),
+            requires=frozenset({"fs.write"}), transitions=(),
+        ),
+    )
+    manifest = WorkflowManifest(
+        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        inputs=(InputSpec(name="task", type="string"),),
+        capabilities=frozenset({"fs.write"}),
+        policies=(deny_policy,),
+        stages=stages,
+    )
+    registry, calls = make_registry_with_log()
+
+    # Allowed: a.py matches first disjunct
+    class ExecA:
+        async def execute(self, ctx: StageContext) -> Mapping[str, object]:
+            await ctx.call_tool("fs.write", {"path": Path("a.py"), "content": "x"})
+            return {"out_a": "done"}
+
+    runtime_a = WorkflowRuntime(manifest=manifest, tools=registry, stage_executor=ExecA())
+    await runtime_a.run({"task": "test"})
+    assert len(calls) == 1
+    calls.clear()
+
+    # Denied: z.py matches neither disjunct
+    class ExecZ:
+        async def execute(self, ctx: StageContext) -> Mapping[str, object]:
+            await ctx.call_tool("fs.write", {"path": Path("z.py"), "content": "x"})
+            return {"out_a": "done"}
+
+    runtime_z = WorkflowRuntime(manifest=manifest, tools=registry, stage_executor=ExecZ())
+    with pytest.raises(PolicyDeniedError, match="denied"):
+        await runtime_z.run({"task": "test"})
+    assert not calls
+
+
+async def test_eq_policy_applies_to_edit_file_and_write_file(make_registry_with_log: Any) -> None:
+    """Both official fs.write tools (write_file + edit_file) are gated by path.eq.
+
+    We exercise two fs.write calls (one with tool_name="write_file", one
+    without) to assert both reach the same policy enforcement path.  The
+    registry's single fs.write tool serves both calls.
+    """
+    deny_policy = PolicySpec(
+        id='deny fs.write(path) if not path.eq("/tmp/candidate.py")',
+        kind="deny",
+        trigger=TriggerSpec(capability="fs.write", bind={"path": "path"}),
+        condition=ExprSpec(
+            kind="not",
+            expr=ExprSpec(
+                kind="method_call",
+                receiver=ExprSpec(kind="ref", ref=RefSpec(kind="bound", name="path")),
+                method="eq",
+                args=(ExprSpec(kind="literal", type="string", value="/tmp/candidate.py"),),
+            ),
+        ),
+    )
+    stages = (
+        StageSpec(
+            id="A", prompt="A", reads=(),
+            writes=(WriteSpec(name="out_a", type="string", optional=False),),
+            requires=frozenset({"fs.write"}), transitions=(),
+        ),
+    )
+    manifest = WorkflowManifest(
+        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        inputs=(InputSpec(name="task", type="string"),),
+        capabilities=frozenset({"fs.write"}),
+        policies=(deny_policy,),
+        stages=stages,
+    )
+    registry, calls = make_registry_with_log()
+
+    # Allowed: write_file to candidate.py
+    class CallWriteFile:
+        async def execute(self, ctx: StageContext) -> Mapping[str, object]:
+            await ctx.call_tool(
+                "fs.write", {"path": Path("/tmp/candidate.py"), "content": "hello"},
+                tool_name="write_file",
+            )
+            return {"out_a": "done"}
+
+    runtime_w = WorkflowRuntime(manifest=manifest, tools=registry, stage_executor=CallWriteFile())
+    await runtime_w.run({"task": "test"})
+    assert len(calls) == 1
+    calls.clear()
+
+    # Denied: write_file to non-allowlisted path
+    class CallDenied:
+        async def execute(self, ctx: StageContext) -> Mapping[str, object]:
+            await ctx.call_tool(
+                "fs.write", {"path": Path("/tmp/harness/eval.py"), "content": "x"},
+                tool_name="write_file",
+            )
+            return {"out_a": "done"}
+
+    runtime_d = WorkflowRuntime(manifest=manifest, tools=registry, stage_executor=CallDenied())
+    with pytest.raises(PolicyDeniedError, match="denied"):
+        await runtime_d.run({"task": "test"})
+    assert not calls
+
+
+# ------------------------------------------------------------------
+# Regression: string cwd + string bound path → path containment (not substring)
+# ------------------------------------------------------------------
+
+
+async def test_contains_string_cwd_and_string_bound_path_uses_path_containment(
+    make_registry_with_log: Any,
+) -> None:
+    """When cwd (path-typed input) arrives as a string, and the bound path is
+    also a string (as a model emits), the coercion fix ensures path containment
+    still applies — not substring match. Regression for false-deny."""
+    deny_policy = PolicySpec(
+        id="deny fs.read(path) if not cwd.contains(path)",
+        kind="deny",
+        trigger=TriggerSpec(capability="fs.read", bind={"path": "path"}),
+        condition=ExprSpec(
+            kind="not",
+            expr=ExprSpec(
+                kind="method_call",
+                receiver=ExprSpec(kind="ref", ref=RefSpec(kind="input", name="cwd")),
+                method="contains",
+                args=(ExprSpec(kind="ref", ref=RefSpec(kind="bound", name="path")),),
+            ),
+        ),
+    )
+    stages = (
+        StageSpec(
+            id="A", prompt="A", reads=(),
+            writes=(WriteSpec(name="out_a", type="string", optional=False),),
+            requires=frozenset({"fs.read"}), transitions=(),
+        ),
+    )
+    manifest = WorkflowManifest(
+        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        inputs=(InputSpec(name="task", type="string"), InputSpec(name="cwd", type="path")),
+        capabilities=frozenset({"fs.read"}),
+        policies=(deny_policy,),
+        stages=stages,
+    )
+    registry, calls = make_registry_with_log()
+
+    class Exec:
+        async def execute(self, ctx: StageContext) -> Mapping[str, object]:
+            # Call with a STRING path arg (as a model emits) — the bound
+            # `path` should be coerced to Path, and cwd stays str but
+            # the presence of the Path arg triggers promotion to path
+            # containment, not substring match.
+            await ctx.call_tool("fs.read", {"path": "file.txt"})
+            return {"out_a": "done"}
+
+    runtime = WorkflowRuntime(manifest=manifest, tools=registry, stage_executor=Exec())
+    # cwd is passed as a string; policy should still allow (path containment)
+    await runtime.run({"task": "test", "cwd": "/tmp/work"})
+    assert len(calls) == 1
+
+
+async def test_contains_substring_bypass_with_string_cwd_rejected(
+    make_registry_with_log: Any,
+) -> None:
+    """An absolute ancestor path that is a substring of the cwd string must NOT
+    pass containment — it is outside cwd. Regression for substring bypass."""
+    deny_policy = PolicySpec(
+        id="deny fs.read(path) if not cwd.contains(path)",
+        kind="deny",
+        trigger=TriggerSpec(capability="fs.read", bind={"path": "path"}),
+        condition=ExprSpec(
+            kind="not",
+            expr=ExprSpec(
+                kind="method_call",
+                receiver=ExprSpec(kind="ref", ref=RefSpec(kind="input", name="cwd")),
+                method="contains",
+                args=(ExprSpec(kind="ref", ref=RefSpec(kind="bound", name="path")),),
+            ),
+        ),
+    )
+    stages = (
+        StageSpec(
+            id="A", prompt="A", reads=(),
+            writes=(WriteSpec(name="out_a", type="string", optional=False),),
+            requires=frozenset({"fs.read"}), transitions=(),
+        ),
+    )
+    manifest = WorkflowManifest(
+        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        inputs=(InputSpec(name="task", type="string"), InputSpec(name="cwd", type="path")),
+        capabilities=frozenset({"fs.read"}),
+        policies=(deny_policy,),
+        stages=stages,
+    )
+    registry, calls = make_registry_with_log()
+
+    class Exec:
+        async def execute(self, ctx: StageContext) -> Mapping[str, object]:
+            # /home/alice is a SUBSTRING of /home/alice/project but is
+            # its ancestor, not inside it.  Path containment says False.
+            await ctx.call_tool("fs.read", {"path": "/home/alice"})
+            return {"out_a": "done"}
+
+    runtime = WorkflowRuntime(manifest=manifest, tools=registry, stage_executor=Exec())
+    with pytest.raises(PolicyDeniedError, match="denied"):
+        await runtime.run({"task": "test", "cwd": "/home/alice/project"})
+    assert not calls
+
+
+# ------------------------------------------------------------------
+# Defense-in-depth runtime tests: reject invalid manifests at runtime
+# ------------------------------------------------------------------
+
+
+async def test_contains_extra_args_raises_policy_evaluation_error(
+    make_registry_with_log: Any,
+) -> None:
+    """Runtime defense: contains() with extra args raises PolicyEvaluationError."""
+    deny_policy = PolicySpec(
+        id='deny os.shell(command) if command.contains("x", "y")',
+        kind="deny",
+        trigger=TriggerSpec(capability="os.shell", bind={"command": "command"}),
+        condition=ExprSpec(
+            kind="method_call",
+            receiver=ExprSpec(kind="ref", ref=RefSpec(kind="bound", name="command")),
+            method="contains",
+            args=(
+                ExprSpec(kind="literal", type="string", value="x"),
+                ExprSpec(kind="literal", type="string", value="y"),
+            ),
+        ),
+    )
+    stages = (
+        StageSpec(
+            id="A", prompt="A", reads=(),
+            writes=(WriteSpec(name="out_a", type="string", optional=False),),
+            requires=frozenset({"os.shell"}), transitions=(),
+        ),
+    )
+    manifest = WorkflowManifest(
+        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        inputs=(InputSpec(name="task", type="string"),),
+        capabilities=frozenset({"os.shell"}),
+        policies=(deny_policy,),
+        stages=stages,
+    )
+    registry, _ = make_registry_with_log()
+
+    class Exec:
+        async def execute(self, ctx: StageContext) -> Mapping[str, object]:
+            await ctx.call_tool("os.shell", {"command": "echo hi"})
+            return {"out_a": "done"}
+
+    runtime = WorkflowRuntime(manifest=manifest, tools=registry, stage_executor=Exec())
+    with pytest.raises(PolicyEvaluationError, match="requires exactly 1 argument"):
+        await runtime.run({"task": "test"})
+
+
+async def test_string_contains_path_raises_policy_evaluation_error(
+    make_registry_with_log: Any,
+) -> None:
+    """Runtime defense: string.contains(Path) raises PolicyEvaluationError."""
+    deny_policy = PolicySpec(
+        id="deny os.shell(command) if command.contains(cwd)",
+        kind="deny",
+        trigger=TriggerSpec(capability="os.shell", bind={"command": "command"}),
+        condition=ExprSpec(
+            kind="method_call",
+            receiver=ExprSpec(kind="ref", ref=RefSpec(kind="bound", name="command")),
+            method="contains",
+            args=(ExprSpec(kind="ref", ref=RefSpec(kind="input", name="cwd")),),
+        ),
+    )
+    stages = (
+        StageSpec(
+            id="A", prompt="A", reads=(),
+            writes=(WriteSpec(name="out_a", type="string", optional=False),),
+            requires=frozenset({"os.shell"}), transitions=(),
+        ),
+    )
+    manifest = WorkflowManifest(
+        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        inputs=(
+            InputSpec(name="task", type="string"),
+            InputSpec(name="cwd", type="path"),
+        ),
+        capabilities=frozenset({"os.shell"}),
+        policies=(deny_policy,),
+        stages=stages,
+    )
+    registry, _ = make_registry_with_log()
+
+    class Exec:
+        async def execute(self, ctx: StageContext) -> Mapping[str, object]:
+            await ctx.call_tool("os.shell", {"command": "echo hi"})
+            return {"out_a": "done"}
+
+    runtime = WorkflowRuntime(manifest=manifest, tools=registry, stage_executor=Exec())
+    with pytest.raises(PolicyEvaluationError, match="argument must be string"):
+        await runtime.run({"task": "test", "cwd": Path("/tmp/work")})

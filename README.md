@@ -8,7 +8,7 @@ Executes compiled agent workflows as structured state machines with tool orchest
 
 - **Workflow runtime** — state-machine execution with stage ordering, read/write resolution, transition selection, and run limits.
 - **Tool framework** — capability-based tool registration, catalog-driven parameter validation, and policy-gated invocation (`fs.read`, `fs.write`, `user.confirm`, `os.shell`, `user.elicit`).
-- **Policy engine** — deny and before-policies with expression evaluation (e.g., path containment guards).
+- **Policy engine** — deny and before-policies with expression evaluation: `and`/`or` boolean combinators, `eq`/`starts_with`/`contains` predicates over bound trigger arguments, path containment and equality guards.
 - **Model integration** — `ModelStageExecutor` with LiteLLM adapter, structured output enforcement, tool-call loop, `ModelRouter` for per-stage model routing, and optional streaming via `ModelStreamingAdapter`.
 - **Live event streaming** — `WorkflowRuntime.stream()` / generated `Agent.stream()` async iterator emitting `WorkflowEvent` values (run lifecycle, model deltas, tool calls, policy decisions) for UIs, debugging, and observability.
 - **Compiler backend target** — generated workflow-specific Python packages consume this runtime; see `nemoir-backend-python` in the main NemoIR repo.
@@ -44,6 +44,64 @@ print(result.output)
 ```
 
 See the [NemoIR project](https://github.com/nemoir) for the full compiler workflow (DSL → IR → generated package).
+
+## Policy engine
+
+Deny policies use expression evaluation to gate capability calls.  Supported
+predicates: ``eq`` (exact match), ``starts_with`` (prefix), ``contains``
+(substring or path containment).  Boolean ``and``/``or`` combinators
+short-circuit at runtime.  ``in [...]`` is DSL sugar that lowers to ``or``
+of ``eq`` calls.
+
+```python
+from nemoir_runtime import PolicySpec, ExprSpec, TriggerSpec, RefSpec
+
+# deny os.shell(command) if not (
+#   command.eq("python run.py")
+#   or command.starts_with("git commit -m ")
+# )
+shell_allowlist = PolicySpec(
+    id="shell-allowlist",
+    kind="deny",
+    trigger=TriggerSpec(capability="os.shell", bind={"command": "command"}),
+    condition=ExprSpec(
+        kind="not",
+        expr=ExprSpec(
+            kind="or",
+            exprs=(
+                ExprSpec(
+                    kind="method_call",
+                    receiver=ExprSpec(kind="ref", ref=RefSpec(kind="bound", name="command")),
+                    method="eq",
+                    args=(ExprSpec(kind="literal", type="string", value="python run.py"),),
+                ),
+                ExprSpec(
+                    kind="method_call",
+                    receiver=ExprSpec(kind="ref", ref=RefSpec(kind="bound", name="command")),
+                    method="starts_with",
+                    args=(ExprSpec(kind="literal", type="string", value="git commit -m "),),
+                ),
+            ),
+        ),
+    ),
+)
+
+# deny fs.write(path) if not path.eq(candidate_path)
+write_allowlist = PolicySpec(
+    id="write-allowlist",
+    kind="deny",
+    trigger=TriggerSpec(capability="fs.write", bind={"path": "path"}),
+    condition=ExprSpec(
+        kind="not",
+        expr=ExprSpec(
+            kind="method_call",
+            receiver=ExprSpec(kind="ref", ref=RefSpec(kind="bound", name="path")),
+            method="eq",
+            args=(ExprSpec(kind="ref", ref=RefSpec(kind="input", name="candidate_path")),),
+        ),
+    ),
+)
+```
 
 ## Official tools
 

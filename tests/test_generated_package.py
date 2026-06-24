@@ -16,11 +16,13 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from textwrap import dedent
 from typing import Any
 
 import pytest  # type: ignore[import-untyped]
 
 from nemoir_runtime import Tool, ToolContext, ToolRegistry
+from nemoir_runtime.errors import PolicyDeniedError
 from nemoir_runtime.models import ModelResponse, ModelStreamChunk, ModelToolCall
 
 REPO_ROOT = Path(__file__).parents[3]
@@ -1093,3 +1095,251 @@ def test_generated_package_stream_reasoning_channel(tmp_path: Path) -> None:  # 
     rc = [e for e in events if e.kind == "run_completed"]
     assert len(rc) == 1
     assert rc[0].result.output.summary == "reasoning-stream-done"
+
+
+# ---------------------------------------------------------------------------
+# Policy predicate generated-package test (Phase 6 / review follow-up)
+# ---------------------------------------------------------------------------
+
+def _compile_and_import(nemo_path: Path, package_name: str, out_dir: Path) -> Any:
+    """Compile a .nemo file and import the generated Python package."""
+    result = subprocess.run(  # noqa: S603
+        [str(NEMO_BIN), "compile", str(nemo_path), "--target", "python", "-o", str(out_dir)],
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        sys.stderr.write(result.stderr.decode() if result.stderr else "(no stderr)\n")
+        sys.stderr.write(result.stdout.decode() if result.stdout else "(no stdout)\n")
+        result.check_returncode()
+    # Clear any previously-cached module.
+    for mod_name in list(sys.modules):
+        if mod_name == package_name or mod_name.startswith(f"{package_name}."):
+            del sys.modules[mod_name]
+    sys.path.insert(0, str(out_dir))
+    if str(RUNTIME_SRC) not in sys.path:
+        sys.path.insert(0, str(RUNTIME_SRC))
+    return __import__(package_name)  # type: ignore[reportUnknownVariableType]
+
+
+def test_generated_package_policy_literal_whitespace_preserved(tmp_path: Path) -> None:  # noqa: C901
+    """Compile a policy-allowlist workflow and assert trailing-space literals.
+
+    Regression test for the {process_string} trimming bug: policy string
+    literals used by {command.starts_with} and {command.contains} must
+    preserve significant leading/trailing whitespace.
+    """
+    nemo_src = dedent("""\
+    workflow TestAllowlist {
+      input {
+        candidate_path: path
+      }
+
+      policy {
+        deny os.shell(command) if not (
+          command.eq("python harness/preflight.py")
+          or command.starts_with("python harness/run_trial.py ")
+          or command.starts_with("git commit -m ")
+        )
+        deny os.shell(command) if command.contains("&&") or command.contains("; ")
+
+        deny fs.write(path) if not path.eq(candidate_path)
+        deny fs.write(path) if path.eq("harness/eval.py") or path.eq("harness/train.py")
+      }
+
+      stage@entry Start {
+        prompt: "start"
+        requires: os.shell, fs.write
+        output: { x: string }
+      }
+      stage@exit Fin {
+        prompt: "done"
+        input: Start.x
+        output: { summary: string }
+      }
+    }
+    """)
+    nemo_path = tmp_path / "test_allowlist.nemo"
+    nemo_path.write_text(nemo_src)
+
+    out_dir = tmp_path / "gen"
+    out_dir.mkdir()
+    pkg = _compile_and_import(nemo_path, "test_allowlist", out_dir)
+
+    manifest = pkg._manifest.WORKFLOW_MANIFEST  # noqa: SLF001  # type: ignore[reportUnknownVariableType]
+
+    # Find the os.shell allowlist policy and assert literal values
+    shell_policy = None
+    for p in manifest.policies:
+        if p.trigger.capability == "os.shell" and "starts_with" in p.id:
+            shell_policy = p
+            break
+    assert shell_policy is not None, "os.shell allowlist policy not found"
+
+    # Collect all string literals from the condition tree
+    def collect_literals(expr: Any) -> list[Any]:  # type: ignore[reportUnknownVariableType]  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        if expr.kind == "literal" and expr.type == "string":
+            return [expr.value]
+        if expr.kind == "or":
+            result: list[Any] = []
+            for e in expr.exprs:
+                result.extend(collect_literals(e))  # pyright: ignore[reportUnknownMemberType]
+            return result
+        if expr.kind == "not":
+            return collect_literals(expr.expr) if expr.expr else []
+        if expr.kind == "method_call":
+            result: list[Any] = []
+            if expr.receiver:
+                result.extend(collect_literals(expr.receiver))  # pyright: ignore[reportUnknownMemberType]
+            for a in expr.args:
+                result.extend(collect_literals(a))  # pyright: ignore[reportUnknownMemberType]
+            return result
+        return []
+
+    literals = collect_literals(shell_policy.condition)
+    # The shell allowlist condition should contain these exact literals:
+    assert "python harness/preflight.py" in literals
+    assert "python harness/run_trial.py " in literals, (
+        f"trailing space preserved: {literals}"
+    )
+    assert "git commit -m " in literals, (
+        f"trailing space preserved: {literals}"
+    )
+
+    # Find the metacharacter deny policy
+    meta_policy = None
+    for p in manifest.policies:
+        if p.trigger.capability == "os.shell" and "contains" in p.id:
+            meta_policy = p
+            break
+    assert meta_policy is not None, "metacharacter deny policy not found"
+    meta_literals = collect_literals(meta_policy.condition)
+    assert "; " in meta_literals, f"trailing space preserved: {meta_literals}"
+    assert "&&" in meta_literals
+
+
+# ------------------------------------------------------------------
+# End-to-end enforcement test (review Medium/Tests 1)
+# ------------------------------------------------------------------
+
+
+class _PolicyEnforcementExecutor:
+    """Stage-aware executor for exercising allow/deny policy enforcement."""
+
+    def __init__(
+        self,
+        start_cmd: str | None = None,
+        error_on_start: type[BaseException] | None = None,
+    ) -> None:
+        self.start_cmd = start_cmd
+        self.error_on_start = error_on_start
+        self.stages_seen: list[str] = []  # type: ignore[reportUnknownVariableType]
+
+    async def execute(self, ctx: Any) -> dict[str, Any]:
+        self.stages_seen.append(ctx.stage.id)
+        if ctx.stage.id == "Start" and self.start_cmd is not None:
+            try:
+                await ctx.call_tool("os.shell", {"command": self.start_cmd})
+            except BaseException as exc:
+                if self.error_on_start is not None and isinstance(exc, self.error_on_start):
+                    raise
+                raise
+            return {"x": "done"}
+        if ctx.stage.id == "Fin":
+            return {"summary": "done"}
+        return {"x": "done"}
+
+
+def test_generated_package_policy_enforcement_allowed(tmp_path: Path) -> None:
+    """Allowed shell command passes policy and completes the workflow."""
+    nemo_path = (
+        REPO_ROOT / "compiler" / "crates" / "nemoir-dsl-fe"
+        / "tests" / "fixtures" / "policy_command_allowlist.nemo"
+    )
+    out_dir = tmp_path / "gen"
+    out_dir.mkdir()
+    pkg = _compile_and_import(nemo_path, "test_allowlist", out_dir)
+
+    executor = _PolicyEnforcementExecutor(start_cmd="python harness/preflight.py")
+    agent = pkg.Agent(model="bogus", tools=_make_tools())
+    result = asyncio.run(
+        agent._run_with_executor(  # noqa: SLF001
+            pkg.AgentInput(cwd=Path("/tmp/work"), candidate_path=Path("/tmp/work/candidate.py")),
+            executor=executor,
+        )
+    )
+    assert isinstance(result, pkg.AgentResult)
+    assert result.output.summary == "done"
+
+
+def test_generated_package_policy_enforcement_denied_shell(tmp_path: Path) -> None:
+    """Denied shell command raises PolicyDeniedError and emits a policy_denied event."""
+    nemo_path = (
+        REPO_ROOT / "compiler" / "crates" / "nemoir-dsl-fe"
+        / "tests" / "fixtures" / "policy_command_allowlist.nemo"
+    )
+    out_dir = tmp_path / "gen"
+    out_dir.mkdir()
+    pkg = _compile_and_import(nemo_path, "test_allowlist", out_dir)
+
+    executor = _PolicyEnforcementExecutor(
+        start_cmd="rm -rf /",
+        error_on_start=PolicyDeniedError,
+    )
+    agent = pkg.Agent(model="bogus", tools=_make_tools())
+
+    events: list[Any] = []
+
+    async def collect_and_run() -> None:
+        try:
+            target_input = pkg.AgentInput(
+                cwd=Path("/tmp/work"), candidate_path=Path("/tmp/work/candidate.py")
+            )
+            async for ev in agent._stream_with_executor(  # noqa: SLF001
+                target_input,
+                executor=executor,
+            ):
+                events.append(ev)
+        except PolicyDeniedError:
+            pass
+
+    asyncio.run(collect_and_run())
+    assert any(e.kind == "policy_denied" for e in events), (
+        f"expected policy_denied event in {[e.kind for e in events]}"
+    )
+
+
+def test_generated_package_policy_enforcement_denied_write(tmp_path: Path) -> None:
+    """Write outside the allowlist (harness/eval.py) raises PolicyDeniedError."""
+    nemo_path = (
+        REPO_ROOT / "compiler" / "crates" / "nemoir-dsl-fe"
+        / "tests" / "fixtures" / "policy_command_allowlist.nemo"
+    )
+    out_dir = tmp_path / "gen"
+    out_dir.mkdir()
+    pkg = _compile_and_import(nemo_path, "test_allowlist", out_dir)
+
+    class WriteDenyExecutor:
+        def __init__(self) -> None:
+            self.stages_seen: list[str] = []  # type: ignore[reportUnknownVariableType]
+
+        async def execute(self, ctx: Any) -> dict[str, Any]:
+            self.stages_seen.append(ctx.stage.id)  # pyright: ignore[reportUnknownMemberType]
+            if ctx.stage.id == "Start":
+                await ctx.call_tool(
+                    "fs.write",
+                    {"path": Path("harness/eval.py"), "content": "x"},
+                )
+                return {"x": "done"}
+            if ctx.stage.id == "Fin":
+                return {"summary": "done"}
+            return {"x": "done"}
+
+    agent = pkg.Agent(model="bogus", tools=_make_tools())
+    denied_input = pkg.AgentInput(
+        cwd=Path("/tmp/work"), candidate_path=Path("/tmp/work/candidate.py")
+    )
+    with pytest.raises(PolicyDeniedError, match="denied"):
+        asyncio.run(agent._run_with_executor(  # noqa: SLF001
+            denied_input, executor=WriteDenyExecutor(),
+        ))
