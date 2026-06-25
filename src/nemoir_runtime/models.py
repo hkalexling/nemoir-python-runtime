@@ -191,7 +191,7 @@ class LiteLLMModelAdapter:
             return obj.get(key, default)  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
         return getattr(obj, key, default)
 
-    async def _normalize_stream(  # noqa: C901, PLR0912, PLR0915
+    async def _normalize_stream(
         self, response: Any, stage_id: str, *, reasoning: str = "none"
     ) -> AsyncIterator[ModelStreamChunk]:
         """Normalize a LiteLLM streaming response into ModelStreamChunk values."""
@@ -377,6 +377,7 @@ _WRITE_TYPE_TO_JSON: dict[str, dict[str, str | dict[str, str]]] = {
     "string": {"type": "string"},
     "bool": {"type": "boolean"},
     "path": {"type": "string"},
+    "number": {"type": "number"},
     "string[]": {"type": "array", "items": {"type": "string"}},
 }
 
@@ -452,6 +453,14 @@ def _normalize_write_value(write: Any, val: Any, stage_id: str) -> Any:
             msg = f"expected list[str] for '{write.name}' in stage '{stage_id}'"
             raise ModelOutputValidationError(msg)
         return list(val)  # type: ignore[reportUnknownArgumentType]
+    if write.type == "number":
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            msg = (
+                f"expected int or float (number) for '{write.name}'"
+                f" in stage '{stage_id}', got {type(val).__name__}"
+            )
+            raise ModelOutputValidationError(msg)
+        return val
     msg = f"unsupported write type '{write.type}' in stage '{stage_id}'"
     raise ModelOutputValidationError(msg)
 
@@ -539,7 +548,7 @@ def tool_schema(tool: Tool) -> dict[str, Any]:
     }
 
 
-def normalize_tool_args(tool: Tool, raw_args: Mapping[str, Any]) -> dict[str, Any]:  # noqa: C901, PLR0912, PLR0915
+def normalize_tool_args(tool: Tool, raw_args: Mapping[str, Any]) -> dict[str, Any]:
     known = set(tool.input_schema.keys())
     for key in raw_args:
         if key not in known:
@@ -637,7 +646,7 @@ def normalize_tool_args(tool: Tool, raw_args: Mapping[str, Any]) -> dict[str, An
     return result
 
 
-def tool_result_to_model_content(value: Any) -> str:  # noqa: PLR0911
+def tool_result_to_model_content(value: Any) -> str:
     if value is None:
         return "null"
     if isinstance(value, str):
@@ -767,7 +776,7 @@ class ModelStageExecutor:
     # Main execution loop
     # ----------------------------------------------------------------
 
-    async def execute(self, ctx: StageContext) -> dict[str, Any]:  # noqa: C901, PLR0912, PLR0915
+    async def execute(self, ctx: StageContext) -> dict[str, Any]:
         adapter = model_for_stage(self._model, ctx.stage.id)
 
         # Resolve the effective reasoning mode: RunOptions overrides adapter.
@@ -1024,7 +1033,7 @@ class ModelStageExecutor:
 # ---------------------------------------------------------------------------
 
 
-def _normalize_litellm_response(  # noqa: C901
+def _normalize_litellm_response(
     response: Any, stage_id: str, *, reasoning: str = "none"
 ) -> ModelResponse:
     try:

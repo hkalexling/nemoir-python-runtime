@@ -1034,3 +1034,24 @@ async def test_retry_respects_default_max_model_retries_from_options() -> None:
         await executor.execute(ctx)
     # Initial + 3 retries = 4 calls
     assert len(adapter.calls) == 4
+
+
+async def test_number_write_passes_through_model_stage() -> None:
+    """Model-backed stage with type=number output passes validation."""
+    writes = (WriteSpec(name="score", type="number", optional=False),)
+    adapter = _fake_adapter([ModelResponse(content='{"score": 1.5}')])
+    executor = ModelStageExecutor(model=adapter, tools=ToolRegistry([]))
+    ctx = _make_stage_ctx(writes=writes)
+    result = await executor.execute(ctx)
+    assert result == {"score": 1.5}
+
+
+async def test_number_write_rejects_bool_from_model() -> None:
+    """Model returns bool for type=number output — rejected."""
+    writes = (WriteSpec(name="score", type="number", optional=False),)
+    # Default max_model_retries=3; provide enough copies for retries + final.
+    adapter = _fake_adapter([ModelResponse(content='{"score": true}')] * 4)
+    executor = ModelStageExecutor(model=adapter, tools=ToolRegistry([]))
+    ctx = _make_stage_ctx(writes=writes)
+    with pytest.raises(ModelOutputValidationError, match="expected int or float"):  # type: ignore[reportUnknownMemberType]
+        await executor.execute(ctx)

@@ -49,7 +49,7 @@ class RefSpec:
 
 @dataclass(frozen=True)
 class ExprSpec:
-    kind: Literal["not", "method_call", "ref", "literal", "and", "or"]
+    kind: Literal["not", "method_call", "ref", "literal", "and", "or", "compare", "binop"]
     expr: ExprSpec | None = None
     receiver: ExprSpec | None = None
     method: str | None = None
@@ -58,14 +58,18 @@ class ExprSpec:
     ref: RefSpec | None = None
     type: str | None = None
     value: Any = None
+    op: str | None = None
+    left: ExprSpec | None = None
+    right: ExprSpec | None = None
 
 
 @dataclass(frozen=True)
 class GuardSpec:
-    kind: Literal["always", "has_value", "missing", "eq"]
+    kind: Literal["always", "has_value", "missing", "eq", "if"]
     ref: RefSpec | None = None
     left: ExprSpec | None = None
     right: ExprSpec | None = None
+    cond: ExprSpec | None = None
 
 
 @dataclass(frozen=True)
@@ -219,17 +223,13 @@ class DeterministicStageExecutor:
         # Resolve args
         resolved_args: dict[str, Any] = {}
         for arg_name, expr in exec_spec.args.items():
-            resolved_args[arg_name] = self._resolve_exec_arg(
-                expr, ctx.inputs, ctx.readable_context
-            )
+            resolved_args[arg_name] = self._resolve_exec_arg(expr, ctx.inputs, ctx.readable_context)
 
         # Coerce catalog path args from str -> Path
         resolved_args = self._coerce_path_args(capability, resolved_args)
 
         # Call through ctx.call_tool (policy enforcement, events)
-        result = await ctx.call_tool(
-            capability, resolved_args, tool_name=tool_name
-        )
+        result = await ctx.call_tool(capability, resolved_args, tool_name=tool_name)
 
         # Output normalization (§1.9)
         return self._normalize_deterministic_output(ctx.stage, result)
@@ -616,7 +616,21 @@ class WorkflowRuntime:
                 return False
             left_val = _eval_guard_expr(guard.left, inputs, stage_outputs)
             right_val = _eval_guard_expr(guard.right, inputs, stage_outputs)
+            # §3.4 ordering-only rule — defensive (plan §8.4): runtime manifests
+            # can bypass DSL/IR validation, so reject numeric operands here too.
+            if _is_number_value(left_val) or _is_number_value(right_val):
+                msg = (
+                    "GuardSpec(kind='eq') does not support number operands; "
+                    "use a compare predicate (>, >=, <, <=) or "
+                    "`score - x > eps` for near-equality"
+                )
+                raise PolicyEvaluationError(msg)
             return left_val == right_val
+        if guard.kind == "if":
+            if guard.cond is None:
+                return False
+            result = _eval_guard_expr(guard.cond, inputs, stage_outputs)
+            return bool(result)
         return False
 
     # ------------------------------------------------------------------
@@ -709,7 +723,7 @@ class WorkflowRuntime:
             emitter=emitter,
         )
 
-    async def _enforce_and_call_with_policies(  # noqa: C901, PLR0912
+    async def _enforce_and_call_with_policies(
         self,
         capability: str,
         args: Mapping[str, Any],
@@ -1087,6 +1101,9 @@ def _type_satisfies_write(py_type: type, write_type: str) -> bool:
         return py_type is bool
     if write_type == "path":
         return py_type in (str, Path)
+    if write_type == "number":
+        # accept int/float; bool is rejected because type(True) is bool, not int
+        return py_type in (int, float)
     if write_type == "string[]":
         origin = get_origin(py_type)
         if origin is list:
@@ -1141,6 +1158,14 @@ def _validate_write_type(value: Any, write_type: str, field_name: str, stage_id:
             msg = (
                 f"Stage '{stage_id}' output field '{field_name}': expected list[str] "
                 f"but contains non-string elements"
+            )
+            raise StageOutputValidationError(msg)
+    elif write_type == "number":
+        # accept int/float, reject bool (bool subclasses int)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            msg = (
+                f"Stage '{stage_id}' output field '{field_name}': expected int/float (number), "
+                f"got {type(value).__name__}"
             )
             raise StageOutputValidationError(msg)
     else:
@@ -1213,6 +1238,52 @@ def _eval_expr_impl(
         return all(recurse(e) for e in expr.exprs)
     if expr.kind == "or":
         return any(recurse(e) for e in expr.exprs)
+    if expr.kind == "compare":
+        if expr.op is None or expr.left is None or expr.right is None:
+            msg = "Compare expression missing op/left/right"
+            raise DataUnavailableError(msg)
+        # Defensive op check: accept only gt/gte/lt/lte
+        if expr.op not in {"gt", "gte", "lt", "lte"}:
+            msg = f"Unknown compare op '{expr.op}'; expected gt, gte, lt, or lte"
+            raise PolicyEvaluationError(msg)
+        left_val = recurse(expr.left)
+        right_val = recurse(expr.right)
+        # None propagation: fail-closed for guards
+        if left_val is None or right_val is None:
+            return False
+        if expr.op == "gt":
+            return left_val > right_val
+        if expr.op == "gte":
+            return left_val >= right_val
+        if expr.op == "lt":
+            return left_val < right_val
+        if expr.op == "lte":
+            return left_val <= right_val
+        return False
+    if expr.kind == "binop":
+        if expr.op is None or expr.left is None or expr.right is None:
+            msg = "Binop expression missing op/left/right"
+            raise DataUnavailableError(msg)
+        if expr.op not in {"add", "sub", "mul", "div"}:
+            msg = f"Unknown binop '{expr.op}'; expected add, sub, mul, or div"
+            raise PolicyEvaluationError(msg)
+        left_val = recurse(expr.left)
+        right_val = recurse(expr.right)
+        # None propagation: return None (SQL-null-style → enclosing compare becomes False)
+        if left_val is None or right_val is None:
+            return None
+        if expr.op == "add":
+            return left_val + right_val
+        if expr.op == "sub":
+            return left_val - right_val
+        if expr.op == "mul":
+            return left_val * right_val
+        if expr.op == "div":
+            if right_val == 0:
+                msg = "Division by zero in binop"
+                raise PolicyEvaluationError(msg)
+            return left_val / right_val
+        return None
     msg = f"Unknown expression kind '{expr.kind}'"
     raise DataUnavailableError(msg)
 
@@ -1261,10 +1332,7 @@ def _method_contains(receiver_val: Any, arg_vals: list[Any]) -> Any:
             except (OSError, ValueError):
                 return False
             else:
-                return (
-                    target_resolved == cwd_resolved
-                    or cwd_resolved in target_resolved.parents
-                )
+                return target_resolved == cwd_resolved or cwd_resolved in target_resolved.parents
         return False
 
     msg = f"contains() receiver must be Path or string, got {type(receiver_val).__name__}"
@@ -1275,7 +1343,21 @@ def _method_eq(receiver_val: Any, arg_vals: list[Any]) -> Any:
     if len(arg_vals) != 1:
         msg = "eq() requires exactly 1 argument"
         raise DataUnavailableError(msg)
-    return _eq(receiver_val, arg_vals[0])
+    arg = arg_vals[0]
+    # §3.4 ordering-only rule — defensive (plan §8.4): runtime manifests
+    # can bypass DSL/IR validation, so reject numeric operands here too.
+    if _is_number_value(receiver_val) or _is_number_value(arg):
+        msg = (
+            "eq() does not support number operands; use a compare predicate "
+            "(>, >=, <, <=) or `score - x > eps` for near-equality"
+        )
+        raise PolicyEvaluationError(msg)
+    return _eq(receiver_val, arg)
+
+
+def _is_number_value(v: Any) -> bool:
+    """True if `v` is a numeric value (int or float), excluding bool."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
 def _method_starts_with(receiver_val: Any, arg_vals: list[Any]) -> Any:
@@ -1343,7 +1425,7 @@ def _active_exception() -> str:
 _RESULT_PREVIEW_MAX_LEN = 200
 
 
-def _safe_result_preview(value: Any) -> str | None:  # noqa: PLR0911
+def _safe_result_preview(value: Any) -> str | None:
     """Return a short, safe preview of a tool result for event metadata.
 
     Large results are truncated to avoid bloating events.

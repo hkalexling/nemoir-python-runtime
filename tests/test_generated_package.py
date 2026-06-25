@@ -983,7 +983,7 @@ def test_generated_package_stream_with_official_tools(tmp_path: Path) -> None:
     assert rc[0].result.output.summary == "official-stream-done"
 
 
-def test_generated_package_stream_reasoning_channel(tmp_path: Path) -> None:  # noqa: C901
+def test_generated_package_stream_reasoning_channel(tmp_path: Path) -> None:
     """Generated Agent.stream() forwards 'reasoning' channel model_delta events."""
     out_dir = tmp_path / "gen"
     out_dir.mkdir()
@@ -1101,6 +1101,7 @@ def test_generated_package_stream_reasoning_channel(tmp_path: Path) -> None:  # 
 # Policy predicate generated-package test (Phase 6 / review follow-up)
 # ---------------------------------------------------------------------------
 
+
 def _compile_and_import(nemo_path: Path, package_name: str, out_dir: Path) -> Any:
     """Compile a .nemo file and import the generated Python package."""
     result = subprocess.run(  # noqa: S603
@@ -1122,7 +1123,7 @@ def _compile_and_import(nemo_path: Path, package_name: str, out_dir: Path) -> An
     return __import__(package_name)  # type: ignore[reportUnknownVariableType]
 
 
-def test_generated_package_policy_literal_whitespace_preserved(tmp_path: Path) -> None:  # noqa: C901
+def test_generated_package_policy_literal_whitespace_preserved(tmp_path: Path) -> None:
     """Compile a policy-allowlist workflow and assert trailing-space literals.
 
     Regression test for the {process_string} trimming bug: policy string
@@ -1199,12 +1200,8 @@ def test_generated_package_policy_literal_whitespace_preserved(tmp_path: Path) -
     literals = collect_literals(shell_policy.condition)
     # The shell allowlist condition should contain these exact literals:
     assert "python harness/preflight.py" in literals
-    assert "python harness/run_trial.py " in literals, (
-        f"trailing space preserved: {literals}"
-    )
-    assert "git commit -m " in literals, (
-        f"trailing space preserved: {literals}"
-    )
+    assert "python harness/run_trial.py " in literals, f"trailing space preserved: {literals}"
+    assert "git commit -m " in literals, f"trailing space preserved: {literals}"
 
     # Find the metacharacter deny policy
     meta_policy = None
@@ -1253,8 +1250,13 @@ class _PolicyEnforcementExecutor:
 def test_generated_package_policy_enforcement_allowed(tmp_path: Path) -> None:
     """Allowed shell command passes policy and completes the workflow."""
     nemo_path = (
-        REPO_ROOT / "compiler" / "crates" / "nemoir-dsl-fe"
-        / "tests" / "fixtures" / "policy_command_allowlist.nemo"
+        REPO_ROOT
+        / "compiler"
+        / "crates"
+        / "nemoir-dsl-fe"
+        / "tests"
+        / "fixtures"
+        / "policy_command_allowlist.nemo"
     )
     out_dir = tmp_path / "gen"
     out_dir.mkdir()
@@ -1275,8 +1277,13 @@ def test_generated_package_policy_enforcement_allowed(tmp_path: Path) -> None:
 def test_generated_package_policy_enforcement_denied_shell(tmp_path: Path) -> None:
     """Denied shell command raises PolicyDeniedError and emits a policy_denied event."""
     nemo_path = (
-        REPO_ROOT / "compiler" / "crates" / "nemoir-dsl-fe"
-        / "tests" / "fixtures" / "policy_command_allowlist.nemo"
+        REPO_ROOT
+        / "compiler"
+        / "crates"
+        / "nemoir-dsl-fe"
+        / "tests"
+        / "fixtures"
+        / "policy_command_allowlist.nemo"
     )
     out_dir = tmp_path / "gen"
     out_dir.mkdir()
@@ -1312,8 +1319,13 @@ def test_generated_package_policy_enforcement_denied_shell(tmp_path: Path) -> No
 def test_generated_package_policy_enforcement_denied_write(tmp_path: Path) -> None:
     """Write outside the allowlist (harness/eval.py) raises PolicyDeniedError."""
     nemo_path = (
-        REPO_ROOT / "compiler" / "crates" / "nemoir-dsl-fe"
-        / "tests" / "fixtures" / "policy_command_allowlist.nemo"
+        REPO_ROOT
+        / "compiler"
+        / "crates"
+        / "nemoir-dsl-fe"
+        / "tests"
+        / "fixtures"
+        / "policy_command_allowlist.nemo"
     )
     out_dir = tmp_path / "gen"
     out_dir.mkdir()
@@ -1340,9 +1352,12 @@ def test_generated_package_policy_enforcement_denied_write(tmp_path: Path) -> No
         cwd=Path("/tmp/work"), candidate_path=Path("/tmp/work/candidate.py")
     )
     with pytest.raises(PolicyDeniedError, match="denied"):
-        asyncio.run(agent._run_with_executor(  # noqa: SLF001
-            denied_input, executor=WriteDenyExecutor(),
-        ))
+        asyncio.run(
+            agent._run_with_executor(  # noqa: SLF001
+                denied_input,
+                executor=WriteDenyExecutor(),
+            )
+        )
 
 
 # ------------------------------------------------------------------
@@ -1383,3 +1398,103 @@ def test_deterministic_package_runs_with_official_tool(tmp_path: Path) -> None:
     result = asyncio.run(agent.run(pkg.AgentInput()))
     assert result.output.summary == "processed"
     assert calls == ["model"]
+
+
+# ------------------------------------------------------------------
+# Numeric transitions: e2e regression test (Extension 4 follow-up)
+# ------------------------------------------------------------------
+
+JUDGE_CANDIDATE_NEMO = (
+    REPO_ROOT
+    / "compiler"
+    / "crates"
+    / "nemoir-dsl-fe"
+    / "tests"
+    / "fixtures"
+    / "judge_candidate.nemo"
+)
+
+
+class _JudgeExecutor:
+    """Scripted executor for judge_candidate.nemo with parametrized scores."""
+
+    def __init__(self, baseline_score: float, best_score: float, judge_score: float | None) -> None:
+        self.baseline_score = baseline_score
+        self.best_score = best_score
+        self.judge_score = judge_score
+        self.stages_seen: list[str] = []  # type: ignore[reportUnknownVariableType]
+
+    async def execute(self, ctx: Any) -> dict[str, object]:
+        self.stages_seen.append(ctx.stage.id)
+        stage_outputs: dict[str, dict[str, object]] = {
+            "Baseline": {"score": self.baseline_score},
+            "Best": {"score": self.best_score},
+            "JudgeCandidate": {"score": self.judge_score},  # type: ignore[reportArgumentType]
+            "Accept": {},
+            "Confirm": {},
+            "Reject": {},
+        }
+        return stage_outputs.get(ctx.stage.id, {})
+
+
+@pytest.mark.parametrize(
+    ("judge_score", "best_score", "eps", "expected_exit"),
+    [
+        (10.0, 3.0, 0.05, "Accept"),  # 10-3=7 > 0.05 → Accept
+        (6.0, 5.0, 2.0, "Confirm"),  # 6-5=1 > 2.0 False, 6>5 True → Confirm
+        (None, 5.0, 0.05, "Reject"),  # None→both False→else→Reject
+    ],
+)
+def test_judge_candidate_numeric_transitions(
+    tmp_path: Path,
+    judge_score: float | None,
+    best_score: float,
+    eps: float,
+    expected_exit: str,
+) -> None:
+    """Compile judge_candidate.nemo → import → run scripted → assert correct exit.
+
+    Verifies the full DSL → IR → codegen → runtime pipeline for numeric
+    comparison guards (BinOp, Compare, None-propagation, else fallthrough).
+    This is the end-to-end regression net for the op-string mismatch
+    (Critical #1) and the guard-side type checks (High #2).
+    """
+    out_dir = tmp_path / "gen"
+    out_dir.mkdir()
+    pkg = _compile_and_import(JUDGE_CANDIDATE_NEMO, "judge_candidate", out_dir)
+
+    executor = _JudgeExecutor(
+        baseline_score=0.0,  # unused by guards
+        best_score=best_score,
+        judge_score=judge_score,
+    )
+
+    agent = pkg.Agent(model="bogus", tools=_make_tools())
+    target_input = pkg.AgentInput(eps=eps)
+
+    events: list[Any] = []
+
+    async def collect_and_run() -> None:
+        async for ev in agent._stream_with_executor(  # noqa: SLF001
+            target_input,
+            executor=executor,
+        ):
+            events.append(ev)
+
+    asyncio.run(collect_and_run())
+
+    # The last transition_selected event is JudgeCandidate's branch selection
+    # (the exit stages terminate without emitting transition_selected).
+    last_transition = None
+    for ev in events:
+        if ev.kind == "transition_selected":
+            last_transition = ev
+    assert last_transition is not None, (
+        f"expected a transition_selected event, got {[e.kind for e in events]}"
+    )
+    assert last_transition.transition_to == expected_exit, (
+        f"expected transition to {expected_exit}, got {last_transition.transition_to}"
+    )
+
+    # A run_completed event must also fire.
+    assert any(e.kind == "run_completed" for e in events), "expected run_completed event"

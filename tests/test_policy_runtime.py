@@ -1115,13 +1115,18 @@ async def test_os_shell_command_eq_allowed(make_registry_with_log: Any) -> None:
     )
     stages = (
         StageSpec(
-            id="A", prompt="A", reads=(),
+            id="A",
+            prompt="A",
+            reads=(),
             writes=(WriteSpec(name="out_a", type="string", optional=False),),
-            requires=frozenset({"os.shell"}), transitions=(),
+            requires=frozenset({"os.shell"}),
+            transitions=(),
         ),
     )
     manifest = WorkflowManifest(
-        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        workflow_id="Test",
+        entry_stage_id="A",
+        exit_stage_ids=frozenset({"A"}),
         inputs=(InputSpec(name="task", type="string"),),
         capabilities=frozenset({"os.shell"}),
         policies=(deny_policy,),
@@ -1156,13 +1161,18 @@ async def test_os_shell_command_eq_denied(make_registry_with_log: Any) -> None:
     )
     stages = (
         StageSpec(
-            id="A", prompt="A", reads=(),
+            id="A",
+            prompt="A",
+            reads=(),
             writes=(WriteSpec(name="out_a", type="string", optional=False),),
-            requires=frozenset({"os.shell"}), transitions=(),
+            requires=frozenset({"os.shell"}),
+            transitions=(),
         ),
     )
     manifest = WorkflowManifest(
-        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        workflow_id="Test",
+        entry_stage_id="A",
+        exit_stage_ids=frozenset({"A"}),
         inputs=(InputSpec(name="task", type="string"),),
         capabilities=frozenset({"os.shell"}),
         policies=(deny_policy,),
@@ -1198,13 +1208,18 @@ async def test_os_shell_command_starts_with_allowed(make_registry_with_log: Any)
     )
     stages = (
         StageSpec(
-            id="A", prompt="A", reads=(),
+            id="A",
+            prompt="A",
+            reads=(),
             writes=(WriteSpec(name="out_a", type="string", optional=False),),
-            requires=frozenset({"os.shell"}), transitions=(),
+            requires=frozenset({"os.shell"}),
+            transitions=(),
         ),
     )
     manifest = WorkflowManifest(
-        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        workflow_id="Test",
+        entry_stage_id="A",
+        exit_stage_ids=frozenset({"A"}),
         inputs=(InputSpec(name="task", type="string"),),
         capabilities=frozenset({"os.shell"}),
         policies=(deny_policy,),
@@ -1237,13 +1252,18 @@ async def test_os_shell_command_contains_metachar_denied(make_registry_with_log:
     )
     stages = (
         StageSpec(
-            id="A", prompt="A", reads=(),
+            id="A",
+            prompt="A",
+            reads=(),
             writes=(WriteSpec(name="out_a", type="string", optional=False),),
-            requires=frozenset({"os.shell"}), transitions=(),
+            requires=frozenset({"os.shell"}),
+            transitions=(),
         ),
     )
     manifest = WorkflowManifest(
-        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        workflow_id="Test",
+        entry_stage_id="A",
+        exit_stage_ids=frozenset({"A"}),
         inputs=(InputSpec(name="task", type="string"),),
         capabilities=frozenset({"os.shell"}),
         policies=(deny_policy,),
@@ -1279,13 +1299,18 @@ async def test_fs_write_path_eq_allowed(make_registry_with_log: Any) -> None:
     )
     stages = (
         StageSpec(
-            id="A", prompt="A", reads=(),
+            id="A",
+            prompt="A",
+            reads=(),
             writes=(WriteSpec(name="out_a", type="string", optional=False),),
-            requires=frozenset({"fs.write"}), transitions=(),
+            requires=frozenset({"fs.write"}),
+            transitions=(),
         ),
     )
     manifest = WorkflowManifest(
-        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        workflow_id="Test",
+        entry_stage_id="A",
+        exit_stage_ids=frozenset({"A"}),
         inputs=(
             InputSpec(name="task", type="string"),
             InputSpec(name="candidate_path", type="path"),
@@ -1323,13 +1348,18 @@ async def test_fs_write_path_eq_denied(make_registry_with_log: Any) -> None:
     )
     stages = (
         StageSpec(
-            id="A", prompt="A", reads=(),
+            id="A",
+            prompt="A",
+            reads=(),
             writes=(WriteSpec(name="out_a", type="string", optional=False),),
-            requires=frozenset({"fs.write"}), transitions=(),
+            requires=frozenset({"fs.write"}),
+            transitions=(),
         ),
     )
     manifest = WorkflowManifest(
-        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        workflow_id="Test",
+        entry_stage_id="A",
+        exit_stage_ids=frozenset({"A"}),
         inputs=(
             InputSpec(name="task", type="string"),
             InputSpec(name="candidate_path", type="path"),
@@ -1369,13 +1399,18 @@ async def test_eq_path_relative_lexical(make_registry_with_log: Any) -> None:
     )
     stages = (
         StageSpec(
-            id="A", prompt="A", reads=(),
+            id="A",
+            prompt="A",
+            reads=(),
             writes=(WriteSpec(name="out_a", type="string", optional=False),),
-            requires=frozenset({"fs.write"}), transitions=(),
+            requires=frozenset({"fs.write"}),
+            transitions=(),
         ),
     )
     manifest = WorkflowManifest(
-        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        workflow_id="Test",
+        entry_stage_id="A",
+        exit_stage_ids=frozenset({"A"}),
         inputs=(InputSpec(name="task", type="string"),),
         capabilities=frozenset({"fs.write"}),
         policies=(deny_policy,),
@@ -1422,13 +1457,18 @@ async def test_and_short_circuits(make_registry_with_log: Any) -> None:
     )
     stages = (
         StageSpec(
-            id="A", prompt="A", reads=(),
+            id="A",
+            prompt="A",
+            reads=(),
             writes=(WriteSpec(name="out_a", type="string", optional=False),),
-            requires=frozenset({"os.shell"}), transitions=(),
+            requires=frozenset({"os.shell"}),
+            transitions=(),
         ),
     )
     manifest = WorkflowManifest(
-        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        workflow_id="Test",
+        entry_stage_id="A",
+        exit_stage_ids=frozenset({"A"}),
         inputs=(InputSpec(name="task", type="string"),),
         capabilities=frozenset({"os.shell"}),
         policies=(deny_policy,),
@@ -1477,13 +1517,18 @@ async def test_or_short_circuits(make_registry_with_log: Any) -> None:
     )
     stages = (
         StageSpec(
-            id="A", prompt="A", reads=(),
+            id="A",
+            prompt="A",
+            reads=(),
             writes=(WriteSpec(name="out_a", type="string", optional=False),),
-            requires=frozenset({"os.shell"}), transitions=(),
+            requires=frozenset({"os.shell"}),
+            transitions=(),
         ),
     )
     manifest = WorkflowManifest(
-        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        workflow_id="Test",
+        entry_stage_id="A",
+        exit_stage_ids=frozenset({"A"}),
         inputs=(InputSpec(name="task", type="string"),),
         capabilities=frozenset({"os.shell"}),
         policies=(deny_policy,),
@@ -1528,13 +1573,18 @@ async def test_os_shell_command_starts_with_denied(make_registry_with_log: Any) 
     )
     stages = (
         StageSpec(
-            id="A", prompt="A", reads=(),
+            id="A",
+            prompt="A",
+            reads=(),
             writes=(WriteSpec(name="out_a", type="string", optional=False),),
-            requires=frozenset({"os.shell"}), transitions=(),
+            requires=frozenset({"os.shell"}),
+            transitions=(),
         ),
     )
     manifest = WorkflowManifest(
-        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        workflow_id="Test",
+        entry_stage_id="A",
+        exit_stage_ids=frozenset({"A"}),
         inputs=(InputSpec(name="task", type="string"),),
         capabilities=frozenset({"os.shell"}),
         policies=(deny_policy,),
@@ -1571,13 +1621,18 @@ async def test_eq_path_absolute_resolves(make_registry_with_log: Any) -> None:
     )
     stages = (
         StageSpec(
-            id="A", prompt="A", reads=(),
+            id="A",
+            prompt="A",
+            reads=(),
             writes=(WriteSpec(name="out_a", type="string", optional=False),),
-            requires=frozenset({"fs.write"}), transitions=(),
+            requires=frozenset({"fs.write"}),
+            transitions=(),
         ),
     )
     manifest = WorkflowManifest(
-        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        workflow_id="Test",
+        entry_stage_id="A",
+        exit_stage_ids=frozenset({"A"}),
         inputs=(InputSpec(name="task", type="string"),),
         capabilities=frozenset({"fs.write"}),
         policies=(deny_policy,),
@@ -1627,13 +1682,18 @@ async def test_fs_write_path_in_allowlist_lowered(make_registry_with_log: Any) -
     )
     stages = (
         StageSpec(
-            id="A", prompt="A", reads=(),
+            id="A",
+            prompt="A",
+            reads=(),
             writes=(WriteSpec(name="out_a", type="string", optional=False),),
-            requires=frozenset({"fs.write"}), transitions=(),
+            requires=frozenset({"fs.write"}),
+            transitions=(),
         ),
     )
     manifest = WorkflowManifest(
-        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        workflow_id="Test",
+        entry_stage_id="A",
+        exit_stage_ids=frozenset({"A"}),
         inputs=(InputSpec(name="task", type="string"),),
         capabilities=frozenset({"fs.write"}),
         policies=(deny_policy,),
@@ -1687,13 +1747,18 @@ async def test_eq_policy_applies_to_edit_file_and_write_file(make_registry_with_
     )
     stages = (
         StageSpec(
-            id="A", prompt="A", reads=(),
+            id="A",
+            prompt="A",
+            reads=(),
             writes=(WriteSpec(name="out_a", type="string", optional=False),),
-            requires=frozenset({"fs.write"}), transitions=(),
+            requires=frozenset({"fs.write"}),
+            transitions=(),
         ),
     )
     manifest = WorkflowManifest(
-        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        workflow_id="Test",
+        entry_stage_id="A",
+        exit_stage_ids=frozenset({"A"}),
         inputs=(InputSpec(name="task", type="string"),),
         capabilities=frozenset({"fs.write"}),
         policies=(deny_policy,),
@@ -1705,7 +1770,8 @@ async def test_eq_policy_applies_to_edit_file_and_write_file(make_registry_with_
     class CallWriteFile:
         async def execute(self, ctx: StageContext) -> Mapping[str, object]:
             await ctx.call_tool(
-                "fs.write", {"path": Path("/tmp/candidate.py"), "content": "hello"},
+                "fs.write",
+                {"path": Path("/tmp/candidate.py"), "content": "hello"},
                 tool_name="write_file",
             )
             return {"out_a": "done"}
@@ -1719,7 +1785,8 @@ async def test_eq_policy_applies_to_edit_file_and_write_file(make_registry_with_
     class CallDenied:
         async def execute(self, ctx: StageContext) -> Mapping[str, object]:
             await ctx.call_tool(
-                "fs.write", {"path": Path("/tmp/harness/eval.py"), "content": "x"},
+                "fs.write",
+                {"path": Path("/tmp/harness/eval.py"), "content": "x"},
                 tool_name="write_file",
             )
             return {"out_a": "done"}
@@ -1757,13 +1824,18 @@ async def test_contains_string_cwd_and_string_bound_path_uses_path_containment(
     )
     stages = (
         StageSpec(
-            id="A", prompt="A", reads=(),
+            id="A",
+            prompt="A",
+            reads=(),
             writes=(WriteSpec(name="out_a", type="string", optional=False),),
-            requires=frozenset({"fs.read"}), transitions=(),
+            requires=frozenset({"fs.read"}),
+            transitions=(),
         ),
     )
     manifest = WorkflowManifest(
-        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        workflow_id="Test",
+        entry_stage_id="A",
+        exit_stage_ids=frozenset({"A"}),
         inputs=(InputSpec(name="task", type="string"), InputSpec(name="cwd", type="path")),
         capabilities=frozenset({"fs.read"}),
         policies=(deny_policy,),
@@ -1807,13 +1879,18 @@ async def test_contains_substring_bypass_with_string_cwd_rejected(
     )
     stages = (
         StageSpec(
-            id="A", prompt="A", reads=(),
+            id="A",
+            prompt="A",
+            reads=(),
             writes=(WriteSpec(name="out_a", type="string", optional=False),),
-            requires=frozenset({"fs.read"}), transitions=(),
+            requires=frozenset({"fs.read"}),
+            transitions=(),
         ),
     )
     manifest = WorkflowManifest(
-        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        workflow_id="Test",
+        entry_stage_id="A",
+        exit_stage_ids=frozenset({"A"}),
         inputs=(InputSpec(name="task", type="string"), InputSpec(name="cwd", type="path")),
         capabilities=frozenset({"fs.read"}),
         policies=(deny_policy,),
@@ -1859,13 +1936,18 @@ async def test_contains_extra_args_raises_policy_evaluation_error(
     )
     stages = (
         StageSpec(
-            id="A", prompt="A", reads=(),
+            id="A",
+            prompt="A",
+            reads=(),
             writes=(WriteSpec(name="out_a", type="string", optional=False),),
-            requires=frozenset({"os.shell"}), transitions=(),
+            requires=frozenset({"os.shell"}),
+            transitions=(),
         ),
     )
     manifest = WorkflowManifest(
-        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        workflow_id="Test",
+        entry_stage_id="A",
+        exit_stage_ids=frozenset({"A"}),
         inputs=(InputSpec(name="task", type="string"),),
         capabilities=frozenset({"os.shell"}),
         policies=(deny_policy,),
@@ -1900,13 +1982,18 @@ async def test_string_contains_path_raises_policy_evaluation_error(
     )
     stages = (
         StageSpec(
-            id="A", prompt="A", reads=(),
+            id="A",
+            prompt="A",
+            reads=(),
             writes=(WriteSpec(name="out_a", type="string", optional=False),),
-            requires=frozenset({"os.shell"}), transitions=(),
+            requires=frozenset({"os.shell"}),
+            transitions=(),
         ),
     )
     manifest = WorkflowManifest(
-        workflow_id="Test", entry_stage_id="A", exit_stage_ids=frozenset({"A"}),
+        workflow_id="Test",
+        entry_stage_id="A",
+        exit_stage_ids=frozenset({"A"}),
         inputs=(
             InputSpec(name="task", type="string"),
             InputSpec(name="cwd", type="path"),
@@ -1925,3 +2012,98 @@ async def test_string_contains_path_raises_policy_evaluation_error(
     runtime = WorkflowRuntime(manifest=manifest, tools=registry, stage_executor=Exec())
     with pytest.raises(PolicyEvaluationError, match="argument must be string"):
         await runtime.run({"task": "test", "cwd": Path("/tmp/work")})
+
+
+async def test_eq_with_numeric_operands_raises(make_registry_with_log: Any) -> None:
+    """eq() with numeric operands raises PolicyEvaluationError (ordering-only rule)."""
+    deny_policy = PolicySpec(
+        id="deny numeric eq",
+        kind="deny",
+        trigger=TriggerSpec(capability="os.shell", bind={"command": "command"}),
+        condition=ExprSpec(
+            kind="not",
+            expr=ExprSpec(
+                kind="method_call",
+                receiver=ExprSpec(kind="ref", ref=RefSpec(kind="input", name="score")),
+                method="eq",
+                args=(ExprSpec(kind="literal", type="number", value=0.3),),
+            ),
+        ),
+    )
+    stages = (
+        StageSpec(
+            id="A",
+            prompt="A",
+            reads=(),
+            writes=(WriteSpec(name="out_a", type="string", optional=False),),
+            requires=frozenset({"os.shell"}),
+            transitions=(),
+        ),
+    )
+    manifest = WorkflowManifest(
+        workflow_id="Test",
+        entry_stage_id="A",
+        exit_stage_ids=frozenset({"A"}),
+        inputs=(InputSpec(name="score", type="number"),),
+        capabilities=frozenset({"os.shell"}),
+        policies=(deny_policy,),
+        stages=stages,
+    )
+    registry, _ = make_registry_with_log()
+
+    class Exec:
+        async def execute(self, ctx: StageContext) -> Mapping[str, object]:
+            await ctx.call_tool("os.shell", {"command": "echo hi"})
+            return {"out_a": "done"}
+
+    runtime = WorkflowRuntime(manifest=manifest, tools=registry, stage_executor=Exec())
+    with pytest.raises(PolicyEvaluationError, match="number"):
+        await runtime.run({"score": 0.1 + 0.2})
+
+
+async def test_eq_with_bool_operands_still_works(make_registry_with_log: Any) -> None:
+    """eq() with bool operands still works (bool excluded from numeric check)."""
+    deny_policy = PolicySpec(
+        id="deny bool eq",
+        kind="deny",
+        trigger=TriggerSpec(capability="os.shell", bind={"command": "command"}),
+        condition=ExprSpec(
+            kind="not",
+            expr=ExprSpec(
+                kind="method_call",
+                receiver=ExprSpec(kind="ref", ref=RefSpec(kind="input", name="flag")),
+                method="eq",
+                args=(ExprSpec(kind="literal", type="bool", value=True),),
+            ),
+        ),
+    )
+    stages = (
+        StageSpec(
+            id="A",
+            prompt="A",
+            reads=(),
+            writes=(WriteSpec(name="out_a", type="string", optional=False),),
+            requires=frozenset({"os.shell"}),
+            transitions=(),
+        ),
+    )
+    manifest = WorkflowManifest(
+        workflow_id="Test",
+        entry_stage_id="A",
+        exit_stage_ids=frozenset({"A"}),
+        inputs=(InputSpec(name="flag", type="bool"),),
+        capabilities=frozenset({"os.shell"}),
+        policies=(deny_policy,),
+        stages=stages,
+    )
+    registry, calls = make_registry_with_log()
+
+    class Exec:
+        async def execute(self, ctx: StageContext) -> Mapping[str, object]:
+            await ctx.call_tool("os.shell", {"command": "echo hi"})
+            return {"out_a": "done"}
+
+    runtime = WorkflowRuntime(manifest=manifest, tools=registry, stage_executor=Exec())
+    # eq(True, True) returns True → Not(True) = False → not denied → call proceeds
+    await runtime.run({"flag": True})
+    assert len(calls) == 1

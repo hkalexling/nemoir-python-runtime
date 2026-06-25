@@ -268,7 +268,7 @@ async def run_shell(
     capability="user.elicit",
     description="Ask the user a question and return their answer.",
 )
-async def ask_user(  # noqa: C901
+async def ask_user(
     *,
     question: str,
     ctx: ToolContext,  # noqa: ARG001

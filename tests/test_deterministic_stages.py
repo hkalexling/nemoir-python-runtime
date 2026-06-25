@@ -54,9 +54,7 @@ def _make_single_stage_tool_manifest(
     """Build a minimal manifest with a single tool-kind exit stage."""
     if args is None:
         args = {"path": RefSpec(kind="input", name="p")}
-    exec_args = {
-        k: ExprSpec(kind="ref", ref=v) for k, v in args.items()
-    }
+    exec_args = {k: ExprSpec(kind="ref", ref=v) for k, v in args.items()}
     return WorkflowManifest(
         workflow_id="Test",
         entry_stage_id=stage_id,
@@ -127,6 +125,7 @@ async def test_deterministic_stage_runs_and_calls_fixed_tool() -> None:
 
 async def test_tool_selection_no_match_raises() -> None:
     """If no registered tool satisfies the stage, fail at init time."""
+
     @tool(capability="fs.read", description="r")
     async def rd(*, path: Path, ctx: ToolContext) -> str:
         return "ok"
@@ -145,6 +144,7 @@ async def test_tool_selection_no_match_raises() -> None:
 
 async def test_tool_selection_auto_selects_capability_match() -> None:
     """When one tool matches input+output among multiple, auto-select it."""
+
     @tool(capability="fs.read", description="a")
     async def rd_a(*, path: Path, ctx: ToolContext) -> str:
         return "a"
@@ -165,6 +165,7 @@ async def test_tool_selection_auto_selects_capability_match() -> None:
 
 async def test_tool_with_no_known_output_shape_satisfies_output_empty() -> None:
     """Tool with None output_schema satisfies output: {} stages."""
+
     @tool(capability="fs.read", description="r")
     async def rd(*, path: Path, ctx: ToolContext) -> str:
         return "ignored"
@@ -195,6 +196,7 @@ class _Result:
 
 async def test_dataclass_result_normalization_with_projection() -> None:
     """Dataclass result → asdict() → projected to declared writes, extras dropped."""
+
     @tool(capability="fs.read", description="r", returns={"content": str})
     async def rd(*, path: Path, ctx: ToolContext) -> _Result:
         return _Result(content="data", size=42)
@@ -219,6 +221,7 @@ class _BadResult:
 
 async def test_dataclass_result_missing_required_field_raises() -> None:
     """Dataclass result missing a required write → StageOutputValidationError."""
+
     @tool(capability="fs.read", description="r", returns={"content": str})
     async def rd(*, path: Path, ctx: ToolContext) -> _BadResult:
         return _BadResult(lines=0)
@@ -238,6 +241,7 @@ async def test_dataclass_result_missing_required_field_raises() -> None:
 
 async def test_scalar_result_with_outputs_raises() -> None:
     """Bare scalar result when stage declares outputs → error (no wrapping)."""
+
     @tool(capability="fs.read", description="r", returns={"content": str})
     async def rd(*, path: Path, ctx: ToolContext) -> str:  # returns scalar despite output_schema
         return "naked"
@@ -267,6 +271,7 @@ class _EmptyResult:
 
 async def test_output_empty_ignores_dataclass_result() -> None:
     """output: {} → dataclass result ignored entirely."""
+
     @tool(capability="fs.read", description="r")
     async def rd(*, path: Path, ctx: ToolContext) -> _EmptyResult:
         return _EmptyResult(x="hi")
@@ -286,6 +291,7 @@ async def test_output_empty_ignores_dataclass_result() -> None:
 
 async def test_output_empty_ignores_none_result() -> None:
     """output: {} → None result accepted."""
+
     @tool(capability="fs.read", description="r")
     async def rd(*, path: Path, ctx: ToolContext) -> None:
         return None
@@ -310,6 +316,7 @@ async def test_output_empty_ignores_none_result() -> None:
 
 async def test_deny_policy_blocks_deterministic_stage() -> None:
     """A deny policy on the exec capability blocks the call."""
+
     @tool(capability="fs.read", description="r", returns={"content": str})
     async def rd(*, path: Path, ctx: ToolContext) -> dict[str, str]:
         return {"content": "blocked"}
@@ -340,6 +347,7 @@ async def test_deny_policy_blocks_deterministic_stage() -> None:
 
 async def test_deterministic_stage_emits_tool_events_not_model_events() -> None:
     """Tool events are emitted; model events are not for deterministic stages."""
+
     @tool(capability="fs.read", description="r", returns={"content": str})
     async def rd(*, path: Path, ctx: ToolContext) -> dict[str, str]:
         return {"content": "ok"}
@@ -375,6 +383,7 @@ class _LinesResult:
 
 async def test_string_array_write_satisfied_by_list_str_dataclass() -> None:
     """string[] write matches list[str] dataclass field (regression: Medium #7)."""
+
     @tool(capability="fs.read", description="r")
     async def rd(*, path: Path, ctx: ToolContext) -> _LinesResult:
         return _LinesResult(lines=["a", "b"])
@@ -404,6 +413,7 @@ class _PathResult:
 
 async def test_path_typed_output_str_coerced_to_path() -> None:
     """path-typed write returned as str → coerced to Path (regression: §1.9)."""
+
     @tool(capability="fs.read", description="r", returns={"path": str})
     async def rd(*, path: Path, ctx: ToolContext) -> _PathResult:
         return _PathResult(path="/tmp/out.txt")
@@ -450,6 +460,7 @@ async def test_path_typed_output_str_coerced_to_path() -> None:
 
 async def test_bool_branch_transition_on_deterministic_output() -> None:
     """Bool-branch transition fires on deterministic stage output."""
+
     @tool(capability="os.shell", description="s", returns={"ok": bool, "log": str})
     async def sh(*, command: str, ctx: ToolContext) -> dict[str, Any]:
         return {"ok": True, "log": "done"}
@@ -504,6 +515,7 @@ async def test_bool_branch_transition_on_deterministic_output() -> None:
             ),
         ),
     )
+
     class FakeM:
         async def complete(self, _request: Any) -> Any:
             return ModelResponse(content='{"summary": "done"}')
@@ -524,6 +536,7 @@ async def test_bool_branch_transition_on_deterministic_output() -> None:
 
 async def test_mixed_deterministic_and_model_stages() -> None:
     """A deterministic stage followed by a model stage runs end-to-end."""
+
     @tool(capability="fs.read", description="r", returns={"content": str})
     async def rd(*, path: Path, ctx: ToolContext) -> dict[str, str]:
         return {"content": "the content"}
@@ -594,6 +607,7 @@ async def test_mixed_deterministic_and_model_stages() -> None:
 async def test_tool_selection_ambiguous_match_raises() -> None:
     """When multiple tools equally satisfy a deterministic stage,
     construction raises WorkflowValidationError naming the candidates."""
+
     @tool(capability="fs.read", description="a", returns={"content": str})
     async def rd_a(*, path: Path, ctx: ToolContext) -> dict[str, str]:
         return {"content": "a"}
@@ -698,6 +712,7 @@ async def test_before_policy_runs_before_deterministic_stage() -> None:
 async def test_all_deterministic_workflow_runs_with_placeholder_model() -> None:
     """An all-deterministic workflow runs end-to-end; the model executor
     is never invoked (§16.5 — model= is still required but unused)."""
+
     @tool(capability="fs.read", description="r", returns={"content": str})
     async def rd(*, path: Path, ctx: ToolContext) -> dict[str, str]:
         return {"content": "step1"}
@@ -708,6 +723,7 @@ async def test_all_deterministic_workflow_runs_with_placeholder_model() -> None:
 
     class SentinelModel:
         """Model that records every call — should never be invoked."""
+
         calls: list[Any] = []  # noqa: RUF012
 
         @classmethod
@@ -726,7 +742,8 @@ async def test_all_deterministic_workflow_runs_with_placeholder_model() -> None:
     write_args = {
         "path": ExprSpec(kind="literal", type="string", value="/tmp/out.txt"),
         "content": ExprSpec(
-            kind="ref", ref=RefSpec(kind="node_output", node="Read", field="content"),
+            kind="ref",
+            ref=RefSpec(kind="node_output", node="Read", field="content"),
         ),
     }
     manifest = WorkflowManifest(
@@ -745,12 +762,16 @@ async def test_all_deterministic_workflow_runs_with_placeholder_model() -> None:
                 requires=frozenset({"fs.read"}),
                 transitions=(
                     TransitionSpec(
-                        to="Write", priority=0, reason="fallthrough",
+                        to="Write",
+                        priority=0,
+                        reason="fallthrough",
                         guard=GuardSpec(kind="always"),
                     ),
                 ),
                 execution=StageExecutionSpec(
-                    kind="tool", capability="fs.read", args=read_args,
+                    kind="tool",
+                    capability="fs.read",
+                    args=read_args,
                 ),
             ),
             StageSpec(
@@ -759,7 +780,9 @@ async def test_all_deterministic_workflow_runs_with_placeholder_model() -> None:
                 reads=(
                     ReadSpec(
                         ref=RefSpec(
-                            kind="node_output", node="Read", field="content",
+                            kind="node_output",
+                            node="Read",
+                            field="content",
                         ),
                         optional=False,
                     ),
@@ -768,7 +791,9 @@ async def test_all_deterministic_workflow_runs_with_placeholder_model() -> None:
                 requires=frozenset({"fs.write"}),
                 transitions=(),
                 execution=StageExecutionSpec(
-                    kind="tool", capability="fs.write", args=write_args,
+                    kind="tool",
+                    capability="fs.write",
+                    args=write_args,
                 ),
             ),
         ),

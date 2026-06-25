@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nemoir-runtime"
-version = "0.8.0"
+version = "0.9.0"
 description = "Python runtime core for NemoIR — execute compiled agent workflows as structured state machines with tool orchestration, policy enforcement, model-backed stage execution, and live event streaming."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -58,6 +58,10 @@ ignore = [
     "ANN401",
     "PLR0913",
     "BLE001",
+    "C901",
+    "PLR0911",
+    "PLR0912",
+    "PLR0915",
 ]
 
 [tool.ruff.lint.per-file-ignores]
