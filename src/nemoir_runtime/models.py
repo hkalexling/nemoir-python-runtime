@@ -10,6 +10,7 @@ from nemoir_runtime.capabilities import CAPABILITY_CATALOG
 from nemoir_runtime.errors import (
     ModelOutputValidationError,
     ModelProviderError,
+    PolicyDeniedError,
     ToolInvocationError,
 )
 from nemoir_runtime.tools import (
@@ -885,6 +886,13 @@ class ModelStageExecutor:
                             self._tool_result_message(tc_id, self._tool_error_content(str(e)))
                         )
                     except ToolInvocationError as e:
+                        if not had_error:
+                            first_error_msg = str(e)
+                        had_error = True
+                        messages.append(
+                            self._tool_result_message(tc_id, self._tool_error_content(str(e)))
+                        )
+                    except PolicyDeniedError as e:
                         if not had_error:
                             first_error_msg = str(e)
                         had_error = True
