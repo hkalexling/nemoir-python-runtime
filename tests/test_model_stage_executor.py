@@ -322,19 +322,19 @@ async def test_tool_call_path_arg_coerced() -> None:
     await executor.execute(ctx)
 
 
-async def test_unknown_tool_name_raises() -> None:
+async def test_unknown_tool_error_fed_back_then_success() -> None:
+    """Unknown tool on first call is fed back as a tool result, not a fatal error.
+
+    Tool-call errors do not consume max_model_retries; the model recovers
+    on the next response.
+    """
     adapter = _fake_adapter(
         [
             ModelResponse(
                 content=None,
-                tool_calls=(
-                    ModelToolCall(
-                        id="c1",
-                        name="nonexistent",
-                        arguments={},
-                    ),
-                ),
+                tool_calls=(ModelToolCall(id="c1", name="nonexistent", arguments={}),),
             ),
+            ModelResponse(content='{"summary": "done"}'),
         ]
     )
     tools = ToolRegistry([_read_tool()])
@@ -342,10 +342,10 @@ async def test_unknown_tool_name_raises() -> None:
     ctx = _make_stage_ctx(
         writes=(WriteSpec(name="summary", type="string", optional=False),),
         allowed_capabilities=frozenset({"fs.read"}),
-        options={"max_model_retries": 0},
+        options={"max_model_retries": 0},  # tool errors must NOT be bounded by this
     )
-    with pytest.raises(ModelOutputValidationError, match="unknown tool"):  # type: ignore[reportUnknownMemberType]
-        await executor.execute(ctx)
+    result = await executor.execute(ctx)
+    assert result == {"summary": "done"}
 
 
 async def test_tool_round_limit_exceeded() -> None:
@@ -371,8 +371,29 @@ async def test_tool_round_limit_exceeded() -> None:
         await executor.execute(ctx)
 
 
-async def test_tool_outside_allowed_capabilities_raises() -> None:
-    """A model requests a tool whose capability is NOT in stage.allowed_capabilities."""
+async def test_persistent_tool_errors_exhaust_max_tool_rounds() -> None:
+    """Repeated tool-call errors do NOT consume max_model_retries; only max_tool_rounds."""
+    writes = (WriteSpec(name="summary", type="string", optional=False),)
+    bad_call = ModelResponse(
+        content=None,
+        tool_calls=(ModelToolCall(id="c1", name="nonexistent", arguments={}),),
+    )
+    # 10 bad responses; max_model_retries=0 must NOT cause early death.
+    adapter = _fake_adapter([bad_call] * 10)
+    tools = ToolRegistry([_read_tool()])
+    executor = ModelStageExecutor(model=adapter, tools=tools, max_tool_rounds=3)
+    ctx = _make_stage_ctx(
+        writes=writes,
+        allowed_capabilities=frozenset({"fs.read"}),
+        options={"max_model_retries": 0},
+    )
+    with pytest.raises(ModelOutputValidationError, match="exceeded max_tool_rounds"):  # type: ignore[reportUnknownMemberType]
+        await executor.execute(ctx)
+    assert len(adapter.calls) == 4  # 3 rounds + the one that trips the cap
+
+
+async def test_disallowed_capability_fed_back_then_success() -> None:
+    """Disallowed capability error is fed back; model recovers on next response."""
     writes = (WriteSpec(name="summary", type="string", optional=False),)
     adapter = _fake_adapter(
         [
@@ -386,6 +407,7 @@ async def test_tool_outside_allowed_capabilities_raises() -> None:
                     ),
                 ),
             ),
+            ModelResponse(content='{"summary": "done"}'),
         ]
     )
     tools = ToolRegistry([_read_tool(), _write_tool()])
@@ -393,12 +415,10 @@ async def test_tool_outside_allowed_capabilities_raises() -> None:
     ctx = _make_stage_ctx(
         writes=writes,
         allowed_capabilities=frozenset({"fs.read"}),
-        options={"max_model_retries": 0},
+        options={"max_model_retries": 0},  # tool errors must NOT be bounded by this
     )
-
-    # The executor's capability visibility check fires BEFORE calling ctx.call_tool.
-    with pytest.raises(ModelOutputValidationError, match="not allowed"):  # type: ignore[reportUnknownMemberType]
-        await executor.execute(ctx)
+    result = await executor.execute(ctx)
+    assert result == {"summary": "done"}
 
 
 async def test_fs_write_triggers_policy_chain() -> None:
@@ -996,7 +1016,7 @@ async def test_tool_call_retry_emits_model_retry_event() -> None:
     assert len(retries) == 1
     assert retries[0].stage_id == "Test"
     assert retries[0].metadata is not None
-    assert retries[0].metadata.get("category") == "tool_args"  # type: ignore[union-attr]
+    assert retries[0].metadata.get("category") == "tool_call"  # type: ignore[union-attr]
 
 
 async def test_max_model_retries_zero_preserves_hard_fail() -> None:

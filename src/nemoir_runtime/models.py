@@ -851,10 +851,17 @@ class ModelStageExecutor:
                 tool_rounds += 1
                 messages.append(self._assistant_tool_call_message(response))
 
-                # Execute every tool call; report errors individually and
-                # retry at the response level when any call fails.
-                had_error = False
-                first_error_msg = ""
+                # Execute every tool call; report errors individually.
+                #
+                # Tool-call errors are corrective feedback, not malformed model
+                # output.  Policy denials, invalid/missing arguments, unknown or
+                # disallowed tools, and handler failures must NOT spend the small
+                # ``max_model_retries`` budget that is reserved for provider
+                # parsing and final-stage JSON/schema correction.  The model sees
+                # each error as a structured tool result and recovers naturally;
+                # the independent ``max_tool_rounds`` cap (checked above) is the
+                # sole safety bound on this loop.
+                had_tool_error = False
                 for i, tc in enumerate(response.tool_calls):
                     tc_id = self._canonical_tool_call_id(tc, i)
                     try:
@@ -878,41 +885,32 @@ class ModelStageExecutor:
                         )
                         result_content = tool_result_to_model_content(result)
                         messages.append(self._tool_result_message(tc_id, result_content))
-                    except ModelOutputValidationError as e:
-                        if not had_error:
-                            first_error_msg = str(e)
-                        had_error = True
-                        messages.append(
-                            self._tool_result_message(tc_id, self._tool_error_content(str(e)))
-                        )
-                    except ToolInvocationError as e:
-                        if not had_error:
-                            first_error_msg = str(e)
-                        had_error = True
-                        messages.append(
-                            self._tool_result_message(tc_id, self._tool_error_content(str(e)))
-                        )
-                    except PolicyDeniedError as e:
-                        if not had_error:
-                            first_error_msg = str(e)
-                        had_error = True
+                    except (
+                        ModelOutputValidationError,
+                        ToolInvocationError,
+                        PolicyDeniedError,
+                    ) as e:
+                        had_tool_error = True
                         messages.append(
                             self._tool_result_message(tc_id, self._tool_error_content(str(e)))
                         )
 
-                if had_error:
-                    if retry_count >= max_retries:
-                        raise ModelOutputValidationError(first_error_msg)
-                    retry_count += 1
+                if had_tool_error:
+                    # Observability only; does NOT consume max_model_retries.
                     await self._emit_model_retry(
                         emitter,
                         stage_id=ctx.stage.id,
-                        error_msg="One or more tool calls failed validation or execution",
-                        category="tool_args",
-                        attempt=retry_count,
-                        max_retries=max_retries,
+                        error_msg="One or more tool calls failed; feedback sent to model",
+                        category="tool_call",
+                        attempt=tool_rounds,
+                        max_retries=(
+                            self._max_tool_rounds if self._max_tool_rounds is not None else -1
+                        ),
                     )
-                    continue
+                # Whether or not tool calls errored, loop back for the next
+                # model response (the model may emit more tool calls or the
+                # final stage output).  max_tool_rounds (checked above) is the
+                # sole bound on this loop.
             else:
                 # Parse and validate final stage output.
                 try:
