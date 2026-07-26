@@ -84,6 +84,13 @@ CAPABILITY_CATALOG: Mapping[str, CapabilitySpec] = MappingProxyType(
                 CapabilityParam("input", CapabilityParamType.JSON),
             ),
         ),
+        "browser.js.sandbox": CapabilitySpec(
+            name="browser.js.sandbox",
+            required_params=(
+                CapabilityParam("code", CapabilityParamType.STRING),
+                CapabilityParam("input", CapabilityParamType.JSON),
+            ),
+        ),
     },
 )
 

@@ -8,8 +8,8 @@ from nemoir_runtime.capabilities import (
 )
 
 
-def test_catalog_has_exactly_nine_capabilities() -> None:
-    assert len(CAPABILITY_CATALOG) == 9
+def test_catalog_has_exactly_ten_capabilities() -> None:
+    assert len(CAPABILITY_CATALOG) == 10
 
 
 def test_catalog_contains_fs_read() -> None:
@@ -63,6 +63,15 @@ def test_catalog_contains_user_confirm() -> None:
     assert len(spec.required_params) == 1
     assert spec.required_params[0].name == "message"
     assert spec.required_params[0].type == CapabilityParamType.STRING
+
+
+def test_catalog_contains_browser_js_sandbox() -> None:
+    spec = get_capability("browser.js.sandbox")
+    assert spec is not None
+    assert spec.name == "browser.js.sandbox"
+    assert [param.name for param in spec.required_params] == ["code", "input"]
+    assert spec.required_params[0].type == CapabilityParamType.STRING
+    assert spec.required_params[1].type == CapabilityParamType.JSON
 
 
 def test_get_capability_returns_none_for_unknown() -> None:
