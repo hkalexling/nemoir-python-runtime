@@ -31,6 +31,7 @@ CATALOG_TYPE_MAP: dict[CapabilityParamType, type] = {
     CapabilityParamType.STRING: str,
     CapabilityParamType.PATH: Path,
     CapabilityParamType.BOOL: bool,
+    CapabilityParamType.JSON: typing.Any,
 }
 
 
@@ -292,6 +293,9 @@ class ToolRegistry:
             raise ToolValidationError(msg)
 
         for param_spec in spec.required_params:
+            # Optional catalog params may be omitted from the tool's handler.
+            if not param_spec.required:
+                continue
             if param_spec.name not in sig.parameters:
                 expected_type_name = CATALOG_TYPE_MAP[param_spec.type].__name__
                 msg = (
@@ -325,7 +329,8 @@ class ToolRegistry:
                         f"expected '{expected_type.__name__}' for capability '{t.capability}'"
                     )
                     raise ToolValidationError(msg)
-                if actual_type is not expected_type:
+                # JSON-typed params accept any annotation (dict, list, str, etc.)
+                if expected_type is not typing.Any and actual_type is not expected_type:
                     actual_name = getattr(actual_type, "__name__", str(actual_type))
                     msg = (
                         f"Tool '{t.name}' parameter '{name}' has type "

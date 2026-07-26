@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import math
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
@@ -380,6 +381,9 @@ _WRITE_TYPE_TO_JSON: dict[str, dict[str, str | dict[str, str]]] = {
     "path": {"type": "string"},
     "number": {"type": "number"},
     "string[]": {"type": "array", "items": {"type": "string"}},
+    # json: any valid JSON value — open schema so the model can produce
+    # objects, arrays, strings, numbers, booleans, or null.
+    "json": {},
 }
 
 
@@ -416,7 +420,8 @@ def normalize_stage_output(stage: StageSpec, raw: Mapping[str, Any]) -> dict[str
         if write.optional and isinstance(val, list) and len(val) == 0 and write.type.endswith("[]"):  # type: ignore[reportUnknownArgumentType]
             val = None
         if val is None:
-            if not write.optional:
+            # json-typed writes may legitimately be None.
+            if not write.optional and write.type != "json":
                 msg = f"missing required output field '{write.name}' in stage '{stage.id}'"
                 raise ModelOutputValidationError(msg)
             result[write.name] = None
@@ -462,8 +467,35 @@ def _normalize_write_value(write: Any, val: Any, stage_id: str) -> Any:
             )
             raise ModelOutputValidationError(msg)
         return val
+    if write.type == "json":
+        # Recursively validate JSON-safe values (no set, bytes, etc.).
+        if not _is_model_json_safe(val):
+            msg = (
+                f"expected JSON-safe value for '{write.name}'"
+                f" in stage '{stage_id}', got {type(val).__name__}"
+            )
+            raise ModelOutputValidationError(msg)
+        return val
     msg = f"unsupported write type '{write.type}' in stage '{stage_id}'"
     raise ModelOutputValidationError(msg)
+
+
+def _is_model_json_safe(value: Any) -> bool:
+    """Recursively check that a value can round-trip through JSON."""
+    if value is None:
+        return True
+    if isinstance(value, (str, bool)):
+        return True
+    if isinstance(value, (int, float)):
+        return not isinstance(value, bool) and math.isfinite(value)
+    if isinstance(value, (list, tuple)):
+        return all(_is_model_json_safe(v) for v in value)
+    if isinstance(value, dict):
+        return all(
+            isinstance(k, str) and _is_model_json_safe(v)
+            for k, v in value.items()
+        )
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -483,7 +515,7 @@ def _required_tool_params(tool: Tool) -> frozenset[str]:
     spec = CAPABILITY_CATALOG.get(tool.capability)
     if spec is None:
         return frozenset()
-    return frozenset(p.name for p in spec.required_params)
+    return frozenset(p.name for p in spec.required_params if p.required)
 
 
 def _non_defaulted_params(tool: Tool) -> frozenset[str]:

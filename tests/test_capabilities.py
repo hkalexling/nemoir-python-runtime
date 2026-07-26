@@ -8,8 +8,8 @@ from nemoir_runtime.capabilities import (
 )
 
 
-def test_catalog_has_exactly_five_capabilities() -> None:
-    assert len(CAPABILITY_CATALOG) == 5
+def test_catalog_has_exactly_nine_capabilities() -> None:
+    assert len(CAPABILITY_CATALOG) == 9
 
 
 def test_catalog_contains_fs_read() -> None:

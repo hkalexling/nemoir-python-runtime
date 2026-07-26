@@ -13,12 +13,14 @@ class CapabilityParamType(Enum):
     STRING = "string"
     PATH = "path"
     BOOL = "bool"
+    JSON = "json"
 
 
 @dataclass(frozen=True)
 class CapabilityParam:
     name: str
     type: CapabilityParamType
+    required: bool = True
 
 
 @dataclass(frozen=True)
@@ -27,7 +29,7 @@ class CapabilitySpec:
     required_params: tuple[CapabilityParam, ...]
 
     def has_required_param(self, name: str) -> bool:
-        return any(param.name == name for param in self.required_params)
+        return any(param.name == name and param.required for param in self.required_params)
 
 
 CAPABILITY_CATALOG: Mapping[str, CapabilitySpec] = MappingProxyType(
@@ -55,6 +57,33 @@ CAPABILITY_CATALOG: Mapping[str, CapabilitySpec] = MappingProxyType(
             name="user.confirm",
             required_params=(CapabilityParam("message", CapabilityParamType.STRING),),
         ),
+        "http.fetch": CapabilitySpec(
+            name="http.fetch",
+            required_params=(
+                CapabilityParam("url", CapabilityParamType.STRING),
+                CapabilityParam("method", CapabilityParamType.STRING),
+                CapabilityParam("headers", CapabilityParamType.JSON, required=False),
+                CapabilityParam("body", CapabilityParamType.JSON, required=False),
+            ),
+        ),
+        "browser.storage.read": CapabilitySpec(
+            name="browser.storage.read",
+            required_params=(CapabilityParam("key", CapabilityParamType.STRING),),
+        ),
+        "browser.storage.write": CapabilitySpec(
+            name="browser.storage.write",
+            required_params=(
+                CapabilityParam("key", CapabilityParamType.STRING),
+                CapabilityParam("value", CapabilityParamType.JSON),
+            ),
+        ),
+        "browser.js.run": CapabilitySpec(
+            name="browser.js.run",
+            required_params=(
+                CapabilityParam("code", CapabilityParamType.STRING),
+                CapabilityParam("input", CapabilityParamType.JSON),
+            ),
+        ),
     },
 )
 
@@ -67,4 +96,4 @@ def required_param_names(name: str) -> frozenset[str]:
     spec = get_capability(name)
     if spec is None:
         return frozenset()
-    return frozenset(param.name for param in spec.required_params)
+    return frozenset(param.name for param in spec.required_params if param.required)

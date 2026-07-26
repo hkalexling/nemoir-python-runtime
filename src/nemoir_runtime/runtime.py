@@ -5,6 +5,7 @@ import collections.abc
 import contextlib
 import dataclasses
 import inspect
+import math
 import os
 import uuid
 from dataclasses import dataclass, field
@@ -543,10 +544,10 @@ class WorkflowRuntime:
                 msg = f"Stage '{stage.id}' returned unknown output field '{key}'"
                 raise StageOutputValidationError(msg)
         for write in stage.writes:
-            if not write.optional and (write.name not in output or output[write.name] is None):
+            val = output.get(write.name)
+            if not write.optional and (write.name not in output or (val is None and write.type != "json")):
                 msg = f"Stage '{stage.id}' is missing required output field '{write.name}'"
                 raise StageOutputValidationError(msg)
-            val = output.get(write.name)
             if val is not None:
                 _validate_write_type(val, write.type, write.name, stage.id)
 
@@ -931,6 +932,9 @@ class WorkflowRuntime:
             )
             raise PolicyEvaluationError(msg)
         for param in spec.required_params:
+            # Optional catalog params need not be bound in policies.
+            if not param.required:
+                continue
             if param.name not in req_args or req_args[param.name] is None:
                 msg = (
                     f"Policy '{policy_id}': required capability '{req_capability}' "
@@ -1109,6 +1113,9 @@ def _type_satisfies_write(py_type: type, write_type: str) -> bool:
         if origin is list:
             return True
         return py_type is list
+    if write_type == "json":
+        # Accept any JSON-serializable Python type.
+        return py_type in (dict, list, str, int, float, bool, type(None), Any)
     return False
 
 
@@ -1123,6 +1130,34 @@ def _non_defaulted_tool_params(tool: Tool) -> frozenset[str]:
         if param is not None and param.default is inspect.Parameter.empty:
             required.add(name)
     return frozenset(required)
+
+
+def _validate_json_safe(value: Any, field_name: str, stage_id: str) -> None:
+    """Recursively validate a JSON-safe value — rejects set, bytes, etc."""
+    if not _is_json_safe_value(value):
+        msg = (
+            f"Stage '{stage_id}' output field '{field_name}': "
+            f"expected JSON-safe value, got {type(value).__name__}"
+        )
+        raise StageOutputValidationError(msg)
+
+
+def _is_json_safe_value(value: Any) -> bool:
+    """Recursively check that a value can round-trip through JSON."""
+    if value is None:
+        return True
+    if isinstance(value, (str, bool)):
+        return True
+    if isinstance(value, (int, float)):
+        return not isinstance(value, bool) and math.isfinite(value)
+    if isinstance(value, (list, tuple)):
+        return all(_is_json_safe_value(v) for v in value)
+    if isinstance(value, dict):
+        return all(
+            isinstance(k, str) and _is_json_safe_value(v)
+            for k, v in value.items()
+        )
+    return False
 
 
 def _validate_write_type(value: Any, write_type: str, field_name: str, stage_id: str) -> None:
@@ -1168,6 +1203,9 @@ def _validate_write_type(value: Any, write_type: str, field_name: str, stage_id:
                 f"got {type(value).__name__}"
             )
             raise StageOutputValidationError(msg)
+    elif write_type == "json":
+        # Recursively validate JSON-safe values (no set, frozenset, bytes, etc.).
+        _validate_json_safe(value, field_name, stage_id)
     else:
         msg = f"Stage '{stage_id}' output field '{field_name}': unsupported type '{write_type}'"
         raise StageOutputValidationError(msg)
