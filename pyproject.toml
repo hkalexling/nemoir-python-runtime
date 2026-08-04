@@ -24,7 +24,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-urls = { Repository = "https://github.com/nemoir" }
+urls = { Repository = "https://github.com/hkalexling/nemoir-python-runtime" }
 requires-python = ">=3.11"
 dependencies = [
     "litellm>=1.0.0",

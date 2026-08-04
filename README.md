@@ -1,6 +1,6 @@
 # NemoIR Runtime
 
-Python runtime core for [NemoIR](https://github.com/nemoir) — an LLVM-inspired compiler stack for agentic workflows.
+Python runtime core for [NemoIR](https://github.com/hkalexling/nemoir) — an LLVM-inspired compiler stack for agentic workflows.
 
 Executes compiled agent workflows as structured state machines with tool orchestration, policy enforcement, model-backed stage execution (via [LiteLLM](https://github.com/BerriAI/litellm)), and live event streaming.
 
@@ -12,13 +12,21 @@ Executes compiled agent workflows as structured state machines with tool orchest
 - **Model integration** — `ModelStageExecutor` with LiteLLM adapter, structured output enforcement, tool-call loop, `ModelRouter` for per-stage model routing, and optional streaming via `ModelStreamingAdapter`.
 - **Deterministic stages** — `exec:` workflow stages run a fixed capability with bound args via `DeterministicStageExecutor`, with no model call. Tool selection happens at runtime construction (fail-fast on no-match/ambiguous). `Tool.output_schema` / `@tool(returns=…)` declare tool return shapes so the runtime can match tools to stage outputs.
 - **Live event streaming** — `WorkflowRuntime.stream()` / generated `Agent.stream()` async iterator emitting `WorkflowEvent` values (run lifecycle, model deltas, tool calls, policy decisions) for UIs, debugging, and observability.
-- **Compiler backend target** — generated workflow-specific Python packages consume this runtime; see `nemoir-backend-python` in the main NemoIR repo.
+- **Compiler backend target** — generated workflow-specific Python packages consume this runtime; see the [Python target guide](https://github.com/hkalexling/nemoir/blob/master/docs/targets/python.md) in the public compiler repo.
 
 ## Install
 
 ```bash
 pip install nemoir-runtime
 ```
+
+## Compiler references
+
+NemoIR is a research-pilot compiler stack. Canonical workflow language, IR semantics, and compiler-target behavior live in the public compiler repo:
+
+- [Compiler repo](https://github.com/hkalexling/nemoir)
+- [DSL and IR spec](https://github.com/hkalexling/nemoir/blob/master/docs/dsl-and-ir.md)
+- [Python target guide](https://github.com/hkalexling/nemoir/blob/master/docs/targets/python.md)
 
 ## Quick start
 
@@ -45,7 +53,7 @@ result = await runtime.run({"task": "analyze code"})
 print(result.output)
 ```
 
-See the [NemoIR project](https://github.com/nemoir) for the full compiler workflow (DSL → IR → generated package).
+See the compiler references above for the full DSL → IR → generated-package workflow.
 
 ## Policy engine
 
