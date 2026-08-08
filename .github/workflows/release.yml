@@ -273,15 +273,20 @@ jobs:
           set -euo pipefail
           tag="v${VERSION}"
           if gh release view "${tag}" --json isDraft --jq '.isDraft' 2>/dev/null | grep -qx true; then
-            gh release upload "${tag}" dist/* --clobber
+            gh release upload "${tag}" dist/*.whl dist/*.tar.gz SHA256SUMS --clobber
           else
             gh release create "${tag}" \
               --target "${RELEASE_SHA}" \
               --title "${tag}" \
               --draft \
               --generate-notes \
-              dist/*
+              dist/*.whl dist/*.tar.gz SHA256SUMS
           fi
+
+      - name: Drop non-distribution files before PyPI publish
+        shell: bash
+        run: |
+          rm -f dist/SHA256SUMS
 
       - name: Publish distributions to PyPI
         if: steps.preflight.outputs.pypi_already_published != 'true'
