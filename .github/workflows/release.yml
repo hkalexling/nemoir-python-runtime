@@ -273,14 +273,14 @@ jobs:
           set -euo pipefail
           tag="v${VERSION}"
           if gh release view "${tag}" --json isDraft --jq '.isDraft' 2>/dev/null | grep -qx true; then
-            gh release upload "${tag}" dist/*.whl dist/*.tar.gz SHA256SUMS --clobber
+            gh release upload "${tag}" dist/*.whl dist/*.tar.gz dist/SHA256SUMS --clobber
           else
             gh release create "${tag}" \
               --target "${RELEASE_SHA}" \
               --title "${tag}" \
               --draft \
               --generate-notes \
-              dist/*.whl dist/*.tar.gz SHA256SUMS
+              dist/*.whl dist/*.tar.gz dist/SHA256SUMS
           fi
 
       - name: Drop non-distribution files before PyPI publish
