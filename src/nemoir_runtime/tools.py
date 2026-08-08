@@ -27,7 +27,7 @@ class ToolContext:
     metadata: Mapping[str, Any] = field(default_factory=dict)  # type: ignore[reportUnknownVariableType]
 
 
-CATALOG_TYPE_MAP: dict[CapabilityParamType, type] = {
+CATALOG_TYPE_MAP: dict[CapabilityParamType, Any] = {
     CapabilityParamType.STRING: str,
     CapabilityParamType.PATH: Path,
     CapabilityParamType.BOOL: bool,

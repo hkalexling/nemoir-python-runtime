@@ -10,7 +10,7 @@ import os
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Protocol, get_origin
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, get_origin
 
 from nemoir_runtime.capabilities import CAPABILITY_CATALOG, CapabilityParamType
 from nemoir_runtime.errors import (
@@ -545,7 +545,9 @@ class WorkflowRuntime:
                 raise StageOutputValidationError(msg)
         for write in stage.writes:
             val = output.get(write.name)
-            if not write.optional and (write.name not in output or (val is None and write.type != "json")):
+            if not write.optional and (
+                write.name not in output or (val is None and write.type != "json")
+            ):
                 msg = f"Stage '{stage.id}' is missing required output field '{write.name}'"
                 raise StageOutputValidationError(msg)
             if val is not None:
@@ -1151,12 +1153,11 @@ def _is_json_safe_value(value: Any) -> bool:
     if isinstance(value, (int, float)):
         return not isinstance(value, bool) and math.isfinite(value)
     if isinstance(value, (list, tuple)):
-        return all(_is_json_safe_value(v) for v in value)
+        values = cast("list[object] | tuple[object, ...]", value)
+        return all(_is_json_safe_value(item) for item in values)
     if isinstance(value, dict):
-        return all(
-            isinstance(k, str) and _is_json_safe_value(v)
-            for k, v in value.items()
-        )
+        mapping = cast("dict[object, object]", value)
+        return all(isinstance(k, str) and _is_json_safe_value(v) for k, v in mapping.items())
     return False
 
 

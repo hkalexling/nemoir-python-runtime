@@ -5,7 +5,7 @@ import json
 import math
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 from nemoir_runtime.capabilities import CAPABILITY_CATALOG
 from nemoir_runtime.errors import (
@@ -489,12 +489,11 @@ def _is_model_json_safe(value: Any) -> bool:
     if isinstance(value, (int, float)):
         return not isinstance(value, bool) and math.isfinite(value)
     if isinstance(value, (list, tuple)):
-        return all(_is_model_json_safe(v) for v in value)
+        values = cast("list[object] | tuple[object, ...]", value)
+        return all(_is_model_json_safe(item) for item in values)
     if isinstance(value, dict):
-        return all(
-            isinstance(k, str) and _is_model_json_safe(v)
-            for k, v in value.items()
-        )
+        mapping = cast("dict[object, object]", value)
+        return all(isinstance(k, str) and _is_model_json_safe(v) for k, v in mapping.items())
     return False
 
 

@@ -181,3 +181,8 @@ stage output validation is unaffected.
 
 - Python ≥ 3.11
 - LiteLLM ≥ 1.0.0 (for `LiteLLMModelAdapter`; custom `ModelAdapter` implementations can avoid this dependency)
+
+## Releasing
+
+Maintainers should follow [RELEASE.md](RELEASE.md); PyPI publication is
+performed only by the trusted GitHub Actions workflow.

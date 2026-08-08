@@ -1,0 +1,295 @@
+name: Release
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - pyproject.toml
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and validate only; do not publish
+        type: boolean
+        default: true
+      ref:
+        description: Exact commit SHA to dry-run or retry (defaults to the selected ref)
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+# Immutable package versions require serialized releases.
+concurrency:
+  group: release-python-runtime-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    name: Detect release candidate
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.detect.outputs.version }}
+      sha: ${{ steps.detect.outputs.sha }}
+      eligible: ${{ steps.detect.outputs.eligible }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Validate version bump
+        id: detect
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          python <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+          import tomllib
+
+          semver = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
+
+          def version_from_toml(text: str) -> tuple[str, tuple[int, int, int]]:
+              value = tomllib.loads(text)["project"]["version"]
+              if not isinstance(value, str) or not semver.fullmatch(value):
+                  raise ValueError(f"expected canonical SemVer X.Y.Z, got {value!r}")
+              return value, tuple(int(component) for component in value.split("."))
+
+          def output(key: str, value: str) -> None:
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
+                  stream.write(f"{key}={value}\n")
+
+          current, current_parts = version_from_toml(open("pyproject.toml", encoding="utf-8").read())
+          sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          output("version", current)
+          output("sha", sha)
+
+          if os.environ["EVENT_NAME"] != "push":
+              output("eligible", "true")
+              print(f"Manual run for nemoir-runtime@{current} at {sha}")
+              raise SystemExit(0)
+
+          before = os.environ.get("BEFORE_SHA", "")
+          if not before or set(before) == {"0"}:
+              output("eligible", "false")
+              print("No prior default-branch revision; automatic release is intentionally skipped.")
+              raise SystemExit(0)
+
+          try:
+              previous_toml = subprocess.check_output(
+                  ["git", "show", f"{before}:pyproject.toml"], text=True,
+              )
+          except subprocess.CalledProcessError:
+              output("eligible", "false")
+              print(f"pyproject.toml was unavailable at {before}; automatic release is skipped.")
+              raise SystemExit(0)
+
+          previous, previous_parts = version_from_toml(previous_toml)
+          if current == previous:
+              output("eligible", "false")
+              print(f"Version is unchanged at {current}; nothing to release.")
+              raise SystemExit(0)
+          if current_parts <= previous_parts:
+              print(f"Version must increase: {previous} -> {current}", file=sys.stderr)
+              raise SystemExit(1)
+
+          output("eligible", "true")
+          print(f"Release candidate: nemoir-runtime@{previous} -> {current} ({sha})")
+          PY
+
+  quality:
+    name: Quality checks
+    needs: detect
+    if: needs.detect.outputs.eligible == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install ruff ".[dev]"
+      - run: ruff format --check .
+      - run: ruff check .
+      - run: pyright .
+
+  test:
+    name: pytest (${{ matrix.python-version }})
+    needs: detect
+    if: needs.detect.outputs.eligible == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12', '3.13', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install ".[dev]"
+      - run: python -m pytest
+
+  build:
+    name: Build and smoke-test distributions
+    needs: [detect, quality, test]
+    if: needs.detect.outputs.eligible == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install --upgrade pip build twine
+      - run: rm -rf dist
+      - run: python -m build --outdir dist
+      - run: twine check dist/*
+      - name: Smoke-test the built wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheel="$(find dist -maxdepth 1 -name '*.whl' -type f | head -1)"
+          test -n "${wheel}"
+          python -m venv /tmp/nemoir-runtime-release-smoke
+          /tmp/nemoir-runtime-release-smoke/bin/python -m pip install "${wheel}"
+          /tmp/nemoir-runtime-release-smoke/bin/python -c 'import nemoir_runtime; print("import OK")'
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum *.whl *.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ needs.detect.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish v${{ needs.detect.outputs.version }}
+    needs: [detect, build]
+    if: >-
+      needs.detect.outputs.eligible == 'true' &&
+      (github.event_name == 'push' || inputs.dry_run == false)
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-${{ needs.detect.outputs.version }}
+          path: dist
+
+      - name: Verify release artifacts
+        working-directory: dist
+        run: sha256sum -c SHA256SUMS
+
+      - name: Preflight immutable release state
+        id: preflight
+        shell: bash
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+          RELEASE_SHA: ${{ needs.detect.outputs.sha }}
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          tag_sha=""
+          tag_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags%2F${tag}" 2>/dev/null || true)"
+          if [[ -n "${tag_ref}" ]]; then
+            tag_sha="$(printf '%s' "${tag_ref}" | jq -r '.object.sha')"
+            tag_type="$(printf '%s' "${tag_ref}" | jq -r '.object.type')"
+            if [[ "${tag_type}" == "tag" ]]; then
+              tag_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}" --jq '.object.sha')"
+            fi
+            if [[ "${tag_sha}" != "${RELEASE_SHA}" ]]; then
+              echo "Tag ${tag} targets ${tag_sha}, not ${RELEASE_SHA}; refusing to reuse a version." >&2
+              exit 1
+            fi
+          fi
+
+          release_state="missing"
+          if draft="$(gh release view "${tag}" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
+            if [[ "${draft}" == "true" ]]; then
+              release_state="draft"
+            else
+              release_state="final"
+            fi
+          fi
+          if [[ "${release_state}" == "final" ]]; then
+            echo "Final GitHub Release ${tag} already exists; refusing overwrite." >&2
+            exit 1
+          fi
+
+          status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' "https://pypi.org/pypi/nemoir-runtime/${VERSION}/json" || true)"
+          if [[ "${status}" != "200" && "${status}" != "404" ]]; then
+            echo "PyPI version lookup returned HTTP ${status:-none}; refusing an unsafe publish." >&2
+            exit 1
+          fi
+
+          already_published=false
+          if [[ "${status}" == "200" ]]; then
+            if [[ "${tag_sha}" == "${RELEASE_SHA}" && "${release_state}" == "draft" ]]; then
+              already_published=true
+              echo "PyPI version exists with a matching draft release; resuming finalization."
+            else
+              echo "nemoir-runtime==${VERSION} already exists without a matching draft at this SHA; refusing." >&2
+              exit 1
+            fi
+          fi
+          echo "pypi_already_published=${already_published}" >> "$GITHUB_OUTPUT"
+
+      - name: Create or refresh draft GitHub Release
+        shell: bash
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+          RELEASE_SHA: ${{ needs.detect.outputs.sha }}
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          if gh release view "${tag}" --json isDraft --jq '.isDraft' 2>/dev/null | grep -qx true; then
+            gh release upload "${tag}" dist/* --clobber
+          else
+            gh release create "${tag}" dist/* \
+              --target "${RELEASE_SHA}" \
+              --title "${tag}" \
+              --draft \
+              --generate-notes
+          fi
+
+      - name: Publish distributions to PyPI
+        if: steps.preflight.outputs.pypi_already_published != 'true'
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
+        with:
+          packages-dir: dist/
+          skip-existing: false
+
+      - name: Attest release distributions
+        if: github.event.repository.visibility == 'public'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: |
+            dist/*.whl
+            dist/*.tar.gz
+
+      - name: Finalize GitHub Release
+        shell: bash
+        run: gh release edit "v${{ needs.detect.outputs.version }}" --draft=false
