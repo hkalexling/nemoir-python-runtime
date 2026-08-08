@@ -275,11 +275,12 @@ jobs:
           if gh release view "${tag}" --json isDraft --jq '.isDraft' 2>/dev/null | grep -qx true; then
             gh release upload "${tag}" dist/* --clobber
           else
-            gh release create "${tag}" dist/* \
+            gh release create "${tag}" \
               --target "${RELEASE_SHA}" \
               --title "${tag}" \
               --draft \
-              --generate-notes
+              --generate-notes \
+              dist/*
           fi
 
       - name: Publish distributions to PyPI
