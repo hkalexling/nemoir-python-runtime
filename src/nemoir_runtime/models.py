@@ -167,16 +167,29 @@ class LiteLLMModelAdapter:
         if request.tools:
             kwargs["tools"] = list(request.tools)
             kwargs["tool_choice"] = "auto"
-        if request.output_schema and "response_format" in self.extra:
-            kwargs["response_format"] = self.extra["response_format"]
-        elif request.output_schema and self.structured_outputs:
-            kwargs["response_format"] = _json_schema_response_format(
-                request.stage_id, request.output_schema
-            )
-        elif request.output_schema:
-            kwargs["response_format"] = {
-                "type": "json_object",
-            }
+        # Gateways are inconsistent about combining `response_format` with
+        # tools: some (e.g. the opencode zen gateway serving deepseek-v4-flash)
+        # silently drop tool calling whenever `response_format` is present,
+        # leaving the model to narrate intent instead of emitting tool calls.
+        # Skip the schema-enforcing response_format for tool-carrying
+        # requests; the runtime still validates the final stage JSON
+        # client-side via its retry loop.  Stages without tools keep
+        # response_format for stronger JSON adherence.
+        #
+        # A `response_format` set explicitly in `extra` is an opt-in
+        # override: `kwargs.update(self.extra)` below re-applies it even for
+        # tool-carrying requests.
+        if not request.tools:
+            if request.output_schema and "response_format" in self.extra:
+                kwargs["response_format"] = self.extra["response_format"]
+            elif request.output_schema and self.structured_outputs:
+                kwargs["response_format"] = _json_schema_response_format(
+                    request.stage_id, request.output_schema
+                )
+            elif request.output_schema:
+                kwargs["response_format"] = {
+                    "type": "json_object",
+                }
         if self.temperature is not None:
             kwargs["temperature"] = self.temperature
         if self.max_tokens is not None:

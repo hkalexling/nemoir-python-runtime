@@ -272,6 +272,123 @@ async def test_litellm_adapter_extra_response_format_overrides_structured_output
     assert call_kwargs["response_format"] == custom_rf
 
 
+async def test_litellm_adapter_tools_suppress_response_format() -> None:
+    """Tools present → no schema-enforcing response_format is sent.
+
+    Some gateways (e.g. opencode zen serving deepseek-v4-flash) silently
+    drop tool calling when ``response_format`` is present.  The adapter must
+    therefore skip it for tool-carrying requests; the runtime validates the
+    final stage JSON client-side instead.
+    """
+    from unittest.mock import AsyncMock  # noqa: PLC0415
+
+    fake_response = type(  # type: ignore[reportUnknownVariableType]
+        "FakeResponse",
+        (),
+        {"choices": [type("Choice", (), {"message": type("Msg", (), {"content": '{"x":1}'})()})()]},  # type: ignore[reportUnknownMemberType]
+    )
+    mock_acompletion = AsyncMock(return_value=fake_response)
+    output_schema = {
+        "type": "object",
+        "properties": {"x": {"type": "string"}},
+        "additionalProperties": False,
+    }
+    tool_schema: dict[str, Any] = {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "read",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+
+    adapter = LiteLLMModelAdapter("openai/gpt-4.1-mini", _acompletion=mock_acompletion)
+    request = ModelRequest(
+        stage_id="test", messages=(), tools=(tool_schema,), output_schema=output_schema
+    )
+
+    response = await adapter.complete(request)
+    assert response.content == '{"x":1}'
+    call_kwargs = mock_acompletion.call_args.kwargs
+    assert call_kwargs["tools"] == [tool_schema]
+    assert call_kwargs["tool_choice"] == "auto"
+    assert "response_format" not in call_kwargs
+
+
+async def test_litellm_adapter_tools_suppress_response_format_even_with_structured_outputs() -> (
+    None
+):
+    """structured_outputs=True must not re-add response_format when tools exist."""
+    from unittest.mock import AsyncMock  # noqa: PLC0415
+
+    fake_response = type(  # type: ignore[reportUnknownVariableType]
+        "FakeResponse",
+        (),
+        {"choices": [type("Choice", (), {"message": type("Msg", (), {"content": '{"x":1}'})()})()]},  # type: ignore[reportUnknownMemberType]
+    )
+    mock_acompletion = AsyncMock(return_value=fake_response)
+    output_schema = {
+        "type": "object",
+        "properties": {"x": {"type": "string"}},
+        "additionalProperties": False,
+    }
+    tool_schema: dict[str, Any] = {
+        "type": "function",
+        "function": {"name": "read_file", "description": "read", "parameters": {}},
+    }
+
+    adapter = LiteLLMModelAdapter(
+        ModelSpec(name="openai/gpt-4.1-mini", structured_outputs=True),
+        _acompletion=mock_acompletion,
+    )
+    request = ModelRequest(
+        stage_id="test", messages=(), tools=(tool_schema,), output_schema=output_schema
+    )
+
+    response = await adapter.complete(request)
+    assert response.content == '{"x":1}'
+    call_kwargs = mock_acompletion.call_args.kwargs
+    assert "response_format" not in call_kwargs
+
+
+async def test_litellm_adapter_explicit_extra_response_format_wins_with_tools() -> None:
+    """A response_format set explicitly in extra is an opt-in override."""
+    from unittest.mock import AsyncMock  # noqa: PLC0415
+
+    fake_response = type(  # type: ignore[reportUnknownVariableType]
+        "FakeResponse",
+        (),
+        {"choices": [type("Choice", (), {"message": type("Msg", (), {"content": '{"x":1}'})()})()]},  # type: ignore[reportUnknownMemberType]
+    )
+    mock_acompletion = AsyncMock(return_value=fake_response)
+    output_schema = {
+        "type": "object",
+        "properties": {"x": {"type": "string"}},
+        "additionalProperties": False,
+    }
+    tool_schema: dict[str, Any] = {
+        "type": "function",
+        "function": {"name": "read_file", "description": "read", "parameters": {}},
+    }
+    custom_rf = {"type": "json_object"}
+
+    adapter = LiteLLMModelAdapter(
+        ModelSpec(
+            name="openai/gpt-4.1-mini",
+            extra={"response_format": custom_rf},
+        ),
+        _acompletion=mock_acompletion,
+    )
+    request = ModelRequest(
+        stage_id="test", messages=(), tools=(tool_schema,), output_schema=output_schema
+    )
+
+    response = await adapter.complete(request)
+    assert response.content == '{"x":1}'
+    call_kwargs = mock_acompletion.call_args.kwargs
+    assert call_kwargs["response_format"] == custom_rf
+
+
 async def test_litellm_adapter_tool_call_response_normalizes_to_model_tool_call() -> None:
     """Tool-call response normalizes to ModelToolCall with parsed JSON args.
 
