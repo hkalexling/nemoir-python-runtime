@@ -40,6 +40,7 @@ from nemoir_runtime.models import (
     ModelStreamChunk,
     ModelStreamingAdapter,
     ModelToolCall,
+    OpenAIResponsesModelAdapter,
     supports_streaming,
 )
 from nemoir_runtime.runtime import (
@@ -97,6 +98,7 @@ __all__ = [
     "ModelToolCall",
     "NemoIRRuntimeError",
     "NoTransitionMatchedError",
+    "OpenAIResponsesModelAdapter",
     "PolicyDeniedError",
     "PolicyEvaluationError",
     "PolicySpec",

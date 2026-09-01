@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 import math
+import os
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
@@ -85,6 +86,8 @@ class ModelSpec:
     max_tokens: int | None = None
     structured_outputs: bool = False
     reasoning: Literal["none", "raw"] = "none"
+    api: Literal["chat_completions", "responses"] = "chat_completions"
+    reasoning_effort: Literal["none", "low", "medium", "high"] = "none"
     extra: Mapping[str, Any] = field(default_factory=dict)  # type: ignore[reportUnknownVariableType]
 
 
@@ -102,6 +105,8 @@ class LiteLLMModelAdapter:
     max_tokens: int | None
     structured_outputs: bool
     reasoning: Literal["none", "raw"]
+    api: Literal["chat_completions", "responses"]
+    reasoning_effort: Literal["none", "low", "medium", "high"]
     extra: Mapping[str, Any]
 
     def __init__(
@@ -116,6 +121,8 @@ class LiteLLMModelAdapter:
         self.max_tokens = self._spec.max_tokens
         self.structured_outputs = self._spec.structured_outputs
         self.reasoning = self._spec.reasoning
+        self.api = self._spec.api  # type: ignore[assignment]
+        self.reasoning_effort = self._spec.reasoning_effort  # type: ignore[assignment]
         self.extra = self._spec.extra
         self._acompletion = _acompletion
 
@@ -204,7 +211,7 @@ class LiteLLMModelAdapter:
             return default
         if isinstance(obj, dict):
             return obj.get(key, default)  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
-        return getattr(obj, key, default)
+        return getattr(obj, key, default)  # type: ignore[reportUnknownMemberType,reportUnknownVariableType,reportUnknownArgumentType]
 
     async def _normalize_stream(
         self, response: Any, stage_id: str, *, reasoning: str = "none"
@@ -302,6 +309,345 @@ class LiteLLMModelAdapter:
         yield ModelStreamChunk(kind="completed", response=final_response)
 
 
+class OpenAIResponsesModelAdapter:
+    """ModelAdapter for OpenAI Responses API (e.g. muse-spark via opencode zen).
+
+    Speaks ``/v1/responses`` directly via the official ``openai`` Python SDK
+    and translates the executor's chat-shaped ``ModelRequest`` into Responses
+    ``input`` items, flattened function tools, and ``text.format`` schema
+    enforcement.  Tool results round-trip as ``function_call_output``.
+    """
+
+    name: str
+    temperature: float | None
+    max_tokens: int | None
+    structured_outputs: bool
+    reasoning: Literal["none", "raw"]
+    api: Literal["chat_completions", "responses"]
+    reasoning_effort: Literal["none", "low", "medium", "high"]
+    extra: Mapping[str, Any]
+
+    def __init__(
+        self,
+        spec: str | Mapping[str, Any] | ModelSpec,
+        *,
+        _client: Any = None,
+    ) -> None:
+        self._spec = _resolve_spec(spec)
+        self.name = self._spec.name
+        self.temperature = self._spec.temperature
+        self.max_tokens = self._spec.max_tokens
+        self.structured_outputs = self._spec.structured_outputs
+        self.reasoning = self._spec.reasoning
+        self.api = self._spec.api  # type: ignore[assignment]
+        self.reasoning_effort = self._spec.reasoning_effort  # type: ignore[assignment]
+        self.extra = self._spec.extra
+        self._client_override = _client
+
+    def _get_client(self) -> Any:
+        if self._client_override is not None:
+            return self._client_override
+        try:
+            from openai import AsyncOpenAI  # type: ignore[import-not-found]  # noqa: PLC0415
+        except ImportError as exc:
+            msg = "openai package required for Responses adapter (pip install openai>=1.40.0)"
+            raise RuntimeError(msg) from exc
+        # Client-level config: api_key / base_url / timeout / max_retries
+        # Prefer explicit extra, then conventional env fallbacks.
+        api_key = (
+            self.extra.get("api_key")  # type: ignore[reportUnknownMemberType]
+            or self.extra.get("apiKey")  # type: ignore[reportUnknownMemberType]
+            or os.environ.get("OPENAI_API_KEY")
+            or os.environ.get("NEMOIR_API_KEY")
+        )
+        base_url = (
+            self.extra.get("api_base")  # type: ignore[reportUnknownMemberType]
+            or self.extra.get("base_url")  # type: ignore[reportUnknownMemberType]
+            or self.extra.get("baseUrl")  # type: ignore[reportUnknownMemberType]
+            or os.environ.get("OPENAI_API_BASE")
+            or os.environ.get("NEMOIR_API_BASE")
+        )
+        timeout_raw = (
+            self.extra.get("timeout")  # type: ignore[reportUnknownMemberType]
+            or self.extra.get("request_timeout")  # type: ignore[reportUnknownMemberType]
+            or self.extra.get("model_timeout_seconds")  # type: ignore[reportUnknownMemberType]
+        )
+        kwargs: dict[str, Any] = {}
+        if api_key:
+            kwargs["api_key"] = api_key
+        if base_url:
+            kwargs["base_url"] = base_url
+        if timeout_raw is not None:
+            try:
+                kwargs["timeout"] = float(timeout_raw)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                kwargs["timeout"] = timeout_raw
+        if "max_retries" in self.extra:
+            kwargs["max_retries"] = self.extra["max_retries"]  # type: ignore[reportUnknownMemberType]
+        # Default generous timeout for long reasoning runs when nothing specified.
+        if "timeout" not in kwargs:
+            kwargs["timeout"] = 600.0
+            kwargs["max_retries"] = kwargs.get("max_retries", 2)
+        return AsyncOpenAI(**kwargs)  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
+
+    def _build_input(self, request: ModelRequest) -> list[dict[str, Any]]:
+        input_items: list[dict[str, Any]] = []
+        for msg in request.messages:
+            role = msg.get("role")
+            if role == "system":
+                input_items.append({"role": "system", "content": msg.get("content", "")})
+            elif role == "user":
+                input_items.append({"role": "user", "content": msg.get("content", "")})
+            elif role == "assistant":
+                tool_calls = msg.get("tool_calls")
+                content = msg.get("content")
+                if tool_calls:
+                    for tc in tool_calls:  # type: ignore[reportUnknownVariableType]
+                        func = (  # type: ignore[reportUnknownVariableType]
+                            tc.get("function", {})  # type: ignore[reportUnknownMemberType,reportUnknownVariableType,reportUnknownArgumentType]
+                            if isinstance(tc, dict)
+                            else getattr(tc, "function", {})  # type: ignore[reportUnknownMemberType,reportUnknownVariableType,reportUnknownArgumentType]
+                        )  # type: ignore[reportUnknownMemberType,reportUnknownVariableType,reportUnknownArgumentType]
+                        if isinstance(func, dict):
+                            fname = func.get("name", "")  # type: ignore[reportUnknownMemberType,reportUnknownVariableType,reportUnknownArgumentType]
+                            fargs = func.get("arguments", "{}")  # type: ignore[reportUnknownMemberType,reportUnknownVariableType,reportUnknownArgumentType]
+                        else:
+                            fname = getattr(func, "name", "")  # type: ignore[reportUnknownMemberType,reportUnknownVariableType,reportUnknownArgumentType]
+                            fargs = getattr(func, "arguments", "{}")  # type: ignore[reportUnknownMemberType,reportUnknownVariableType,reportUnknownArgumentType]
+                        call_id = (  # type: ignore[reportUnknownVariableType]
+                            tc.get("id", "") if isinstance(tc, dict) else getattr(tc, "id", "")  # type: ignore[reportUnknownMemberType,reportUnknownVariableType,reportUnknownArgumentType]
+                        )  # type: ignore[reportUnknownMemberType,reportUnknownVariableType,reportUnknownArgumentType]
+                        input_items.append(
+                            {
+                                "type": "function_call",
+                                "call_id": str(call_id),  # type: ignore[reportUnknownVariableType,reportUnknownArgumentType,reportUnknownMemberType]
+                                "name": str(fname),  # type: ignore[reportUnknownArgumentType,reportUnknownVariableType,reportUnknownMemberType]
+                                "arguments": str(fargs)  # type: ignore[reportUnknownArgumentType,reportUnknownVariableType,reportUnknownMemberType]
+                                if isinstance(fargs, str)
+                                else json.dumps(fargs),  # type: ignore[reportUnknownVariableType,reportUnknownArgumentType,reportUnknownMemberType]
+                            }
+                        )
+                    if content:
+                        input_items.append({"role": "assistant", "content": content})
+                elif content:
+                    input_items.append({"role": "assistant", "content": content})
+            elif role == "tool":
+                input_items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": str(msg.get("tool_call_id", "")),
+                        "output": str(msg.get("content", "")),
+                    }
+                )
+            elif msg.get("content"):
+                input_items.append({"role": "user", "content": str(msg.get("content"))})
+        return input_items
+
+    def _build_tools(self, request: ModelRequest) -> list[dict[str, Any]] | None:
+        if not request.tools:
+            return None
+        tools: list[dict[str, Any]] = []
+        for t in request.tools:  # type: ignore[reportUnknownVariableType]
+            # t is {"type":"function","function":{...}} from tool_schema
+            func = t.get("function", t) if isinstance(t, dict) else t  # type: ignore[reportUnknownMemberType]
+            if isinstance(func, dict):
+                tools.append(
+                    {
+                        "type": "function",
+                        "name": func.get("name"),  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
+                        "description": func.get("description", ""),  # type: ignore[reportUnknownMemberType,reportUnknownVariableType,reportUnknownArgumentType]
+                        "parameters": func.get(  # type: ignore[reportUnknownMemberType,reportUnknownVariableType,reportUnknownArgumentType]
+                            "parameters", {"type": "object", "properties": {}}
+                        ),
+                    }
+                )
+            else:
+                tools.append(
+                    {
+                        "type": "function",
+                        "name": getattr(func, "name", ""),  # type: ignore[reportUnknownMemberType,reportUnknownVariableType,reportUnknownArgumentType]
+                        "description": getattr(func, "description", ""),  # type: ignore[reportUnknownMemberType,reportUnknownVariableType,reportUnknownArgumentType]
+                        "parameters": getattr(
+                            func, "parameters", {"type": "object", "properties": {}}
+                        ),  # type: ignore[reportUnknownMemberType,reportUnknownVariableType,reportUnknownArgumentType]
+                    }
+                )
+        return tools
+
+    def _build_kwargs(self, request: ModelRequest) -> dict[str, Any]:
+        input_items = self._build_input(request)
+        tools = self._build_tools(request)
+        # Text format for structured output (only when no tools to avoid breaking tool calling)
+        text_format: dict[str, Any] | None = None
+        if not request.tools and request.output_schema:
+            # Allow explicit text format override via extra["text"] or extra["text_format"]
+            if "text" in self.extra and isinstance(self.extra["text"], dict):  # type: ignore[reportUnknownMemberType]
+                txt = self.extra["text"]  # type: ignore[reportUnknownMemberType]
+                text_format = (  # type: ignore[reportUnknownVariableType]
+                    txt["format"]  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
+                    if isinstance(txt, dict) and "format" in txt  # type: ignore[reportUnknownMemberType]
+                    else txt  # type: ignore[reportUnknownVariableType]
+                )
+            elif "text_format" in self.extra:
+                text_format = self.extra["text_format"]  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
+            elif self.structured_outputs:
+                text_format = _responses_json_schema_format(request.stage_id, request.output_schema)
+            else:
+                text_format = {"type": "json_object"}
+        # Strip provider prefix for Responses wire (e.g. "openai/muse-spark" -> "muse-spark")
+        wire_name = self.name.split("/", 1)[-1] if "/" in self.name else self.name
+        kwargs: dict[str, Any] = {
+            "model": wire_name,
+            "input": input_items,
+        }
+        if self.temperature is not None:
+            kwargs["temperature"] = self.temperature
+        if self.max_tokens is not None:
+            kwargs["max_output_tokens"] = self.max_tokens
+        # Reasoning effort (Responses-specific, distinct from reasoning channel)
+        if self.reasoning_effort != "none":
+            kwargs["reasoning"] = {"effort": self.reasoning_effort}
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+        if text_format is not None:
+            kwargs["text"] = {"format": text_format}
+        # Merge remaining extra that looks like Responses request options
+        # (e.g. top_p, truncation, store, parallel_tool_calls, etc.),
+        # excluding client-only and chat-only keys.
+        exclude = {
+            "api_key",
+            "apiKey",
+            "api_base",
+            "base_url",
+            "baseUrl",
+            "timeout",
+            "request_timeout",
+            "model_timeout_seconds",
+            "max_retries",
+            "response_format",
+            "text_format",
+            "text",
+        }
+        for k, v in self.extra.items():  # type: ignore[reportUnknownVariableType]
+            if k not in exclude and k not in kwargs:
+                kwargs[k] = v  # type: ignore[reportUnknownVariableType]
+        # Ensure we don't store conversation state server-side by default
+        if "store" not in kwargs:
+            kwargs["store"] = False
+        return kwargs
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        kwargs = self._build_kwargs(request)
+
+        async def _do_create(kw: dict[str, Any]) -> Any:
+            client = self._get_client()
+            return await client.responses.create(**kw)  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
+
+        try:
+            try:
+                resp = await _do_create(kwargs)
+            except Exception as e:
+                msg = str(e)
+                is_400 = (
+                    "400" in msg or "invalid_request_error" in msg or "invalid parameters" in msg
+                )
+                if is_400 and "reasoning" in kwargs:
+                    kw2 = dict(kwargs)
+                    kw2.pop("reasoning", None)
+                    resp = await _do_create(kw2)
+                else:
+                    raise
+        except Exception as e:
+            msg = f"OpenAI Responses provider error for model '{self.name}': {e}"
+            raise ModelProviderError(msg) from e
+        try:
+            return _normalize_responses_response(resp, request.stage_id)
+        except ModelOutputValidationError:
+            raise
+        except Exception as e:
+            msg = f"Failed to parse Responses output for '{self.name}': {e}"
+            raise ModelProviderError(msg) from e
+
+
+def _responses_json_schema_format(stage_id: str, schema: Mapping[str, Any]) -> dict[str, Any]:
+    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in stage_id) or "stage"
+    return {
+        "type": "json_schema",
+        "name": safe_name[:64],
+        "schema": dict(schema),
+        "strict": False,
+    }
+
+
+def _normalize_responses_response(response: Any, stage_id: str) -> ModelResponse:
+    content: str | None = None
+    tool_calls: list[ModelToolCall] = []
+    # SDK convenience field; used as fallback when message parts are missing.
+    output_text = getattr(response, "output_text", None)  # type: ignore[reportUnknownMemberType,reportUnknownVariableType,reportUnknownArgumentType]
+    output_items = (  # type: ignore[reportUnknownVariableType]
+        response.get("output", []) or []  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
+        if isinstance(response, dict)
+        else getattr(response, "output", []) or []  # type: ignore[reportUnknownVariableType]
+    )
+    for item in output_items:  # type: ignore[reportUnknownVariableType]
+        item_type = (  # type: ignore[reportUnknownVariableType]
+            item.get("type")  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
+            if isinstance(item, dict)  # type: ignore[reportUnknownVariableType]
+            else getattr(item, "type", None)  # type: ignore[reportUnknownMemberType,reportUnknownVariableType,reportUnknownArgumentType]
+        )
+        if item_type == "function_call":
+            if isinstance(item, dict):  # type: ignore[reportUnknownVariableType]
+                name = item.get("name", "")  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
+                args_str = item.get("arguments", "{}")  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
+                call_id = item.get("call_id", item.get("id", ""))  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
+            else:
+                name = getattr(item, "name", "")  # type: ignore[reportUnknownMemberType,reportUnknownVariableType,reportUnknownArgumentType]
+                args_str = getattr(item, "arguments", "{}")  # type: ignore[reportUnknownMemberType,reportUnknownVariableType,reportUnknownArgumentType]
+                call_id = getattr(item, "call_id", getattr(item, "id", ""))  # type: ignore[reportUnknownMemberType,reportUnknownVariableType,reportUnknownArgumentType]
+            try:
+                args = json.loads(args_str) if isinstance(args_str, str) and args_str else {}  # type: ignore[reportUnknownVariableType]
+            except json.JSONDecodeError as e:
+                msg = f"model returned malformed tool-call arguments in stage '{stage_id}': {e}"
+                raise ModelOutputValidationError(msg) from e
+            if not isinstance(args, dict):
+                msg = f"tool-call arguments must be an object, got {type(args).__name__}"
+                raise ModelOutputValidationError(msg)
+            tool_calls.append(ModelToolCall(id=str(call_id), name=str(name), arguments=args))  # type: ignore[reportUnknownArgumentType]
+        elif item_type == "message":
+            cont = item.get("content") if isinstance(item, dict) else getattr(item, "content", None)  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
+            if cont:
+                for part in cont:  # type: ignore[reportUnknownVariableType]
+                    if isinstance(part, dict):  # type: ignore[reportUnknownVariableType]
+                        t = part.get("text")  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
+                    else:
+                        t = getattr(part, "text", None)  # type: ignore[reportUnknownMemberType,reportUnknownVariableType,reportUnknownArgumentType]
+                        if t is None and isinstance(part, dict):  # type: ignore[reportUnknownVariableType]
+                            t = part.get("text")  # type: ignore[reportUnknownMemberType]
+                    if t:
+                        content = (content or "") + str(t)  # type: ignore[reportUnknownArgumentType,reportUnknownVariableType]
+        elif item_type == "reasoning":
+            # Responses reasoning items are not forwarded by default; they are
+            # distinct from the chat reasoning_content channel.  Intentionally
+            # ignored here to preserve privacy posture.  Future streaming
+            # support could surface them when reasoning="raw".
+            continue
+    if not content and output_text and not tool_calls:
+        content = str(output_text)  # type: ignore[reportUnknownArgumentType,reportUnknownVariableType]
+    if not content and output_text is None:
+        for item in output_items:  # type: ignore[reportUnknownVariableType]
+            if isinstance(item, dict):  # type: ignore[reportUnknownVariableType]
+                if item.get("type") == "message" and isinstance(item.get("content"), str):  # type: ignore[reportUnknownMemberType]
+                    content = str(item.get("content"))  # type: ignore[reportUnknownMemberType]
+                    break
+            elif getattr(item, "type", None) == "message":  # type: ignore[reportUnknownMemberType,reportUnknownVariableType,reportUnknownArgumentType]
+                c = getattr(item, "content", None)  # type: ignore[reportUnknownMemberType,reportUnknownVariableType,reportUnknownArgumentType]
+                if isinstance(c, str) and c:
+                    content = c
+                    break
+    return ModelResponse(content=content, tool_calls=tuple(tool_calls))
+
+
 def _resolve_reasoning_mode(
     adapter_reasoning: str,
     override: str,
@@ -320,17 +666,94 @@ def _resolve_reasoning_mode(
     return adapter_reasoning
 
 
+def _normalize_api_value(raw: Any) -> Literal["chat_completions", "responses"]:
+    if isinstance(raw, str):
+        v = raw.strip().lower().replace("-", "_").replace(".", "_")
+        if v in (
+            "responses",
+            "response",
+            "response_api",
+            "responses_api",
+            "openai_responses",
+            "openai_responses_api",
+        ):
+            return "responses"
+        if v in (
+            "chat_completions",
+            "chat_completions_api",
+            "completions",
+            "chat",
+            "openai_completions",
+            "openai_chat_completions",
+            "openai_chat_completions_api",
+        ):
+            return "chat_completions"
+        if "response" in v:
+            return "responses"
+        if "chat" in v or "completion" in v:
+            return "chat_completions"
+    msg = f"unsupported api value '{raw}'; expected 'chat_completions' or 'responses'"
+    raise ValueError(msg)
+
+
+def _normalize_reasoning_effort_value(raw: Any) -> Literal["none", "low", "medium", "high"]:
+    if raw is None:
+        return "none"
+    if isinstance(raw, bool):
+        return "high" if raw else "none"
+    if isinstance(raw, str):
+        v = raw.strip().lower()
+        if v in ("none", "", "off", "false", "null"):
+            return "none"
+        if v == "low":
+            return "low"
+        if v in ("medium", "med"):
+            return "medium"
+        if v in ("high", "raw", "high_effort", "high effort"):
+            return "high"
+    msg = f"unsupported reasoning_effort value '{raw}'; expected 'none', 'low', 'medium', or 'high'"
+    raise ValueError(msg)
+
+
+def _env_api_default() -> Literal["chat_completions", "responses"] | None:
+    for key in ("NEMOIR_MODEL_API", "NEMOIR_API_TYPE", "NEMOIR_MODEL_API_TYPE"):
+        val = os.environ.get(key)
+        if val:
+            return _normalize_api_value(val)
+    return None
+
+
+def _env_reasoning_effort_default() -> Literal["none", "low", "medium", "high"] | None:
+    for key in ("NEMOIR_REASONING_EFFORT", "NEMOIR_REASONING"):
+        val = os.environ.get(key)
+        if val is not None and val != "":
+            return _normalize_reasoning_effort_value(val)
+    return None
+
+
 def _resolve_spec(config: str | Mapping[str, Any] | ModelSpec) -> ModelSpec:
     if isinstance(config, ModelSpec):
         return config
     if isinstance(config, str):
-        return ModelSpec(name=config)
+        api = _env_api_default() or "chat_completions"
+        effort = _env_reasoning_effort_default() or "none"
+        return ModelSpec(name=config, api=api, reasoning_effort=effort)  # type: ignore[arg-type]
     if isinstance(config, dict):
         name = config.get("name")
         if not name or not isinstance(name, str):
             msg = "model config mapping must have a string 'name' key"
             raise TypeError(msg)
-        reserved = {"name", "temperature", "max_tokens", "structured_outputs", "reasoning"}
+        reserved = {
+            "name",
+            "temperature",
+            "max_tokens",
+            "structured_outputs",
+            "reasoning",
+            "api",
+            "api_type",
+            "reasoning_effort",
+            "reasoningEffort",
+        }
         extra = {k: v for k, v in config.items() if k not in reserved}
 
         reasoning_raw = config.get("reasoning", "none")
@@ -343,12 +766,27 @@ def _resolve_spec(config: str | Mapping[str, Any] | ModelSpec) -> ModelSpec:
         else:
             reasoning = "none"
 
+        raw_api = config.get("api", config.get("api_type"))
+        if raw_api is None:
+            api = _env_api_default() or "chat_completions"
+        else:
+            api = _normalize_api_value(raw_api)
+
+        raw_effort = config.get("reasoning_effort", config.get("reasoningEffort"))
+        if raw_effort is None:
+            env_effort = _env_reasoning_effort_default()
+            reasoning_effort: Literal["none", "low", "medium", "high"] = env_effort or "none"  # type: ignore[assignment]
+        else:
+            reasoning_effort = _normalize_reasoning_effort_value(raw_effort)
+
         return ModelSpec(
             name=name,
             temperature=config.get("temperature"),
             max_tokens=config.get("max_tokens"),
             structured_outputs=config.get("structured_outputs", False),
             reasoning=reasoning,
+            api=api,  # type: ignore[arg-type]
+            reasoning_effort=reasoning_effort,  # type: ignore[arg-type]
             extra=extra,
         )
     msg = f"unsupported model spec type: {type(config).__name__}"
@@ -365,7 +803,10 @@ def normalize_model(model: object) -> ModelAdapter | ModelRouter:
     if _is_adapter(model):
         return model  # type: ignore[return-value]
     if isinstance(model, (str, dict, ModelSpec)):
-        return LiteLLMModelAdapter(model)  # type: ignore[reportUnknownArgumentType]
+        spec = _resolve_spec(model)  # type: ignore[arg-type]
+        if spec.api == "responses":  # type: ignore[attr-defined]
+            return OpenAIResponsesModelAdapter(spec)  # type: ignore[reportUnknownArgumentType]
+        return LiteLLMModelAdapter(spec)  # type: ignore[reportUnknownArgumentType]
     msg = (
         "Invalid model config: expected str, mapping, ModelSpec, "
         f"ModelRouter, or ModelAdapter, got {type(model).__name__}"

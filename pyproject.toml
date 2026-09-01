@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nemoir-runtime"
-version = "0.9.4"
+version = "0.10.0"
 description = "Python runtime core for NemoIR — execute compiled agent workflows as structured state machines with tool orchestration, policy enforcement, model-backed stage execution, and live event streaming."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -28,6 +28,7 @@ urls = { Repository = "https://github.com/hkalexling/nemoir-python-runtime" }
 requires-python = ">=3.11"
 dependencies = [
     "litellm>=1.0.0",
+    "openai>=1.40.0",
 ]
 
 [project.optional-dependencies]
