@@ -388,6 +388,22 @@ class OpenAIResponsesModelAdapter:
         if "timeout" not in kwargs:
             kwargs["timeout"] = 600.0
             kwargs["max_retries"] = kwargs.get("max_retries", 2)
+        # Generic extra headers forwarding (provider-agnostic).
+        # Users can pass e.g. {"extra_headers": {"x-opencode-session": "..."}}
+        # via model extra. Normalize aliases to AsyncOpenAI's `default_headers`.
+        try:
+            _headers: dict[str, str] = {}
+            for _k in ("extra_headers", "default_headers", "headers"):
+                _v = self.extra.get(_k)  # type: ignore[reportUnknownMemberType]
+                if isinstance(_v, dict):
+                    _headers.update({str(k): str(v) for k, v in _v.items()})  # type: ignore[reportUnknownVariableType]
+            if _headers:
+                _existing = kwargs.get("default_headers")
+                if isinstance(_existing, dict):
+                    _headers = {**_existing, **_headers}
+                kwargs["default_headers"] = _headers
+        except Exception:  # noqa: S110
+            pass
         return AsyncOpenAI(**kwargs)  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
 
     def _build_input(self, request: ModelRequest) -> list[dict[str, Any]]:

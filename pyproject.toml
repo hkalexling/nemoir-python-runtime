@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nemoir-runtime"
-version = "0.10.0"
+version = "0.10.1"
 description = "Python runtime core for NemoIR — execute compiled agent workflows as structured state machines with tool orchestration, policy enforcement, model-backed stage execution, and live event streaming."
 readme = "README.md"
 license = { file = "LICENSE" }
