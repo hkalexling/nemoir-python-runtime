@@ -25,6 +25,11 @@ from nemoir_runtime.errors import (
 )
 from nemoir_runtime.events import WorkflowEvent, WorkflowEventEmitter, WorkflowEventSink
 from nemoir_runtime.tools import Tool, ToolContext, ToolRegistry
+from nemoir_runtime.trace import (
+    NoOpTraceRecorder,
+    TraceRecorder,
+    resolve_recorder,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -188,6 +193,9 @@ class StageContext:
     options: RunOptions
     call_tool: Callable[..., Awaitable[Any]]
     event_emitter: WorkflowEventEmitter | None = None
+    # NemoTrace audit recorder (Phase 1). ``None`` disables tracing; the
+    # runtime substitutes a no-op so execution paths stay identical.
+    trace_recorder: Any = None
 
 
 class StageExecutor(Protocol):
@@ -440,6 +448,7 @@ class WorkflowRuntime:
         *,
         options: RunOptions | None = None,
         event_sink: WorkflowEventSink | None = None,
+        trace_recorder: TraceRecorder | NoOpTraceRecorder | None = None,
     ) -> WorkflowResult:
         opts = options if options is not None else RunOptions()
         inputs = self._coerce_path_inputs(dict(inputs))
@@ -447,12 +456,25 @@ class WorkflowRuntime:
         current_id = self._manifest.entry_stage_id
         steps = 0
         run_id = uuid.uuid4().hex
-        emitter = WorkflowEventEmitter(run_id=run_id, sink=event_sink)
+        rec = resolve_recorder(trace_recorder)
+        rec.begin_run(self._manifest)
+        # Trace observer does not count as a live sink, so provider
+        # streaming stays gated on a real caller consumer. The observer
+        # is invoked inside ``WorkflowEventEmitter.emit`` before the sink.
+        if isinstance(rec, TraceRecorder):
+            emitter = WorkflowEventEmitter(
+                run_id=run_id, sink=event_sink, observer=rec.observe_workflow_event
+            )
+        else:
+            emitter = WorkflowEventEmitter(run_id=run_id, sink=event_sink)
 
         await emitter.emit(
             "run_started",
             metadata={"workflow_id": self._manifest.workflow_id, "entry": current_id},
         )
+        # Set once the success path finalizes, so a finalization failure
+        # itself never triggers a second terminal event/finalization below.
+        finalized = False
 
         try:
             while True:
@@ -465,7 +487,8 @@ class WorkflowRuntime:
 
                 stage = self._require_stage(current_id)
                 readable = self._resolve_reads(stage, inputs, stage_outputs)
-                ctx = self._make_stage_context(stage, inputs, readable, opts, emitter)
+                ctx = self._make_stage_context(stage, inputs, readable, opts, emitter, rec)
+                visit_id = rec.begin_stage_visit(stage.id)
                 await emitter.emit("stage_started", stage_id=stage.id)
                 if stage.execution.kind == "tool":
                     raw_output = await self._deterministic_executor.execute(ctx)
@@ -491,9 +514,11 @@ class WorkflowRuntime:
                         ),
                     )
                     await emitter.emit("run_completed", result=result)
+                    finalized = True
+                    rec.finish_run("complete")
                     return result
 
-                selected = self._select_transition(stage, inputs, stage_outputs)
+                selected = self._select_transition(stage, inputs, stage_outputs, rec, visit_id)
                 await emitter.emit(
                     "transition_selected",
                     stage_id=stage.id,
@@ -502,11 +527,24 @@ class WorkflowRuntime:
                 )
                 current_id = selected.to
         except Exception as exc:
+            if finalized:
+                raise
+            rec.record_run_error(exc)
             await emitter.emit(
                 "run_failed",
                 error=str(exc),
                 metadata={"reason": type(exc).__name__},
             )
+            # A blocked finalization is loud: it chains onto the original error.
+            rec.finish_run("failed")
+            raise
+        except BaseException:
+            if finalized:
+                raise
+            # Cancellation (or interpreter shutdown): finalize as interrupted
+            # without emitting a live event, and never mask the original.
+            with contextlib.suppress(Exception):
+                rec.finish_run("interrupted")
             raise
 
     # ------------------------------------------------------------------
@@ -587,10 +625,25 @@ class WorkflowRuntime:
         stage: StageSpec,
         inputs: Mapping[str, Any],
         stage_outputs: Mapping[str, Mapping[str, Any]],
+        recorder: TraceRecorder | NoOpTraceRecorder | None = None,
+        stage_visit_id: str | None = None,
     ) -> TransitionSpec:
+        rec = resolve_recorder(recorder)
+        candidates: list[dict[str, Any]] = []
         sorted_transitions = sorted(stage.transitions, key=lambda t: t.priority)
         for trans in sorted_transitions:
-            if WorkflowRuntime._evaluate_guard(trans.guard, inputs, stage_outputs):
+            matched = WorkflowRuntime._evaluate_guard(trans.guard, inputs, stage_outputs)
+            candidates.append(
+                {
+                    "to": trans.to,
+                    "priority": trans.priority,
+                    "reason": trans.reason,
+                    "matched": bool(matched),
+                }
+            )
+            if matched:
+                if stage_visit_id:
+                    rec.record_transition_evaluation(stage_visit_id, candidates)
                 return trans
         msg = f"Stage '{stage.id}': no transition matched"
         raise NoTransitionMatchedError(msg)
@@ -647,6 +700,7 @@ class WorkflowRuntime:
         readable: Mapping[str, Any],
         options: RunOptions,
         emitter: WorkflowEventEmitter,
+        recorder: TraceRecorder | NoOpTraceRecorder | None = None,
     ) -> StageContext:
         return StageContext(
             workflow_id=self._manifest.workflow_id,
@@ -655,8 +709,9 @@ class WorkflowRuntime:
             readable_context=readable,
             allowed_capabilities=stage.requires,
             options=options,
-            call_tool=self._make_tool_caller(stage, inputs, options, emitter),
+            call_tool=self._make_tool_caller(stage, inputs, options, emitter, recorder),
             event_emitter=emitter,
+            trace_recorder=recorder,
         )
 
     def _make_tool_caller(
@@ -665,6 +720,7 @@ class WorkflowRuntime:
         inputs: Mapping[str, Any],
         run_opts: RunOptions,
         emitter: WorkflowEventEmitter,
+        recorder: TraceRecorder | NoOpTraceRecorder | None = None,
     ) -> Callable[..., Awaitable[Any]]:
         async def call_tool(
             capability: str,
@@ -673,7 +729,7 @@ class WorkflowRuntime:
             tool_name: str | None = None,
         ) -> Any:
             return await self._enforce_and_call(
-                stage, capability, args, inputs, run_opts, emitter, tool_name=tool_name
+                stage, capability, args, inputs, run_opts, emitter, recorder, tool_name=tool_name
             )
 
         return call_tool
@@ -690,6 +746,7 @@ class WorkflowRuntime:
         inputs: Mapping[str, Any],
         run_opts: RunOptions,
         emitter: WorkflowEventEmitter,
+        recorder: TraceRecorder | NoOpTraceRecorder | None = None,
         *,
         tool_name: str | None = None,
     ) -> Any:
@@ -704,6 +761,7 @@ class WorkflowRuntime:
             allow_before=True,
             run_opts=run_opts,
             emitter=emitter,
+            recorder=recorder,
             tool_name=tool_name,
         )
 
@@ -715,6 +773,7 @@ class WorkflowRuntime:
         stage: StageSpec,
         run_opts: RunOptions,
         emitter: WorkflowEventEmitter,
+        recorder: TraceRecorder | NoOpTraceRecorder | None = None,
     ) -> Any:
         return await self._enforce_and_call_with_policies(
             capability,
@@ -724,6 +783,7 @@ class WorkflowRuntime:
             allow_before=False,
             run_opts=run_opts,
             emitter=emitter,
+            recorder=recorder,
         )
 
     async def _enforce_and_call_with_policies(
@@ -736,8 +796,10 @@ class WorkflowRuntime:
         allow_before: bool,
         run_opts: RunOptions,
         emitter: WorkflowEventEmitter,
+        recorder: TraceRecorder | NoOpTraceRecorder | None = None,
         tool_name: str | None = None,
     ) -> Any:
+        rec = resolve_recorder(recorder)
         policies = self._policies_by_trigger.get(capability, [])
 
         for policy in policies:
@@ -796,7 +858,7 @@ class WorkflowRuntime:
                 bound_args = self._bind_trigger_args(
                     policy.trigger, args, policy_id=policy.id, capability=capability
                 )
-                if emitter.has_sink:
+                if emitter.has_sink or emitter.has_observer:
                     required_caps = [req.capability for req in policy.requires]
                     await emitter.emit(
                         "policy_checked",
@@ -818,7 +880,7 @@ class WorkflowRuntime:
                         req.capability, req_args, policy_id=policy.id, capability=capability
                     )
                     result = await self._enforce_policy_call(
-                        req.capability, req_args, inputs, stage, run_opts, emitter
+                        req.capability, req_args, inputs, stage, run_opts, emitter, rec
                     )
                     if req.capability == "user.confirm" and result is False:
                         await emitter.emit(
@@ -842,6 +904,9 @@ class WorkflowRuntime:
         else:
             tool_obj = self._tools.get(capability)
             resolved_name = tool_obj.name if tool_obj else capability
+        # Assign the trace tool-call id before the live event so the
+        # recorder can attribute the observed event deterministically.
+        tool_call_id = rec.begin_tool_call(stage.id)
         await emitter.emit(
             "tool_call_started",
             stage_id=stage.id,
@@ -858,7 +923,8 @@ class WorkflowRuntime:
         )
         try:
             result = await self._tools.call(capability, args, ctx, tool_name=tool_name)
-        except Exception:
+        except Exception as exc:
+            rec.record_tool_error(tool_call_id, exc)
             await emitter.emit(
                 "tool_call_failed",
                 stage_id=stage.id,
@@ -867,6 +933,7 @@ class WorkflowRuntime:
                 error=str(_active_exception()),
             )
             raise
+        rec.record_tool_result(tool_call_id, result)
         await emitter.emit(
             "tool_call_completed",
             stage_id=stage.id,
@@ -954,6 +1021,7 @@ class WorkflowRuntime:
         inputs: Mapping[str, Any],
         *,
         options: RunOptions | None = None,
+        trace_recorder: TraceRecorder | NoOpTraceRecorder | None = None,
     ) -> AsyncIterator[WorkflowEvent]:
         queue: asyncio.Queue[WorkflowEvent | _RunDone] = asyncio.Queue()
 
@@ -962,7 +1030,9 @@ class WorkflowRuntime:
 
         async def run_task() -> None:
             try:
-                await self.run(inputs, options=options, event_sink=sink)
+                await self.run(
+                    inputs, options=options, event_sink=sink, trace_recorder=trace_recorder
+                )
             except BaseException as exc:
                 await queue.put(_RunDone(error=exc))
             else:
@@ -1144,12 +1214,23 @@ def _validate_json_safe(value: Any, field_name: str, stage_id: str) -> None:
         raise StageOutputValidationError(msg)
 
 
+def _check_string_utf8(value: str) -> bool:
+    """Return False if string contains lone surrogates (not valid UTF-8/I-JSON)."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _is_json_safe_value(value: Any) -> bool:
     """Recursively check that a value can round-trip through JSON."""
     if value is None:
         return True
-    if isinstance(value, (str, bool)):
+    if isinstance(value, bool):
         return True
+    if isinstance(value, str):
+        return _check_string_utf8(value)
     if isinstance(value, (int, float)):
         return not isinstance(value, bool) and math.isfinite(value)
     if isinstance(value, (list, tuple)):
@@ -1157,7 +1238,10 @@ def _is_json_safe_value(value: Any) -> bool:
         return all(_is_json_safe_value(item) for item in values)
     if isinstance(value, dict):
         mapping = cast("dict[object, object]", value)
-        return all(isinstance(k, str) and _is_json_safe_value(v) for k, v in mapping.items())
+        return all(
+            isinstance(k, str) and _check_string_utf8(k) and _is_json_safe_value(v)
+            for k, v in mapping.items()
+        )
     return False
 
 
@@ -1167,6 +1251,12 @@ def _validate_write_type(value: Any, write_type: str, field_name: str, stage_id:
             msg = (
                 f"Stage '{stage_id}' output field '{field_name}': expected str, "
                 f"got {type(value).__name__}"
+            )
+            raise StageOutputValidationError(msg)
+        if not _check_string_utf8(value):
+            msg = (
+                f"Stage '{stage_id}' output field '{field_name}': "
+                "string contains invalid Unicode (lone surrogate)"
             )
             raise StageOutputValidationError(msg)
     elif write_type == "bool":
@@ -1194,6 +1284,12 @@ def _validate_write_type(value: Any, write_type: str, field_name: str, stage_id:
             msg = (
                 f"Stage '{stage_id}' output field '{field_name}': expected list[str] "
                 f"but contains non-string elements"
+            )
+            raise StageOutputValidationError(msg)
+        if not all(_check_string_utf8(v) for v in value):  # type: ignore[reportUnknownVariableType]
+            msg = (
+                f"Stage '{stage_id}' output field '{field_name}': "
+                "string contains invalid Unicode (lone surrogate)"
             )
             raise StageOutputValidationError(msg)
     elif write_type == "number":

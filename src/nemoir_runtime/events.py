@@ -7,6 +7,7 @@ run-level outcomes as an observable async stream.
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -58,6 +59,7 @@ class WorkflowEvent:
 
 
 WorkflowEventSink = Callable[[WorkflowEvent], Awaitable[None]]
+WorkflowEventObserver = Callable[[WorkflowEvent], Any]
 
 
 class WorkflowEventEmitter:
@@ -67,9 +69,16 @@ class WorkflowEventEmitter:
     constructs and returns the event (for tests), but no I/O happens.
     """
 
-    def __init__(self, *, run_id: str, sink: WorkflowEventSink | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        sink: WorkflowEventSink | None = None,
+        observer: WorkflowEventObserver | None = None,
+    ) -> None:
         self._run_id = run_id
         self._sink = sink
+        self._observer = observer
         self._seq = 0
 
     @property
@@ -89,6 +98,20 @@ class WorkflowEventEmitter:
         """
         return self._sink is not None
 
+    @property
+    def has_live_sink(self) -> bool:
+        """Alias for :attr:`has_sink` that makes the trace observer explicit.
+
+        The internal trace observer never counts as a live consumer, so
+        streaming stays gated on a real caller sink even when a
+        :class:`TraceRecorder` is attached.
+        """
+        return self._sink is not None
+
+    @property
+    def has_observer(self) -> bool:
+        return self._observer is not None
+
     async def emit(
         self,
         kind: WorkflowEventKind,
@@ -102,6 +125,17 @@ class WorkflowEventEmitter:
             timestamp=datetime.now(tz=UTC),
             **kwargs,
         )
+        if self._observer is not None:
+            try:
+                result = self._observer(event)
+                if inspect.isawaitable(result):
+                    await result
+            except BaseException:  # noqa: S110
+                # Observer failures must not change workflow outcome or
+                # prevent the live sink from receiving the event. The
+                # recorder will surface capture degradation via final_scan
+                # or a dedicated warning; workflow control flow continues.
+                pass
         if self._sink is not None:
             await self._sink(event)
         return event

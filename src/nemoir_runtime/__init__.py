@@ -1,3 +1,15 @@
+from nemoir_runtime.canonical import (
+    parse_json_strict as parse_json_strict,
+)
+from nemoir_runtime.canonical import (
+    sha256_tag as sha256_tag,
+)
+from nemoir_runtime.canonical import (
+    to_canonical_bytes as to_canonical_bytes,
+)
+from nemoir_runtime.canonical import (
+    to_canonical_str as to_canonical_str,
+)
 from nemoir_runtime.capabilities import (
     CAPABILITY_CATALOG,
     CapabilityParam,
@@ -71,6 +83,22 @@ from nemoir_runtime.tools import (
     ToolRegistry,
     tool,
 )
+from nemoir_runtime.trace import (
+    HostProvenance,
+    ModelDescriptor,
+    NoOpTraceRecorder,
+    TraceConfig,
+    TraceError,
+    TraceRecorder,
+    TraceValue,
+    VerificationReport,
+    load_generated_provenance,
+    read_archive_entries,
+    resolve_recorder,
+    resolve_trace_recorder,
+    safe_model_descriptor,
+    verify_archive,
+)
 
 __all__ = [
     "CAPABILITY_CATALOG",
@@ -81,11 +109,13 @@ __all__ = [
     "DeterministicStageExecutor",
     "ExprSpec",
     "GuardSpec",
+    "HostProvenance",
     "InputSpec",
     "LiteLLMModelAdapter",
     "MaxStepsExceededError",
     "MissingCapabilityError",
     "ModelAdapter",
+    "ModelDescriptor",
     "ModelOutputValidationError",
     "ModelProviderError",
     "ModelRequest",
@@ -97,6 +127,7 @@ __all__ = [
     "ModelStreamingAdapter",
     "ModelToolCall",
     "NemoIRRuntimeError",
+    "NoOpTraceRecorder",
     "NoTransitionMatchedError",
     "OpenAIResponsesModelAdapter",
     "PolicyDeniedError",
@@ -116,8 +147,13 @@ __all__ = [
     "ToolInvocationError",
     "ToolRegistry",
     "ToolValidationError",
+    "TraceConfig",
+    "TraceError",
+    "TraceRecorder",
+    "TraceValue",
     "TransitionSpec",
     "TriggerSpec",
+    "VerificationReport",
     "WorkflowManifest",
     "WorkflowResult",
     "WorkflowRuntime",
@@ -126,9 +162,19 @@ __all__ = [
     "WorkflowValidationError",
     "WriteSpec",
     "get_capability",
+    "load_generated_provenance",
+    "parse_json_strict",
+    "read_archive_entries",
     "required_param_names",
+    "resolve_recorder",
+    "resolve_trace_recorder",
+    "safe_model_descriptor",
+    "sha256_tag",
     "supports_streaming",
+    "to_canonical_bytes",
+    "to_canonical_str",
     "tool",
+    "verify_archive",
 ]
 
 # Extended with Phase 5 event primitives (re-exported for convenience).

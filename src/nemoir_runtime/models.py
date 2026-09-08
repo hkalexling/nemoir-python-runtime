@@ -79,6 +79,28 @@ def supports_streaming(adapter: object) -> bool:
     return callable(getattr(adapter, "stream", None))  # type: ignore[arg-type]
 
 
+def _response_bytes(response: ModelResponse) -> int:
+    """Safe byte count for a model response (content + tool-call args).
+
+    Provider reasoning is excluded: reasoning markers omit length by policy.
+    Used only for the public ``response_bytes`` metric; text never retained.
+
+    Tool-call argument bytes use RFC 8785 canonical bytes (compact, UTF-8,
+    UTF-16 key order) to match the web ``responseBytes`` which uses
+    ``canonicalStringify``. This guarantees cross-language parity for
+    ``response_bytes`` (e.g. ``{"label":"é"}`` is 20 bytes, not 27).
+    """
+    from nemoir_runtime.canonical import to_canonical_bytes  # noqa: PLC0415
+
+    total = len((response.content or "").encode("utf-8"))
+    for tool_call in response.tool_calls:
+        try:
+            total += len(to_canonical_bytes(tool_call.arguments or {}))
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
 @dataclass(frozen=True)
 class ModelSpec:
     name: str
@@ -950,12 +972,22 @@ def _normalize_write_value(write: Any, val: Any, stage_id: str) -> Any:
     raise ModelOutputValidationError(msg)
 
 
+def _check_str_utf8(s: str) -> bool:
+    try:
+        s.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _is_model_json_safe(value: Any) -> bool:
     """Recursively check that a value can round-trip through JSON."""
     if value is None:
         return True
-    if isinstance(value, (str, bool)):
+    if isinstance(value, bool):
         return True
+    if isinstance(value, str):
+        return _check_str_utf8(value)
     if isinstance(value, (int, float)):
         return not isinstance(value, bool) and math.isfinite(value)
     if isinstance(value, (list, tuple)):
@@ -963,7 +995,10 @@ def _is_model_json_safe(value: Any) -> bool:
         return all(_is_model_json_safe(item) for item in values)
     if isinstance(value, dict):
         mapping = cast("dict[object, object]", value)
-        return all(isinstance(k, str) and _is_model_json_safe(v) for k, v in mapping.items())
+        return all(
+            isinstance(k, str) and _check_str_utf8(k) and _is_model_json_safe(v)
+            for k, v in mapping.items()
+        )
     return False
 
 
@@ -1300,7 +1335,16 @@ class ModelStageExecutor:
         messages: list[dict[str, Any]] = self._build_initial_messages(ctx, output_schema)
 
         emitter = ctx.event_emitter
-        use_streaming = emitter is not None and emitter.has_sink and supports_streaming(adapter)
+        use_streaming = (
+            emitter is not None
+            and getattr(emitter, "has_live_sink", emitter.has_sink)
+            and supports_streaming(adapter)
+        )
+        # NemoTrace: capture final-response evidence regardless of live
+        # streaming. The recorder stores counts/bytes only, never text.
+        from nemoir_runtime.trace import resolve_recorder  # noqa: PLC0415
+
+        rec = resolve_recorder(getattr(ctx, "trace_recorder", None))
 
         tool_rounds = 0
         while True:
@@ -1314,11 +1358,20 @@ class ModelStageExecutor:
 
             # Acquire model response; catch provider-level parse errors
             # (e.g. malformed streamed tool-call JSON) so they are retryable.
+            # Each attempt gets its own trace model-call id.
+            model_call_id = rec.begin_model_call(ctx.stage.id)
             try:
                 if use_streaming:
-                    response = await self._stream_adapter_response(adapter, request, ctx, emitter)
+                    response = await self._stream_adapter_response(
+                        adapter, request, ctx, emitter, rec, model_call_id
+                    )
                 else:
                     response = await adapter.complete(request)
+                    rec.record_model_response(
+                        model_call_id,
+                        response_bytes=_response_bytes(response),
+                        tool_call_count=len(response.tool_calls),
+                    )
                     if emitter is not None:
                         await emitter.emit(
                             "model_completed",
@@ -1458,6 +1511,8 @@ class ModelStageExecutor:
         request: ModelRequest,
         ctx: StageContext,
         emitter: Any,
+        recorder: Any = None,
+        model_call_id: str = "",
     ) -> ModelResponse:
         """Consume a streaming adapter and emit workflow events for deltas."""
         final_response: ModelResponse | None = None
@@ -1470,7 +1525,14 @@ class ModelStageExecutor:
                     text=chunk.text,
                 )
             elif chunk.kind == "completed":
-                final_response = chunk.response
+                completed: ModelResponse = chunk.response
+                final_response = completed
+                if recorder is not None and model_call_id:
+                    recorder.record_model_response(
+                        model_call_id,
+                        response_bytes=_response_bytes(completed),
+                        tool_call_count=len(completed.tool_calls),
+                    )
                 await emitter.emit(
                     "model_completed",
                     stage_id=ctx.stage.id,

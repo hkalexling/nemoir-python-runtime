@@ -12,6 +12,7 @@ This proves the generated ``_manifest.py`` is consumable by Phase 2's
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 import subprocess
 import sys
@@ -230,7 +231,9 @@ def test_generated_package_run_with_fake_adapter_succeeds(tmp_path: Path) -> Non
         async def complete(self, request: Any) -> ModelResponse:
             self.calls.append(request)
             stage_id = request.stage_id
-            return self._responses.get(stage_id, ModelResponse(content='{"summary": "unknown"}'))
+            return self._responses.get(
+                stage_id, ModelResponse(content='{"summary": "unknown"}')
+            )
 
     fake = StageAwareAdapter()
     agent = coding_agent.Agent(model=fake, tools=_make_tools())
@@ -1498,3 +1501,81 @@ def test_judge_candidate_numeric_transitions(
 
     # A run_completed event must also fire.
     assert any(e.kind == "run_completed" for e in events), "expected run_completed event"
+
+
+def test_generated_package_run_produces_audit_trace(tmp_path: Path) -> None:
+    """Generated Agent.run() with trace= writes one bound audit archive.
+
+    The archive's IR fingerprint must match the emitted workflow.json
+    resource, and a second run with the same config must also finalize
+    (fresh recorder per invocation, never a shared instance).
+    """
+    from nemoir_runtime.trace import (  # noqa: PLC0415
+        TraceConfig,
+        read_archive_entries,
+        verify_archive,
+    )
+
+    out_dir = tmp_path / "gen"
+    out_dir.mkdir()
+    _generate_package(out_dir)
+
+    coding_agent = _import_generated_package(out_dir)
+
+    from nemoir_runtime.models import ModelResponse  # noqa: PLC0415
+
+    # Scripted content-only responses for every model stage.
+    async def scripted_complete(request: Any) -> ModelResponse:
+        bodies = {
+            "Triage": '{"summary": "triage-done"}',
+            "Plan": '{"plan": "the plan"}',
+            "Propose": '{"ok": true}',
+            "Apply": '{"summary": "apply-done"}',
+            "Fin": '{"summary": "fin-done"}',
+        }
+        return ModelResponse(content=bodies.get(request.stage_id, '{"summary": "x"}'))
+
+    class FakeAdapter:
+        def __init__(self) -> None:
+            self.calls: list[Any] = []
+
+        async def complete(self, request: Any) -> ModelResponse:
+            self.calls.append(request)
+            return await scripted_complete(request)
+
+    trace_path = tmp_path / "run.nemotrace"
+    agent = coding_agent.Agent(
+        model=FakeAdapter(),
+        tools=_make_tools(),
+        trace=TraceConfig(path=trace_path, path_aliases={"$workspace": tmp_path}),
+    )
+    first = asyncio.run(agent.run(coding_agent.AgentInput(task="t", cwd=tmp_path)))
+    assert first.output.summary == "fin-done"
+    assert trace_path.exists()
+
+    report = verify_archive(trace_path)
+    assert report.ok, report.errors
+    entries = read_archive_entries(trace_path)
+    manifest = json.loads(entries["manifest.json"])
+    assert manifest["status"] == "complete"
+    assert manifest["capture"]["profile"] == "audit"
+    assert manifest["provenance"]["complete"] is True
+
+    # Fingerprint binds the exact emitted resource, not pretty bytes.
+    from nemoir_runtime.canonical import (  # noqa: PLC0415
+        sha256_tag,
+        to_canonical_bytes,
+    )
+
+    workflow_value = json.loads((out_dir / "coding_agent" / "workflow.json").read_text())
+    assert manifest["workflow"]["ir_sha256"] == sha256_tag(to_canonical_bytes(workflow_value))
+
+    # A second run with the same constructor config finalizes again.
+    second_path = tmp_path / "run2.nemotrace"
+    agent2 = coding_agent.Agent(
+        model=FakeAdapter(),
+        tools=_make_tools(),
+        trace=TraceConfig(path=second_path, path_aliases={"$workspace": tmp_path}),
+    )
+    asyncio.run(agent2.run(coding_agent.AgentInput(task="t", cwd=tmp_path)))
+    assert verify_archive(second_path).ok
