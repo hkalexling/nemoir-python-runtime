@@ -157,6 +157,13 @@ class TraceConfig:
     # Test hooks: fixed trace id and clock for byte-identical fixtures.
     trace_id: str | None = None
     clock: Callable[[], datetime] | None = None
+    # Narrow synchronous host hook invoked immediately after a
+    # successfully observed ``stage_completed`` (Phase 3). The hook receives
+    # only ``{"stage_id", "stage_visit_id", "sequence"}`` and may return
+    # ``{"namespace", "kind", "payload", "anchor_sequence"?}`` or None.
+    # It must never alter workflow control flow; hook failures never break
+    # the run. Trace storage/configuration stays here, never in RunOptions.
+    on_stage_completed: Callable[[Mapping[str, Any]], Mapping[str, Any] | None] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +429,227 @@ def _is_maskable(pointer: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Trusted autoresearch annotation validation (Phase 3)
+# ---------------------------------------------------------------------------
+
+_ANNOTATION_NAMESPACE = "nemoir.autoresearch/v1"
+_ANNOTATION_KIND = "trial_finished"
+
+_ANNOTATION_VERDICTS = frozenset({"accepted", "rejected", "inconclusive"})
+
+_ANNOTATION_REASONS = frozenset(
+    {
+        "accepted",
+        "no_change",
+        "duplicate",
+        "preflight_integrity",
+        "preflight_scope",
+        "preflight_static_scan",
+        "preflight_build",
+        "preflight_smoke",
+        "preflight_sanitizer",
+        "selection_correctness",
+        "selection_noise",
+        "selection_tail_regression",
+        "confirmation_correctness",
+        "confirmation_noise",
+        "confirmation_tail_regression",
+        "no_improvement",
+        "full_sanitizer",
+        "no_evaluation",
+        "policy_denied",
+        "tool_failed",
+        "budget_exhausted",
+        "other",
+    }
+)
+
+_ANNOTATION_METRIC_NUMBERS = frozenset(
+    {
+        "candidate_median_ns",
+        "incumbent_median_ns",
+        "delta_ns",
+        "effect_ns",
+        "speedup_pct",
+        "candidate_spread_pct",
+        "p95_regression_pct",
+        "cold_regression_pct",
+    }
+)
+
+_ANNOTATION_METRIC_BOOLS = frozenset({"valid", "noise_ok", "regressions_ok"})
+
+_ANNOTATION_REQUIRED = frozenset(
+    {
+        "trial_id",
+        "candidate_ref",
+        "verdict",
+        "reason_code",
+        "selection_metrics",
+        "artifact_refs",
+    }
+)
+
+_ANNOTATION_ALLOWED = frozenset(
+    {
+        "trial_id",
+        "candidate_ref",
+        "parent_ref",
+        "candidate_digest",
+        "parent_digest",
+        "selection_metrics",
+        "confirmation_metrics",
+        "verdict",
+        "reason_code",
+        "source_reason_code",
+        "mechanism_ref",
+        "mechanism_id",
+        "artifact_refs",
+    }
+)
+
+
+def _validate_autoresearch_metrics(value: Any, *, field: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        msg = f"trial_finished payload has invalid {field}: must be an object"
+        raise TraceError(msg)
+    mapping = dict(value)
+    for key in mapping:
+        if key not in _ANNOTATION_METRIC_NUMBERS and key not in _ANNOTATION_METRIC_BOOLS:
+            msg = f"trial_finished payload has unknown metrics field {key!r} in {field}"
+            raise TraceError(msg)
+    for key in _ANNOTATION_METRIC_NUMBERS:
+        if key not in mapping:
+            continue
+        number = mapping[key]
+        if isinstance(number, bool) or not isinstance(number, (int, float)):
+            msg = f"trial_finished payload has invalid {field}.{key}: must be a number"
+            raise TraceError(msg)
+        if isinstance(number, float) and not math.isfinite(number):
+            msg = f"trial_finished payload has non-finite {field}.{key}"
+            raise TraceError(msg)
+        if isinstance(number, int) and not MIN_SAFE_INT <= number <= MAX_SAFE_INT:
+            msg = f"trial_finished payload has unsafe integer {field}.{key}"
+            raise TraceError(msg)
+        if isinstance(number, float) and number.is_integer():
+            as_int = int(number)
+            if not MIN_SAFE_INT <= as_int <= MAX_SAFE_INT:
+                msg = f"trial_finished payload has unsafe integer {field}.{key}"
+                raise TraceError(msg)
+    for key in _ANNOTATION_METRIC_BOOLS:
+        if key not in mapping:
+            continue
+        if not isinstance(mapping[key], bool):
+            msg = f"trial_finished payload has invalid {field}.{key}: must be a boolean"
+            raise TraceError(msg)
+    return mapping
+
+
+def _validate_autoresearch_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate a ``trial_finished`` payload and return a plain copy.
+
+    Raises :class:`TraceError` on any shape violation. Raw prose, patches,
+    paths, and digests are rejected by the adapter contract; the recorder
+    enforces shape, finite numbers, safe integers, opaque-ref patterns, and
+    closed field sets. Secret scanning still applies after validation.
+    """
+    if not isinstance(payload, Mapping):
+        msg = "trial_finished payload must be an object"
+        raise TraceError(msg)
+    data = dict(payload)
+    unknown = set(data) - _ANNOTATION_ALLOWED
+    if unknown:
+        msg = f"trial_finished payload has unknown fields {sorted(unknown)}"
+        raise TraceError(msg)
+    missing = _ANNOTATION_REQUIRED - set(data)
+    if missing:
+        msg = f"trial_finished payload is missing fields {sorted(missing)}"
+        raise TraceError(msg)
+    trial_id = data.get("trial_id")
+    if (
+        isinstance(trial_id, bool)
+        or not isinstance(trial_id, int)
+        or trial_id < 1
+        or not MIN_SAFE_INT <= trial_id <= MAX_SAFE_INT
+    ):
+        msg = f"trial_finished payload has invalid trial_id {trial_id!r}"
+        raise TraceError(msg)
+    candidate_ref = data.get("candidate_ref")
+    if not isinstance(candidate_ref, str) or not re.fullmatch(
+        r"candidate-[1-9][0-9]*", candidate_ref
+    ):
+        msg = f"trial_finished payload has invalid candidate_ref {candidate_ref!r}"
+        raise TraceError(msg)
+    parent_ref = data.get("parent_ref")
+    if parent_ref is not None and (
+        not isinstance(parent_ref, str)
+        or not re.fullmatch(r"candidate-[1-9][0-9]*", parent_ref)
+    ):
+        msg = f"trial_finished payload has invalid parent_ref {parent_ref!r}"
+        raise TraceError(msg)
+    for digest_key in ("candidate_digest", "parent_digest"):
+        digest = data.get(digest_key)
+        if digest is not None and (
+            not isinstance(digest, str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+        ):
+            msg = f"trial_finished payload has invalid {digest_key} {digest!r}"
+            raise TraceError(msg)
+    data["selection_metrics"] = _validate_autoresearch_metrics(
+        data.get("selection_metrics"), field="selection_metrics"
+    )
+    confirmation = data.get("confirmation_metrics")
+    if confirmation is not None:
+        data["confirmation_metrics"] = _validate_autoresearch_metrics(
+            confirmation, field="confirmation_metrics"
+        )
+    verdict = data.get("verdict")
+    if verdict not in _ANNOTATION_VERDICTS:
+        msg = f"trial_finished payload has invalid verdict {verdict!r}"
+        raise TraceError(msg)
+    reason = data.get("reason_code")
+    if reason not in _ANNOTATION_REASONS:
+        msg = f"trial_finished payload has invalid reason_code {reason!r}"
+        raise TraceError(msg)
+    source_reason = data.get("source_reason_code")
+    if source_reason is not None and (
+        not isinstance(source_reason, str)
+        or len(source_reason) > 64
+        or not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", source_reason)
+    ):
+        msg = f"trial_finished payload has invalid source_reason_code {source_reason!r}"
+        raise TraceError(msg)
+    mechanism_ref = data.get("mechanism_ref")
+    if mechanism_ref is not None and (
+        not isinstance(mechanism_ref, str)
+        or not re.fullmatch(r"mechanism-[1-9][0-9]*", mechanism_ref)
+    ):
+        msg = f"trial_finished payload has invalid mechanism_ref {mechanism_ref!r}"
+        raise TraceError(msg)
+    mechanism_id = data.get("mechanism_id")
+    if mechanism_id is not None and (
+        not isinstance(mechanism_id, str)
+        or not 1 <= len(mechanism_id) <= 128
+    ):
+        msg = "trial_finished payload has invalid mechanism_id"
+        raise TraceError(msg)
+    artifact_refs = data.get("artifact_refs")
+    if not isinstance(artifact_refs, (list, tuple)) or isinstance(artifact_refs, (str, bytes)):
+        msg = "trial_finished payload has invalid artifact_refs: must be an array"
+        raise TraceError(msg)
+    refs = list(artifact_refs)
+    if len(set(refs)) != len(refs):
+        msg = "trial_finished payload has duplicate artifact_refs"
+        raise TraceError(msg)
+    for ref in refs:
+        if not isinstance(ref, str) or not re.fullmatch(r"artifact-[1-9][0-9]*", ref):
+            msg = f"trial_finished payload has invalid artifact_ref {ref!r}"
+            raise TraceError(msg)
+    data["artifact_refs"] = refs
+    return data
+
+
+# ---------------------------------------------------------------------------
 # Provenance resource loading (generated packages)
 # ---------------------------------------------------------------------------
 
@@ -559,6 +787,11 @@ class TraceRecorder:
         self._pending_tools: dict[str, list[str]] = {}
         self._open_tools: dict[str, list[str]] = {}
         self._current_visit: str | None = None
+        self._current_stage_id: str | None = None
+        self._visit_to_stage: dict[str, str] = {}
+        self._visit_sequences: dict[str, list[int]] = {}
+        self._annotations_dropped = 0
+        self._annotation_warnings: list[str] = []
         self._model_bytes: dict[str, int] = {}
         self._model_tool_calls: dict[str, int] = {}
         self._tool_started_at: dict[str, datetime] = {}
@@ -590,6 +823,8 @@ class TraceRecorder:
         secrets: tuple[str, ...] | list[str] | None = None,
         trace_id: str | None = None,
         clock: Callable[[], datetime] | None = None,
+        on_stage_completed: Callable[[Mapping[str, Any]], Mapping[str, Any] | None]
+        | None = None,
     ) -> TraceRecorder:
         """Create a recorder for one run writing to ``path`` on finish."""
         return cls(
@@ -604,6 +839,7 @@ class TraceRecorder:
                 secrets=tuple(secrets or ()),
                 trace_id=trace_id,
                 clock=clock,
+                on_stage_completed=on_stage_completed,
             )
         )
 
@@ -615,6 +851,16 @@ class TraceRecorder:
     def config(self) -> TraceConfig:
         """The immutable host configuration this recorder was created with."""
         return self._config
+
+    @property
+    def annotations_dropped(self) -> int:
+        """Counted hook annotations lost (review item 1 completeness)."""
+        return self._annotations_dropped
+
+    @property
+    def annotation_warnings(self) -> tuple[str, ...]:
+        """Bounded safe warnings for dropped hook annotations."""
+        return tuple(self._annotation_warnings)
 
     # -- run lifecycle ---------------------------------------------------
 
@@ -664,6 +910,8 @@ class TraceRecorder:
         visit_id = f"s-{self._visit_count}"
         self._pending_visits.setdefault(stage_id, []).append(visit_id)
         self._current_visit = visit_id
+        self._current_stage_id = stage_id
+        self._visit_to_stage[visit_id] = stage_id
         return visit_id
 
     def begin_model_call(
@@ -734,16 +982,116 @@ class TraceRecorder:
         self,
         namespace: str,
         kind: str,
-        _payload: Mapping[str, Any],
-        _anchor_sequence: int | None = None,
-    ) -> None:
-        """Trusted domain annotations land in Phase 3; refuse loudly until then."""
+        payload: Mapping[str, Any] | None = None,
+        anchor_sequence: int | None = None,
+        *,
+        stage_id: str | None = None,
+        stage_visit_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Persist one trusted domain annotation (Phase 3).
+
+        Known ``nemoir.autoresearch/v1`` / ``trial_finished`` payloads are
+        strictly validated; unknown namespaces retain only namespace/kind
+        with a redacted payload marker. Returns the persisted record, or
+        None when the cleartext scanner forces omission (sequence gaps are
+        valid). Raises :class:`TraceError` on malformed known payloads,
+        bad anchors, or missing stage context.
+        """
         self._require_begun()
-        msg = (
-            f"trace annotations ({namespace}/{kind}) arrive in Phase 3; "
-            f"the Phase 1 audit recorder cannot persist them"
+        if self._event_limit_exceeded or len(self._events) >= LIMIT_EVENT_COUNT:
+            self._event_limit_exceeded = True
+            return None
+        visit = stage_visit_id or self._current_visit
+        stage = stage_id or (
+            self._visit_to_stage.get(visit, self._current_stage_id)
+            if visit is not None
+            else None
         )
-        raise TraceError(msg)
+        if visit is None or stage is None:
+            msg = "trace annotation requires an enclosing stage visit"
+            raise TraceError(msg)
+        if not re.fullmatch(r"s-[1-9][0-9]*", visit):
+            msg = f"trace annotation has invalid stage_visit_id {visit!r}"
+            raise TraceError(msg)
+        if not isinstance(stage, str) or not 1 <= len(stage) <= 256:
+            msg = f"trace annotation has invalid stage_id {stage!r}"
+            raise TraceError(msg)
+        if (
+            anchor_sequence is not None
+            and (
+                isinstance(anchor_sequence, bool)
+                or not isinstance(anchor_sequence, int)
+                or anchor_sequence < 1
+                or not MIN_SAFE_INT <= anchor_sequence <= MAX_SAFE_INT
+            )
+        ):
+            msg = f"trace annotation has invalid anchor_sequence {anchor_sequence!r}"
+            raise TraceError(msg)
+        if anchor_sequence is not None:
+            # Anchor must belong to the declared visit when that visit has
+            # observed sequences; otherwise the annotation would point at an
+            # unrelated event. Hook path forces the triggering sequence, so
+            # this primarily guards direct calls (which raise loudly).
+            known = self._visit_sequences.get(visit, [])
+            if known and anchor_sequence not in known:
+                msg = (
+                    f"trace annotation anchor_sequence {anchor_sequence!r} "
+                    f"does not belong to visit {visit!r}"
+                )
+                raise TraceError(msg)
+        if namespace == _ANNOTATION_NAMESPACE and kind == _ANNOTATION_KIND:
+            if payload is None:
+                msg = "trial_finished annotation requires a payload mapping"
+                raise TraceError(msg)
+            projected_payload = _validate_autoresearch_payload(payload)
+            # Audit policy gate (redaction-policy §11): digests and raw
+            # mechanism IDs require explicit publication review. The audit
+            # profile keeps only opaque refs; reject cleartext identifiers.
+            if self._config.profile == "audit":
+                if not isinstance(projected_payload, dict):
+                    msg = "trial_finished payload must be an object"
+                    raise TraceError(msg)
+                if projected_payload.get("candidate_digest") is not None:
+                    msg = "audit profile rejects non-null candidate_digest (requires publication review)"
+                    raise TraceError(msg)
+                if projected_payload.get("parent_digest") is not None:
+                    msg = "audit profile rejects non-null parent_digest (requires publication review)"
+                    raise TraceError(msg)
+                if projected_payload.get("mechanism_id") is not None:
+                    msg = "audit profile rejects non-null mechanism_id (requires publication review)"
+                    raise TraceError(msg)
+        else:
+            # Unknown namespace: retain only namespace/kind per policy §11.
+            projected_payload = self._new_marker(
+                "unapproved_field", payload if payload is not None else {}
+            )
+        record: dict[str, Any] = {
+            "kind": "annotation",
+            "run_id": self._trace_id,
+            "timestamp": format_timestamp(self._now()),
+            "stage_id": stage,
+            "stage_visit_id": visit,
+            "annotation": {
+                "namespace": namespace,
+                "kind": kind,
+                "payload": projected_payload,
+            },
+            "redacted_fields": [],
+        }
+        if anchor_sequence is not None:
+            record["anchor_sequence"] = anchor_sequence
+        if isinstance(projected_payload, dict) and "$redacted" in projected_payload:
+            record["redacted_fields"] = ["/annotation/payload"]
+        record = self._apply_registry(record)
+        omitted = self._scan_and_mask(record)
+        if omitted:
+            return None
+        record["redacted_fields"] = sorted(set(record.get("redacted_fields", [])))
+        if len(self._events) >= LIMIT_EVENT_COUNT:
+            self._event_limit_exceeded = True
+            return None
+        self._events.append(record)
+        return record
 
     # -- live event observation ------------------------------------------
 
@@ -769,7 +1117,91 @@ class TraceRecorder:
             self._event_limit_exceeded = True
             return None
         self._events.append(record)
+        # Track per-visit sequences for annotation anchor validation.
+        visit_seq = record.get("stage_visit_id")
+        seq_num = getattr(event, "sequence", None)
+        if (
+            isinstance(visit_seq, str)
+            and isinstance(seq_num, int)
+            and not isinstance(seq_num, bool)
+            and seq_num >= 1
+        ):
+            self._visit_sequences.setdefault(visit_seq, []).append(seq_num)
+        if record.get("kind") == "stage_completed":
+            self._maybe_emit_stage_annotation(record, event)
         return record
+
+    def _maybe_emit_stage_annotation(
+        self, record: dict[str, Any], event: WorkflowEvent
+    ) -> None:
+        """Invoke the host ``on_stage_completed`` hook, if configured.
+
+        Hook failures never break the run: they are swallowed so workflow
+        control flow continues with the annotation missing, but a bounded
+        safe warning is recorded and surfaced via the summary. Direct
+        :meth:`record_annotation` calls still raise loudly for tests.
+        The hook-supplied anchor is ignored; the triggering
+        ``stage_completed`` sequence is authoritative.
+        """
+        hook = self._config.on_stage_completed
+        if hook is None or self._finished:
+            return
+        try:
+            info: dict[str, Any] = {
+                "stage_id": record.get("stage_id"),
+                "stage_visit_id": record.get("stage_visit_id"),
+                "sequence": getattr(event, "sequence", None),
+            }
+            spec = hook(info)
+        except Exception:
+            self._record_annotation_warning(record, "hook_failed")
+            return
+        if spec is None:
+            return
+        try:
+            if not isinstance(spec, Mapping):
+                self._record_annotation_warning(record, "invalid_spec")
+                return
+            namespace = spec.get("namespace")
+            kind = spec.get("kind")
+            payload = spec.get("payload")
+            if not isinstance(namespace, str) or not isinstance(kind, str):
+                self._record_annotation_warning(record, "invalid_spec")
+                return
+            if not isinstance(payload, Mapping):
+                self._record_annotation_warning(record, "invalid_payload")
+                return
+            # Force the anchor to the triggering sequence; never trust a
+            # hook-returned anchor (prevents cross-visit mislinking).
+            triggering = getattr(event, "sequence", None)
+            anchor: Any = triggering if isinstance(triggering, int) and triggering >= 1 else None
+            persisted = self.record_annotation(
+                namespace,
+                kind,
+                payload,
+                anchor,
+                stage_id=record.get("stage_id"),
+                stage_visit_id=record.get("stage_visit_id"),
+            )
+            if persisted is None:
+                # Scanner-forced omission: same silent-loss class as a hook
+                # failure, so count it (review item 1). Direct calls return
+                # None to the caller; only the hook path auto-counts here.
+                self._record_annotation_warning(record, "invalid_payload")
+        except Exception:
+            self._record_annotation_warning(record, "invalid_payload")
+            return
+
+    def _record_annotation_warning(self, record: dict[str, Any], reason: str) -> None:
+        """Record a bounded safe completeness warning for a dropped hook annotation."""
+        self._annotations_dropped += 1
+        if len(self._annotation_warnings) >= 10:
+            return
+        stage = record.get("stage_id")
+        stage_str = stage if isinstance(stage, str) else "unknown"
+        # Safe fixed vocabulary only; never echo payload values.
+        safe_reason = reason if reason in ("hook_failed", "invalid_spec", "invalid_payload") else "invalid_payload"
+        self._annotation_warnings.append(f"{stage_str}:{safe_reason}")
 
     # -- projection ------------------------------------------------------
 
@@ -821,6 +1253,8 @@ class TraceRecorder:
             self._visit_count += 1
             visit = f"s-{self._visit_count}"
         self._current_visit = visit
+        self._current_stage_id = stage_id
+        self._visit_to_stage[visit] = stage_id
         return visit
 
     def _peek_model(self, visit: str) -> str | None:
@@ -962,9 +1396,16 @@ class TraceRecorder:
     def _project_model_retry(self, event: WorkflowEvent) -> dict[str, Any]:
         visit = self._current_visit or ""
         record = self._base(event, stage_visit_id=visit)
+        # The schema requires model_call_id on every model_retry. A retry can
+        # legally arrive with no pending call (e.g. models.py emits a
+        # tool-error retry after model_completed already consumed the call
+        # id), so synthesize a fresh run-local id rather than emitting a
+        # schema-invalid record. Peek-hit behavior is unchanged.
         call_id = self._peek_model(visit)
-        if call_id is not None:
-            record["model_call_id"] = call_id
+        if call_id is None:
+            self._model_count += 1
+            call_id = f"m-{self._model_count}"
+        record["model_call_id"] = call_id
         metadata: Mapping[str, Any] = event.metadata or {}
         record["metadata"] = {
             "attempt": _safe_int(metadata.get("attempt"), 1, minimum=1),
@@ -1447,6 +1888,8 @@ class TraceRecorder:
             "stage_visit_count": len(visits),
             "duration_ms": max(0, int((finish_time - begin_time).total_seconds() * 1000)),
             "counts_by_kind": kinds,
+            "annotations_dropped": self._annotations_dropped,
+            "annotation_warnings": list(self._annotation_warnings),
         }
         payloads: dict[str, bytes] = {
             MANIFEST_PATH: to_canonical_bytes(manifest_obj),
@@ -1679,8 +2122,11 @@ class NoOpTraceRecorder:
         self,
         _namespace: str,
         _kind: str,
-        _payload: Mapping[str, Any],
+        _payload: Mapping[str, Any] | None = None,
         _anchor_sequence: int | None = None,
+        *,
+        _stage_id: str | None = None,
+        _stage_visit_id: str | None = None,
     ) -> None:
         return None
 
@@ -2206,6 +2652,26 @@ def verify_archive(path: str | Path) -> VerificationReport:
                 ann = ev.get("annotation")  # type: ignore[reportUnknownMemberType, reportUnknownVariableType, reportUnknownArgumentType]
                 if not isinstance(ann, dict) or "namespace" not in ann or "kind" not in ann or "payload" not in ann:
                     errors.append(f"public/events.ndjson:{idx} invalid annotation")
+                else:
+                    ns = ann.get("namespace")
+                    kd = ann.get("kind")
+                    pl = ann.get("payload")
+                    if not isinstance(ns, str) or not (1 <= len(ns) <= 128):
+                        errors.append(f"public/events.ndjson:{idx} invalid annotation namespace")
+                    elif not isinstance(kd, str) or not (1 <= len(kd) <= 128):
+                        errors.append(f"public/events.ndjson:{idx} invalid annotation kind")
+                    elif ns == _ANNOTATION_NAMESPACE and kd == _ANNOTATION_KIND:
+                        try:
+                            _validate_autoresearch_payload(pl)  # type: ignore[arg-type]
+                        except Exception as exc:
+                            errors.append(
+                                f"public/events.ndjson:{idx} invalid trial_finished payload: {exc}"
+                            )
+                    # Unknown annotations must be a redaction marker per policy §11.
+                    elif not (isinstance(pl, dict) and "$redacted" in pl):
+                        errors.append(
+                            f"public/events.ndjson:{idx} unknown annotation payload must be a redaction marker"
+                        )
             if _has_unsafe_int(ev):
                 errors.append(f"public/events.ndjson:{idx} contains unsafe integer")
     except Exception as exc:

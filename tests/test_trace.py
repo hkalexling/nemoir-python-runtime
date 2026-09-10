@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import pytest  # type: ignore[import-untyped]
 from jsonschema import Draft202012Validator, FormatChecker  # type: ignore[import-untyped]
@@ -19,6 +20,7 @@ from referencing import Registry, Resource  # type: ignore[import-untyped]
 
 from nemoir_runtime import ToolContext, ToolRegistry, tool
 from nemoir_runtime.errors import MaxStepsExceededError, PolicyDeniedError, ToolInvocationError
+from nemoir_runtime.events import WorkflowEvent
 from nemoir_runtime.models import ModelResponse, ModelStageExecutor
 from nemoir_runtime.runtime import (
     ExprSpec,
@@ -47,9 +49,6 @@ from nemoir_runtime.trace import (
     resolve_trace_recorder,
     verify_archive,
 )
-
-if TYPE_CHECKING:
-    from nemoir_runtime.events import WorkflowEvent
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCHEMA_DIR = REPO_ROOT / "docs" / "trace" / "schema"
@@ -633,10 +632,277 @@ def test_profiles_and_annotations_refused(tmp_path: Path) -> None:
         TraceRecorder.create(tmp_path / "x.nemotrace", profile="replay")
     with pytest.raises(TraceError, match="only 'audit'"):
         TraceRecorder.create(tmp_path / "x.nemotrace", profile="publication")
+
+
+def _trial_payload(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "trial_id": 1,
+        "candidate_ref": "candidate-1",
+        "verdict": "rejected",
+        "reason_code": "no_improvement",
+        "selection_metrics": {"candidate_median_ns": 100.0, "valid": True},
+        "artifact_refs": [],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_annotation_accepted_and_shaped(tmp_path: Path) -> None:
+    validators = _validators()
     recorder = _make_recorder(tmp_path)
     recorder.begin_run(_trace_manifest())
-    with pytest.raises(TraceError, match="Phase 3"):
+    visit = recorder.begin_stage_visit("RecordTrial")
+    record = recorder.record_annotation(
+        "nemoir.autoresearch/v1", "trial_finished", _trial_payload(), anchor_sequence=7
+    )
+    assert record is not None
+    assert record["kind"] == "annotation"
+    assert "sequence" not in record
+    assert record["stage_id"] == "RecordTrial"
+    assert record["stage_visit_id"] == visit
+    assert record["anchor_sequence"] == 7
+    assert record["run_id"] == FIXED_TRACE_ID
+    validators["public-event.schema.json"].validate(record)
+    validators["autoresearch-annotation.schema.json"].validate(
+        record["annotation"]["payload"]
+    )
+
+
+def test_verifier_rejects_malformed_known_annotation(tmp_path: Path) -> None:
+    """H4: forged archive with invalid trial_id must not verify as ok."""
+    import zipfile  # noqa: PLC0415
+
+    from nemoir_runtime.canonical import sha256_tag, to_canonical_bytes  # noqa: PLC0415
+
+    recorder = _make_recorder(tmp_path, name="good.nemotrace")
+    recorder.begin_run(_trace_manifest())
+    recorder.begin_stage_visit("RecordTrial")
+    evt = WorkflowEvent(
+        kind="stage_completed", run_id="x", sequence=1, timestamp=FIXED_TIME,
+        stage_id="RecordTrial", output={"report": "x"},
+    )
+    recorder.observe_workflow_event(evt)
+    recorder.record_annotation(
+        "nemoir.autoresearch/v1", "trial_finished", _trial_payload(), anchor_sequence=1,
+    )
+    good_path = recorder.finish_run("complete")
+    entries = read_archive_entries(good_path)
+    # Forge: trial_id 0 violates schema; recompute hashes + identity deterministically.
+    lines = [
+        json.loads(line)
+        for line in entries["public/events.ndjson"].split(b"\n")
+        if line.strip()
+    ]
+    for line in lines:
+        if line["kind"] == "annotation":
+            line["annotation"]["payload"]["trial_id"] = 0
+            break
+    else:
+        msg = "no annotation to forge"
+        raise AssertionError(msg)
+    forged_events = b"".join(to_canonical_bytes(e) + b"\n" for e in lines)
+    forged_entries = dict(entries)
+    forged_entries["public/events.ndjson"] = forged_events
+    # Recompute summary + integrity for a self-consistent forgery.
+    summary = json.loads(forged_entries["public/summary.json"])
+    summary["events_sha256"] = sha256_tag(forged_events)
+    kinds: dict[str, int] = {}
+    for event in lines:
+        kinds[event["kind"]] = kinds.get(event["kind"], 0) + 1
+    summary["counts_by_kind"] = kinds
+    forged_entries["public/summary.json"] = to_canonical_bytes(summary)
+    integrity_entries = [
+        {
+            "path": path,
+            "media_type": (
+                "application/x-ndjson"
+                if path.endswith(".ndjson")
+                else "application/json"
+            ),
+            "uncompressed_bytes": len(data),
+            "sha256": sha256_tag(data),
+        }
+        for path, data in sorted(forged_entries.items())
+        if path != "integrity.json"
+    ]
+    identity = {
+        "format": "nemoir.trace.content-identity/0.1",
+        "entries": sorted(
+            (
+                {
+                    "path": e["path"],
+                    "sha256": e["sha256"],
+                    "uncompressed_bytes": e["uncompressed_bytes"],
+                }
+                for e in integrity_entries
+            ),
+            key=lambda e: e["path"],
+        ),
+    }
+    forged_entries["integrity.json"] = to_canonical_bytes({
+        "format": "nemoir.trace.integrity/0.1", "algorithm": "sha256",
+        "entries": integrity_entries, "content_identity": sha256_tag(to_canonical_bytes(identity)),
+    })
+    forged_path = tmp_path / "forged.nemotrace"
+    with zipfile.ZipFile(forged_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        for name in sorted(forged_entries):
+            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o644 << 16
+            zf.writestr(info, forged_entries[name])
+    report = verify_archive(forged_path)
+    assert not report.ok
+    assert any("trial_finished" in e for e in report.errors)
+
+
+def test_hook_anchor_forced_and_malformed_counted(tmp_path: Path) -> None:
+    """M1: hook anchor ignored (triggering seq wins); malformed hook counted."""
+
+    def bad_hook(_info: Any) -> Any:
+        return {
+            "namespace": "nemoir.autoresearch/v1",
+            "kind": "trial_finished",
+            "payload": _trial_payload(reason_code="bogus"),
+            "anchor_sequence": 999,  # must be ignored; payload is malformed anyway
+        }
+
+    recorder = _make_recorder(tmp_path, name="hook.nemotrace", on_stage_completed=bad_hook)
+    recorder.begin_run(_trace_manifest())
+    recorder.begin_stage_visit("RecordTrial")
+    evt = WorkflowEvent(
+        kind="stage_completed", run_id="x", sequence=5, timestamp=FIXED_TIME,
+        stage_id="RecordTrial", output={"report": "x"},
+    )
+    recorder.observe_workflow_event(evt)
+    assert recorder.annotations_dropped == 1
+    assert recorder.annotation_warnings
+    # Warnings are surfaced via summary.json (review item 1 completeness).
+    hook_path = recorder.finish_run("complete")
+    hook_entries = read_archive_entries(hook_path)
+    hook_summary = json.loads(hook_entries["public/summary.json"])
+    assert hook_summary["annotations_dropped"] == 1
+    assert hook_summary["annotation_warnings"] == list(recorder.annotation_warnings)
+    assert len(hook_summary["annotation_warnings"]) == 1
+    # Direct cross-visit anchor raises loudly.
+    recorder2 = _make_recorder(tmp_path, name="direct.nemotrace")
+    recorder2.begin_run(_trace_manifest())
+    recorder2.begin_stage_visit("RecordTrial")
+    evt2 = WorkflowEvent(
+        kind="stage_completed", run_id="x", sequence=3, timestamp=FIXED_TIME,
+        stage_id="RecordTrial", output={"report": "x"},
+    )
+    recorder2.observe_workflow_event(evt2)
+    with pytest.raises(TraceError, match="does not belong to visit"):
+        recorder2.record_annotation(
+            "nemoir.autoresearch/v1", "trial_finished", _trial_payload(), anchor_sequence=999,
+        )
+
+
+def test_model_retry_without_pending_call_keeps_valid_id(tmp_path: Path) -> None:
+    """Regression: a tool-error retry after model_completed consumed the call
+    id must still carry a valid model_call_id (schema requires it)."""
+
+    recorder = _make_recorder(tmp_path)
+    recorder.begin_run(_trace_manifest())
+    recorder.begin_stage_visit("Start")
+    seq = 0
+
+    def emit(kind: str, **kwargs: Any) -> Any:
+        nonlocal seq
+        seq += 1
+        return recorder.observe_workflow_event(
+            WorkflowEvent(
+                kind=kind,  # type: ignore[arg-type]
+                run_id="x",
+                sequence=seq,
+                timestamp=FIXED_TIME,
+                stage_id="Start",
+                **kwargs,  # type: ignore[arg-type]
+            )
+        )
+
+    recorder.begin_model_call("Start")
+    emit("model_completed")
+    retry = emit(
+        "model_retry",
+        error="x",
+        metadata={"attempt": 1, "max_retries": 3, "category": "tool_call"},
+    )
+    assert retry is not None
+    assert re.fullmatch(r"m-[1-9][0-9]*", retry["model_call_id"])
+    path = recorder.finish_run("complete")
+    report = verify_archive(path)
+    assert report.ok, report.errors
+    assert not report.errors
+
+
+def test_annotation_unknown_namespace_markered(tmp_path: Path) -> None:
+    recorder = _make_recorder(tmp_path)
+    recorder.begin_run(_trace_manifest())
+    recorder.begin_stage_visit("RecordTrial")
+    record = recorder.record_annotation("example.com/v1", "custom", {"x": 1})
+    assert record is not None
+    assert record["annotation"]["payload"] == {
+        "$redacted": record["annotation"]["payload"]["$redacted"]
+    }
+    assert "/annotation/payload" in record["redacted_fields"]
+
+
+def test_annotation_malformed_rejected(tmp_path: Path) -> None:
+    recorder = _make_recorder(tmp_path)
+    recorder.begin_run(_trace_manifest())
+    recorder.begin_stage_visit("RecordTrial")
+    with pytest.raises(TraceError, match="trial_finished"):
         recorder.record_annotation("nemoir.autoresearch/v1", "trial_finished", {})
+    with pytest.raises(TraceError, match="reason_code"):
+        recorder.record_annotation(
+            "nemoir.autoresearch/v1", "trial_finished", _trial_payload(reason_code="bogus")
+        )
+    with pytest.raises(TraceError, match="unknown fields"):
+        recorder.record_annotation(
+            "nemoir.autoresearch/v1",
+            "trial_finished",
+            _trial_payload(detail="free prose leaks"),
+        )
+    with pytest.raises(TraceError, match="anchor_sequence"):
+        recorder.record_annotation(
+            "nemoir.autoresearch/v1", "trial_finished", _trial_payload(), anchor_sequence=0
+        )
+    fresh = _make_recorder(tmp_path, name="b.nemotrace")
+    fresh.begin_run(_trace_manifest())
+    with pytest.raises(TraceError, match="enclosing stage visit"):
+        fresh.record_annotation(
+            "nemoir.autoresearch/v1", "trial_finished", _trial_payload()
+        )
+
+
+def test_annotation_secret_scan_omits_or_masks(tmp_path: Path) -> None:
+    recorder = _make_recorder(tmp_path, secrets=("sk-cvxpygen-TEST-secret-0001",))
+    recorder.begin_run(_trace_manifest())
+    recorder.begin_stage_visit("RecordTrial")
+    # Audit profile rejects raw mechanism_id/digests outright (redaction-policy
+    # §11: they require explicit publication review). Opaque refs only.
+    with pytest.raises(TraceError, match="mechanism_id"):
+        recorder.record_annotation(
+            "nemoir.autoresearch/v1",
+            "trial_finished",
+            _trial_payload(mechanism_id="sk-cvxpygen-TEST-secret-0001"),
+        )
+    with pytest.raises(TraceError, match="candidate_digest"):
+        recorder.record_annotation(
+            "nemoir.autoresearch/v1",
+            "trial_finished",
+            _trial_payload(candidate_digest="sha256:" + "ab" * 32),
+        )
+    # Opaque-only payload still records and stays secret-free.
+    record = recorder.record_annotation(
+        "nemoir.autoresearch/v1",
+        "trial_finished",
+        _trial_payload(),
+    )
+    assert record is not None
+    blob = json.dumps(record).encode()
+    assert b"sk-cvxpygen-TEST-secret-0001" not in blob
 
 
 async def test_blocked_finalization_is_loud_without_double_terminal(tmp_path: Path) -> None:

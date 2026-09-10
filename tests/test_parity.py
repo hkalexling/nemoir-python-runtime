@@ -135,6 +135,13 @@ def _drive_fixture(tmp_path: Path) -> Path:
         elif kind == "record_tool_error":
             error_type = type(op["error_type"], (Exception,), {})
             recorder.record_tool_error(last_tid, error_type())
+        elif kind == "record_annotation":
+            recorder.record_annotation(
+                op["namespace"],
+                op["kind"],
+                op["payload"],
+                op.get("anchor_sequence"),
+            )
         elif kind == "observe":
             spec = op["event"]
             event = WorkflowEvent(
