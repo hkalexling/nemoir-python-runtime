@@ -458,6 +458,8 @@ class WorkflowRuntime:
         run_id = uuid.uuid4().hex
         rec = resolve_recorder(trace_recorder)
         rec.begin_run(self._manifest)
+        # Vault-bound run inputs for taped replay (no-op unless replay).
+        rec.record_run_inputs(inputs)
         # Trace observer does not count as a live sink, so provider
         # streaming stays gated on a real caller consumer. The observer
         # is invoked inside ``WorkflowEventEmitter.emit`` before the sink.
@@ -807,6 +809,39 @@ class WorkflowRuntime:
                 bound_args = self._bind_trigger_args(
                     policy.trigger, args, policy_id=policy.id, capability=capability
                 )
+                taped_outcome = rec.consume_taped_policy(policy.id)
+                if taped_outcome is not None:
+                    # Taped replay: reproduce the recorded outcome instead of
+                    # re-evaluating the expression against scrubbed fixture
+                    # arguments (path-scoped policies would wrongly deny
+                    # opaque refs/placeholders). Order and milestones match
+                    # the live run exactly; an exhausted tape falls through
+                    # to live evaluation below and diverges honestly.
+                    denied = taped_outcome == "denied"
+                    await emitter.emit(
+                        "policy_checked",
+                        stage_id=stage.id,
+                        capability=capability,
+                        metadata={
+                            "policy_id": policy.id,
+                            "policy_kind": "deny",
+                            "denied": denied,
+                        },
+                    )
+                    rec.record_policy_evaluation(
+                        None, policy.id, bound_args, "denied" if denied else "allowed"
+                    )
+                    if denied:
+                        await emitter.emit(
+                            "policy_denied",
+                            stage_id=stage.id,
+                            capability=capability,
+                            error=f"Policy '{policy.id}' denied capability '{capability}'",
+                            metadata={"policy_id": policy.id},
+                        )
+                        msg = f"Policy '{policy.id}' denied capability '{capability}'"
+                        raise PolicyDeniedError(msg)
+                    continue
                 try:
                     denied = _eval_policy_expr(
                         policy.condition,
@@ -827,6 +862,7 @@ class WorkflowRuntime:
                             "error": str(e),
                         },
                     )
+                    rec.record_policy_evaluation(None, policy.id, bound_args, "denied")
                     msg = (
                         f"Policy '{policy.id}': condition evaluation failed "
                         f"for capability '{capability}': {e}"
@@ -841,6 +877,9 @@ class WorkflowRuntime:
                         "policy_kind": "deny",
                         "denied": denied,
                     },
+                )
+                rec.record_policy_evaluation(
+                    None, policy.id, bound_args, "denied" if denied else "allowed"
                 )
                 if denied:
                     await emitter.emit(
@@ -890,11 +929,13 @@ class WorkflowRuntime:
                             error=f"user.confirm returned False for policy '{policy.id}'",
                             metadata={"policy_id": policy.id},
                         )
+                        rec.record_policy_evaluation(None, policy.id, bound_args, "denied")
                         msg = (
                             f"Policy '{policy.id}': user.confirm returned False, "
                             f"blocking capability '{capability}'"
                         )
                         raise PolicyDeniedError(msg)
+                rec.record_policy_evaluation(None, policy.id, bound_args, "allowed")
 
         # Emit tool_call_started before the handler runs.
         # Prefer the caller-provided tool_name; fall back to the first
@@ -933,7 +974,7 @@ class WorkflowRuntime:
                 error=str(_active_exception()),
             )
             raise
-        rec.record_tool_result(tool_call_id, result)
+        rec.record_tool_result(tool_call_id, result, args=dict(args))
         await emitter.emit(
             "tool_call_completed",
             stage_id=stage.id,

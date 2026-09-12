@@ -79,6 +79,27 @@ def supports_streaming(adapter: object) -> bool:
     return callable(getattr(adapter, "stream", None))  # type: ignore[arg-type]
 
 
+def _vault_response_payload(response: ModelResponse) -> dict[str, Any]:
+    """Full model-response fixture for the encrypted replay vault.
+
+    Reasoning is included here and gated at the recorder boundary
+    (``VaultCapture.include_reasoning``); credentials never appear because
+    ``ModelResponse`` cannot represent provider configuration.
+    """
+    return {
+        "content": response.content,
+        "tool_calls": [
+            {
+                "id": call.id,
+                "name": call.name,
+                "arguments": dict(call.arguments),
+            }
+            for call in response.tool_calls
+        ],
+        "reasoning": response.reasoning,
+    }
+
+
 def _response_bytes(response: ModelResponse) -> int:
     """Safe byte count for a model response (content + tool-call args).
 
@@ -1360,6 +1381,16 @@ class ModelStageExecutor:
             # (e.g. malformed streamed tool-call JSON) so they are retryable.
             # Each attempt gets its own trace model-call id.
             model_call_id = rec.begin_model_call(ctx.stage.id)
+            if rec.vault_enabled:
+                rec.record_model_request(
+                    model_call_id,
+                    {
+                        "messages": [dict(message) for message in messages],
+                        "tools": list(tool_schemas),
+                        "output_schema": dict(output_schema),
+                        "options": {"reasoning": effective_reasoning},
+                    },
+                )
             try:
                 if use_streaming:
                     response = await self._stream_adapter_response(
@@ -1371,6 +1402,7 @@ class ModelStageExecutor:
                         model_call_id,
                         response_bytes=_response_bytes(response),
                         tool_call_count=len(response.tool_calls),
+                        response=_vault_response_payload(response),
                     )
                     if emitter is not None:
                         await emitter.emit(
@@ -1532,6 +1564,7 @@ class ModelStageExecutor:
                         model_call_id,
                         response_bytes=_response_bytes(completed),
                         tool_call_count=len(completed.tool_calls),
+                        response=_vault_response_payload(completed),
                     )
                 await emitter.emit(
                     "model_completed",

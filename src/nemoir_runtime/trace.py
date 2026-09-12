@@ -1,4 +1,4 @@
-"""NemoTrace audit recorder and single-file archive (Phase 1).
+"""NemoTrace audit/replay recorder and single-file archive (Phases 1+4).
 
 Turns a run's live :class:`WorkflowEvent` stream plus recorder semantic
 hooks into one portable ``*.nemotrace`` ZIP artifact: a redacted public
@@ -10,9 +10,12 @@ Security model (see ``docs/trace/redaction-policy.md``):
 - A value is absent from cleartext unless an allowlist rule permits it.
 - Redaction happens at capture time, before any journal/archive write. The
   viewer is never a redaction boundary.
-- ``audit`` is the only Phase 1 profile. There is no cleartext full-capture
-  profile; ``replay``/``publication`` arrive in later phases and this module
-  refuses them explicitly rather than silently producing them.
+- ``audit`` is the default redacted profile. ``replay`` produces the same
+  public ledger plus an encrypted vault (``private/vault.enc``) holding taped
+  model/tool/guard evidence for local re-execution; it requires a host
+  passphrase and is never publication-eligible. There is no cleartext
+  full-capture profile; ``publication`` arrives in a later phase and this
+  module refuses it explicitly rather than silently producing it.
 - Credentials never enter the ledger or any vault. The secret-value registry
   is defense-in-depth against echoed credentials, not the primary control.
 - The final cleartext scanner blocks archive finalization on any unresolved
@@ -24,21 +27,30 @@ the wire form. Canonical JSON bytes come from
 (``nemoir-ir/src/canonical.rs``) and TypeScript (``canonical.ts``) ports must
 produce byte-identical uncompressed entries for the same logical run.
 
-This module is deliberately stdlib-only so tracing never adds required
-runtime dependencies.
+Audit recording is stdlib-only so tracing never adds required runtime
+dependencies. The ``replay`` vault codec (PBKDF2-HMAC-SHA-256 + AES-256-GCM)
+imports the optional ``cryptography`` package lazily: importing this module
+or recording ``audit`` traces never requires it.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
 import contextlib
+import dataclasses
+import hashlib
+import json
 import math
 import os
 import re
+import unicodedata
 import uuid
 import zipfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -72,7 +84,26 @@ GRAPH_PATH = "public/workflow.graph.json"
 EVENTS_PATH = "public/events.ndjson"
 SUMMARY_PATH = "public/summary.json"
 INTEGRITY_PATH = "integrity.json"
+VAULT_ENC_PATH = "private/vault.enc"
+VAULT_META_PATH = "private/vault.meta.json"
 AUDIT_ENTRY_PATHS = (MANIFEST_PATH, GRAPH_PATH, EVENTS_PATH, SUMMARY_PATH)
+VAULT_ENTRY_PATHS = (VAULT_ENC_PATH, VAULT_META_PATH)
+
+# Phase 4 encrypted-vault codec (docs/trace/spikes/crypto-interop.md).
+VAULT_CODEC = "PBKDF2-HMAC-SHA-256+A256GCM"
+VAULT_META_FORMAT = "nemoir.trace.vault-meta/0.1"
+VAULT_AAD_FORMAT = "nemoir.trace.vault-aad/0.1"
+VAULT_KDF_NAME = "PBKDF2-HMAC-SHA-256"
+VAULT_KDF_ITERATIONS = 600_000
+VAULT_SALT_BYTES = 16
+VAULT_NONCE_BYTES = 12
+VAULT_DERIVED_KEY_BITS = 256
+VAULT_TAG_BITS = 128
+VAULT_PLAINTEXT_MEDIA_TYPE = "application/x-ndjson"
+# Trace id used in vault AAD when provenance has no IR fingerprint.
+VAULT_NULL_IR_SHA256 = "sha256:" + "00" * 32
+# Default cap for decrypted vault plaintext (uncompressed NDJSON bytes).
+DEFAULT_MAX_VAULT_BYTES = 64 * 1024 * 1024
 
 # Deterministic ZIP profile (matches the Phase 0 fixture assembly).
 ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
@@ -98,6 +129,20 @@ _MAX_METHOD_LEN = 16
 _MAX_CATEGORY_LEN = 64
 _MIN_SECRET_LEN = 8
 _MAX_MASK_PASSES = 8
+
+
+def policy_refs_for(policies: Any) -> dict[str, str]:
+    """Opaque policy refs in IR declaration order (``p-1``, ``p-2``, ...).
+
+    Single rule shared by the recorder (cleartext graph/ledger refs) and
+    taped replay (resolving vault ``policy_ref`` evidence back to policy
+    ids). Policies are spec objects with an ``id`` attribute."""
+    refs: dict[str, str] = {}
+    for index, policy in enumerate(policies or (), 1):
+        policy_id = getattr(policy, "id", None)
+        if isinstance(policy_id, str) and policy_id not in refs:
+            refs[policy_id] = f"p-{index}"
+    return refs
 
 
 class TraceError(Exception):
@@ -134,6 +179,26 @@ class HostProvenance:
 
 
 @dataclass(frozen=True)
+class VaultCapture:
+    """Which private evidence a ``replay``-profile recorder retains.
+
+    The vault is encrypted with the host passphrase, but capture is still
+    conservative: credentials never enter the vault (taped replay never
+    calls the provider), transport headers are dropped, unregistered
+    absolute paths degrade to opaque refs, and reasoning text requires an
+    explicit opt-in.
+    """
+
+    include_model_messages: bool = True
+    include_tool_results: bool = True
+    include_stage_snapshots: bool = True
+    include_transition_policy: bool = True
+    include_reasoning: bool = False
+    include_ir: bool = True
+    max_vault_bytes: int = DEFAULT_MAX_VAULT_BYTES
+
+
+@dataclass(frozen=True)
 class TraceConfig:
     """Immutable per-run trace configuration owned by the host.
 
@@ -145,6 +210,11 @@ class TraceConfig:
     profile: str = "audit"
     provenance: HostProvenance = field(default_factory=HostProvenance)
     model: ModelDescriptor | None = None
+    # Replay-vault passphrase (Phase 4). Required for ``profile="replay"``
+    # and rejected for ``audit``. Held in memory only, never serialized.
+    # Demo hosts source this from ``env:VAR`` / ``file:PATH`` / ``prompt``.
+    vault_passphrase: str | bytes | None = None
+    vault_capture: VaultCapture = field(default_factory=VaultCapture)
     # alias (e.g. "$workspace") -> local root the alias stands for.
     path_aliases: Mapping[str, str | Path] = field(default_factory=_empty_alias_map)
     # Aliases whose alias-relative segments may appear in cleartext. Any
@@ -388,6 +458,13 @@ def _scan_strings(node: Any, pointer: str, registry: _SecretRegistry) -> list[_F
     findings: list[_Finding] = []
     for child_pointer, key, value in _iter_strings(node, pointer):
         if key is not None and key in _PROHIBITED_KEYS:
+            # An already-markered value is neutralized: the key name alone
+            # (declared in the workflow's public writes schema) is not a
+            # leak. Reporting it would loop the mask passes until the whole
+            # record is omitted — dropping milestone events taped replay
+            # needs for path comparison. Raw values stay reportable below.
+            if _is_redaction_marker(_node_at_pointer(node, child_pointer)):
+                continue
             findings.append(_Finding(rule="prohibited_field", pointer=child_pointer))
             continue
         if value is None:
@@ -650,6 +727,278 @@ def _validate_autoresearch_payload(payload: Mapping[str, Any]) -> dict[str, Any]
 
 
 # ---------------------------------------------------------------------------
+# Phase 4 replay-vault helpers (passphrase, scrubbing, codec)
+# ---------------------------------------------------------------------------
+
+
+def _normalize_passphrase(value: str | bytes | None) -> bytes | None:
+    """Normalize a vault passphrase to NFC UTF-8 bytes (spike §1)."""
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        try:
+            text = value.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            msg = "vault passphrase must be valid UTF-8"
+            raise TraceError(msg) from exc
+    else:
+        text = value
+    if not text:
+        return None
+    return unicodedata.normalize("NFC", text).encode("utf-8")
+
+
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(value: str, *, what: str, expected: int | None = None) -> bytes:
+    try:
+        raw = base64.urlsafe_b64decode(value + "=" * ((4 - len(value) % 4) % 4))
+    except (ValueError, binascii.Error) as exc:
+        msg = f"vault metadata has invalid base64url for {what}"
+        raise TraceError(msg) from exc
+    if expected is not None and len(raw) != expected:
+        msg = f"vault metadata has invalid length for {what}"
+        raise TraceError(msg)
+    return raw
+
+
+def _to_jsonable(value: Any, *, _depth: int = 0) -> Any:
+    """Convert runtime values to JCS-safe plain JSON.
+
+    Mappings/sequences/dataclasses become plain dicts/lists; sets and
+    frozensets become sorted lists; Paths/UUIDs/datetimes become strings;
+    bytes become UTF-8 (replacement) strings; Enums become values.
+    Rejects NaN/infinity and unsafe integers like the public ledger does.
+    """
+    if _depth > 64:
+        msg = "vault value exceeds nesting depth"
+        raise TraceError(msg)
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        if not MIN_SAFE_INT <= value <= MAX_SAFE_INT:
+            msg = f"vault value has unsafe integer {value!r}"
+            raise TraceError(msg)
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            msg = "vault value has non-finite number"
+            raise TraceError(msg)
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", errors="replace")
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, datetime):
+        return format_timestamp(value)
+    if isinstance(value, uuid.UUID):
+        return value.hex
+    if isinstance(value, Enum):
+        return _to_jsonable(value.value, _depth=_depth + 1)
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {
+            f.name: _to_jsonable(getattr(value, f.name), _depth=_depth + 1)
+            for f in dataclasses.fields(value)
+        }
+    if isinstance(value, Mapping):
+        mapping = cast("Mapping[Any, Any]", value)
+        items: dict[str, Any] = {}
+        for raw_key, raw_item in mapping.items():
+            name = raw_key
+            items[str(name) if not isinstance(name, str) else name] = _to_jsonable(
+                raw_item, _depth=_depth + 1
+            )
+        return items
+    if isinstance(value, (set, frozenset)):
+        members = cast("Any", value)
+        return sorted(
+            (_to_jsonable(item, _depth=_depth + 1) for item in members),
+            key=lambda v: json.dumps(v, sort_keys=True, default=str),
+        )
+    if isinstance(value, (list, tuple)):
+        sequence = cast("Any", value)
+        return [_to_jsonable(item, _depth=_depth + 1) for item in sequence]
+    # Last resort for opaque objects: never str()/repr() provider clients or
+    # credentials — reject instead of guessing.
+    msg = f"vault value of type {type(value).__name__} is not serializable"
+    raise TraceError(msg)
+
+
+# Vault-excluded mapping keys (case-insensitive): transport credentials and
+# provider options that taped replay never needs. Values become opaque
+# credential markers instead of blocking finalization.
+_VAULT_CREDENTIAL_KEYS = frozenset(
+    {
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "set-cookie",
+        "api_key",
+        "api-key",
+        "apikey",
+        "access_token",
+        "refresh_token",
+        "client_secret",
+        "extra_headers",
+        "default_headers",
+        "headers",
+    }
+)
+
+_VAULT_RECORD_TYPES = frozenset(
+    {
+        "run_inputs",
+        "stage_snapshot",
+        "model_request",
+        "model_response",
+        "tool_result",
+        "transition_evaluation",
+        "policy_evaluation",
+        "private_fields",
+        "full_workflow_ir",
+        "annotation_private_fields",
+    }
+)
+
+
+def _node_at_pointer(node: Any, pointer: str) -> Any:
+    """Return the value at an RFC 6901 pointer, or None when absent."""
+    if pointer in ("", "/"):
+        return node
+    current = node
+    for part in pointer.split("/")[1:]:
+        key = part.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, Mapping):
+            branch = cast("Any", current)
+            if key not in branch:
+                return None
+            current = branch[key]
+        elif isinstance(current, list):
+            sequence = cast("Any", current)
+            if not key.isdigit() or int(key) >= len(sequence):
+                return None
+            current = sequence[int(key)]
+        else:
+            return None
+    return current
+
+
+def _is_redaction_marker(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    if not isinstance(value, dict):
+        return False
+    branch = cast("dict[Any, Any]", value)
+    return isinstance(branch.get("$redacted"), Mapping)
+
+
+def _parse_ledger_line(line: bytes) -> Any:
+    """Parse one ledger line, returning None when it is not valid JSON."""
+    try:
+        return parse_json_strict(line.decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _vault_meta_object(
+    *,
+    salt: bytes,
+    nonce: bytes,
+    aad_dict: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "format": VAULT_META_FORMAT,
+        "codec": VAULT_CODEC,
+        "passphrase": {"encoding": "UTF-8", "normalization": "NFC"},
+        "kdf": {
+            "name": VAULT_KDF_NAME,
+            "iterations": VAULT_KDF_ITERATIONS,
+            "salt_base64url": _b64url_encode(salt),
+            "derived_key_bits": VAULT_DERIVED_KEY_BITS,
+        },
+        "cipher": {
+            "name": "AES-256-GCM",
+            "nonce_base64url": _b64url_encode(nonce),
+            "tag_length_bits": VAULT_TAG_BITS,
+            "tag_placement": "ciphertext_suffix",
+        },
+        "plaintext": {
+            "media_type": VAULT_PLAINTEXT_MEDIA_TYPE,
+            "encoding": "UTF-8",
+            "compression": "none",
+        },
+        "aad": aad_dict,
+    }
+
+
+def _vault_primitives() -> tuple[Any, Any]:
+    """Return ``(AESGCM, InvalidTag)`` from the optional ``trace`` extra."""
+    try:
+        from cryptography.exceptions import InvalidTag  # noqa: PLC0415
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa: PLC0415
+    except ImportError as exc:
+        msg = (
+            "trace profile 'replay' requires the optional 'trace' extra "
+            "(pip install 'nemoir-runtime[trace]'): " + str(exc)
+        )
+        raise TraceError(msg) from exc
+    return AESGCM, InvalidTag
+
+
+def _derive_vault_key(passphrase: bytes, salt: bytes) -> bytes:
+    return hashlib.pbkdf2_hmac(
+        "sha256", passphrase, salt, VAULT_KDF_ITERATIONS, dklen=32
+    )
+
+
+def encrypt_vault_records(
+    plaintext: bytes,
+    passphrase: bytes,
+    aad: bytes,
+    *,
+    salt: bytes | None = None,
+    nonce: bytes | None = None,
+) -> tuple[bytes, bytes, bytes]:
+    """Seal vault plaintext; returns ``(salt, nonce, ciphertext+tag)``."""
+    aes_gcm_cls, _ = _vault_primitives()
+    salt = salt if salt is not None else os.urandom(VAULT_SALT_BYTES)
+    nonce = nonce if nonce is not None else os.urandom(VAULT_NONCE_BYTES)
+    if len(salt) != VAULT_SALT_BYTES or len(nonce) != VAULT_NONCE_BYTES:
+        msg = "vault salt/nonce have invalid length"
+        raise TraceError(msg)
+    key = _derive_vault_key(passphrase, salt)
+    return salt, nonce, aes_gcm_cls(key).encrypt(nonce, plaintext, aad)
+
+
+def decrypt_vault_records(
+    sealed: bytes,
+    passphrase: bytes,
+    aad: bytes,
+    *,
+    salt: bytes,
+    nonce: bytes,
+) -> bytes:
+    """Open vault ciphertext; fails closed with a generic error."""
+    aes_gcm_cls, invalid_tag = _vault_primitives()
+    if len(salt) != VAULT_SALT_BYTES or len(nonce) != VAULT_NONCE_BYTES:
+        msg = "vault unlock failed"
+        raise TraceError(msg)
+    if len(sealed) < 16:
+        msg = "vault unlock failed"
+        raise TraceError(msg)
+    key = _derive_vault_key(passphrase, salt)
+    try:
+        return aes_gcm_cls(key).decrypt(nonce, sealed, aad)
+    except invalid_tag as exc:
+        # Wrong passphrase and modified ciphertext/AAD are
+        # indistinguishable by design; never report which one failed.
+        msg = "vault unlock failed"
+        raise TraceError(msg) from exc
+
+
+# ---------------------------------------------------------------------------
 # Provenance resource loading (generated packages)
 # ---------------------------------------------------------------------------
 
@@ -745,18 +1094,38 @@ def safe_model_descriptor(model: Any) -> ModelDescriptor | None:
 # ---------------------------------------------------------------------------
 
 
+def _vault_record_shape_error(record: Any) -> str | None:
+    """Return a shape violation for a vault record, or None when valid."""
+    if not isinstance(record, dict):
+        return "vault record must be an object"
+    entry = cast("dict[Any, Any]", record)
+    if not re.fullmatch(r"v-[1-9][0-9]*", str(entry.get("record_id", ""))):
+        return f"vault record has invalid record_id {entry.get('record_id')!r}"
+    if entry.get("record_type") not in _VAULT_RECORD_TYPES:
+        return f"vault record has invalid record_type {entry.get('record_type')!r}"
+    return None
+
+
 class TraceRecorder:
     """Redacted audit recorder for one run. See module docstring for the
     security model. Obtain via :meth:`create`; exactly one ``begin_run`` then
     at most one ``finish_run`` per instance."""
 
     def __init__(self, config: TraceConfig) -> None:
-        if config.profile != "audit":
+        if config.profile not in ("audit", "replay"):
             msg = (
-                f"unsupported trace profile '{config.profile}': Phase 1 supports "
-                f"only 'audit' (replay arrives in Phase 4, publication in Phase 5)"
+                f"unsupported trace profile '{config.profile}': expected "
+                f"'audit' or 'replay' (publication arrives in Phase 5)"
             )
             raise TraceError(msg)
+        self._vault_enabled = config.profile == "replay"
+        if self._vault_enabled and config.vault_passphrase in (None, "", b""):
+            msg = "trace profile 'replay' requires vault_passphrase"
+            raise TraceError(msg)
+        if not self._vault_enabled and config.vault_passphrase not in (None, "", b""):
+            msg = "vault_passphrase requires trace profile 'replay'"
+            raise TraceError(msg)
+        self._vault_passphrase = _normalize_passphrase(config.vault_passphrase)
         self._config = config
         self._registry = _SecretRegistry(config.secrets)
         self._clock = config.clock or (lambda: datetime.now(tz=UTC))
@@ -784,6 +1153,15 @@ class TraceRecorder:
         self._events: list[dict[str, Any]] = []
         self._pending_visits: dict[str, list[str]] = {}
         self._pending_models: dict[str, list[str]] = {}
+        # Last model-call id bound to a ledger record in each visit. A retry
+        # emitted after model_completed consumed the pending id reuses this
+        # instead of synthesizing a dangling id with no vault evidence.
+        self._last_model_id: dict[str, str] = {}
+        # Optional taped policy outcomes for replay (see replay.py). Maps a
+        # policy id to its recorded outcomes in capture order; consumed
+        # FIFO by the runtime instead of re-evaluating expressions against
+        # scrubbed fixture args. None (default) means live evaluation.
+        self.policy_tape: dict[str, list[str]] | None = None
         self._pending_tools: dict[str, list[str]] = {}
         self._open_tools: dict[str, list[str]] = {}
         self._current_visit: str | None = None
@@ -798,6 +1176,11 @@ class TraceRecorder:
         self._tool_result_types: dict[str, str] = {}
         self._tool_errors: dict[str, tuple[str, str]] = {}
         self._transition_evidence: list[dict[str, Any]] = []
+        # Phase 4 vault state (populated only when profile == "replay").
+        self._open_tool_calls: dict[str, dict[str, Any]] = {}
+        self._vault_records: list[dict[str, Any]] = []
+        self._vault_count = 0
+        self._pending_transitions: dict[str, list[dict[str, Any]]] = {}
         self._visit_count = 0
         self._model_count = 0
         self._tool_count = 0
@@ -808,6 +1191,28 @@ class TraceRecorder:
         self._event_limit_exceeded = False
 
     # -- construction ----------------------------------------------------
+
+    @property
+    def vault_enabled(self) -> bool:
+        """True when this recorder captures an encrypted replay vault."""
+        return self._vault_enabled
+
+    def consume_taped_policy(self, policy_id: Any) -> str | None:
+        """Pop the next recorded outcome for a deny-policy check, if taped.
+
+        Taped replay sets :attr:`policy_tape` so the runtime reproduces
+        recorded allow/deny outcomes instead of re-evaluating expressions
+        against scrubbed fixture arguments (which would wrongly deny
+        path-scoped policies). Returns ``"allowed"``/``"denied"`` or
+        None when no tape covers this check (live evaluation proceeds).
+        """
+        tape = self.policy_tape
+        if tape is None or not isinstance(policy_id, str):
+            return None
+        queue = tape.get(policy_id)
+        if not queue:
+            return None
+        return queue.pop(0)
 
     @classmethod
     def create(
@@ -825,6 +1230,8 @@ class TraceRecorder:
         clock: Callable[[], datetime] | None = None,
         on_stage_completed: Callable[[Mapping[str, Any]], Mapping[str, Any] | None]
         | None = None,
+        vault_passphrase: str | bytes | None = None,
+        vault_capture: VaultCapture | None = None,
     ) -> TraceRecorder:
         """Create a recorder for one run writing to ``path`` on finish."""
         return cls(
@@ -840,6 +1247,8 @@ class TraceRecorder:
                 trace_id=trace_id,
                 clock=clock,
                 on_stage_completed=on_stage_completed,
+                vault_passphrase=vault_passphrase,
+                vault_capture=vault_capture or VaultCapture(),
             )
         )
 
@@ -872,10 +1281,7 @@ class TraceRecorder:
         self._begun = True
         self._begin_time = self._clock()
         self._manifest = manifest
-        for index, policy in enumerate(getattr(manifest, "policies", ()) or (), 1):
-            policy_id = getattr(policy, "id", None)
-            if isinstance(policy_id, str) and policy_id not in self._policy_refs:
-                self._policy_refs[policy_id] = f"p-{index}"
+        self._policy_refs = policy_refs_for(getattr(manifest, "policies", ()))
         self._write_partial_marker("in_progress")
 
     def finish_run(self, status: str) -> Path:
@@ -925,17 +1331,71 @@ class TraceRecorder:
         self._pending_models.setdefault(visit, []).append(call_id)
         return call_id
 
+    def record_model_request(
+        self, model_call_id: str, request: Mapping[str, Any] | None
+    ) -> None:
+        """Retain a model request for the encrypted replay vault.
+
+        The public ledger keeps only counts; messages, tool schemas, and
+        output schemas enter the vault (scrubbed) when ``profile='replay'``
+        and are dropped otherwise. Credentials are never retained.
+        """
+        self._require_begun()
+        if not self._vault_enabled or request is None:
+            return
+        capture = self._config.vault_capture
+        if not capture.include_model_messages:
+            return
+        payload = _to_jsonable(dict(request))
+        if not isinstance(payload, dict):
+            msg = "model request must be an object"
+            raise TraceError(msg)
+        scrubbed = self._scrub_vault_value(payload)
+        self._append_vault_record(
+            "model_request",
+            scrubbed,
+            model_call_id=model_call_id,
+            stage_visit_id=self._current_visit,
+        )
+
     def record_model_response(
         self,
         model_call_id: str,
         *,
         response_bytes: int = 0,
         tool_call_count: int = 0,
+        response: Mapping[str, Any] | None = None,
     ) -> None:
-        """Record safe model-response facts (counts only, never text)."""
+        """Record safe model-response facts (counts only, never text).
+
+        When ``profile='replay'`` and ``response`` is supplied, the full
+        content/tool-calls/usage also enter the encrypted vault (reasoning
+        only with an explicit opt-in).
+        """
         self._require_begun()
         self._model_bytes[model_call_id] = max(0, int(response_bytes))
         self._model_tool_calls[model_call_id] = max(0, int(tool_call_count))
+        if not self._vault_enabled or response is None:
+            return
+        capture = self._config.vault_capture
+        if not capture.include_model_messages:
+            return
+        payload = _to_jsonable(dict(response))
+        if not isinstance(payload, dict):
+            msg = "model response must be an object"
+            raise TraceError(msg)
+        model_response = cast("dict[Any, Any]", payload)
+        if not capture.include_reasoning:
+            reasoning = model_response.pop("reasoning", None)
+            if reasoning not in (None, "", [], {}):
+                model_response["reasoning"] = self._new_marker("private_content", reasoning)
+        scrubbed = self._scrub_vault_value(model_response)
+        self._append_vault_record(
+            "model_response",
+            scrubbed,
+            model_call_id=model_call_id,
+            stage_visit_id=self._current_visit,
+        )
 
     def begin_tool_call(
         self,
@@ -951,32 +1411,319 @@ class TraceRecorder:
         self._tool_started_at[call_id] = self._clock()
         return call_id
 
-    def record_tool_result(self, tool_call_id: str, result: Any) -> None:
-        """Note a tool result's safe type facts (the value stays private)."""
+    def record_tool_result(
+        self,
+        tool_call_id: str,
+        result: Any,
+        args: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Note a tool result's safe type facts (the value stays private).
+
+        When ``profile='replay'`` the full args/result also enter the
+        encrypted vault (scrubbed): replay fixtures need real values, but
+        transport credentials and echoed secrets still never enter the vault.
+        """
         self._require_begun()
         self._tool_errors.pop(tool_call_id, None)
         self._tool_result_types[tool_call_id] = _result_type_slug(result)
+        if not self._vault_enabled:
+            return
+        capture = self._config.vault_capture
+        if not capture.include_tool_results:
+            return
+        stashed = self._open_tool_calls.get(tool_call_id, {})
+        effective_args = args if args is not None else stashed.get("args")
+        payload: dict[str, Any] = {"result": _to_jsonable(result)}
+        if effective_args is not None:
+            payload["args"] = _to_jsonable(dict(effective_args))
+        if stashed.get("capability") is not None:
+            payload["capability"] = stashed["capability"]
+        if stashed.get("tool_name") is not None:
+            payload["tool_name"] = stashed["tool_name"]
+        scrubbed = self._scrub_vault_value(payload)
+        if not isinstance(scrubbed, dict):
+            msg = "tool result vault payload must be an object"
+            raise TraceError(msg)
+        self._append_vault_record(
+            "tool_result",
+            scrubbed,
+            tool_call_id=tool_call_id,
+            stage_visit_id=self._current_visit,
+        )
+
+    def record_run_inputs(self, inputs: Mapping[str, Any] | None) -> None:
+        """Retain workflow inputs for the encrypted replay vault."""
+        self._require_begun()
+        if not self._vault_enabled or inputs is None:
+            return
+        payload = _to_jsonable(dict(inputs))
+        scrubbed = self._scrub_vault_value(payload)
+        self._append_vault_record("run_inputs", scrubbed)
+
+    def record_policy_evaluation(
+        self,
+        stage_visit_id: str | None,
+        policy_id: Any,
+        bound: Mapping[str, Any] | None,
+        outcome: str,
+    ) -> None:
+        """Retain policy-evaluation evidence for the encrypted vault.
+
+        ``outcome`` is ``"allowed"`` or ``"denied"``. Bound trigger-arg
+        values are scrubbed (paths aliased, secrets/credentials removed).
+        """
+        self._require_begun()
+        if not self._vault_enabled:
+            return
+        capture = self._config.vault_capture
+        if not capture.include_transition_policy:
+            return
+        if outcome not in ("allowed", "denied"):
+            msg = f"policy evaluation outcome must be allowed/denied, got {outcome!r}"
+            raise TraceError(msg)
+        ref = self._policy_ref(policy_id)
+        payload: dict[str, Any] = {
+            "policy_ref": ref,
+            "outcome": outcome,
+            "bound": self._scrub_vault_value(_to_jsonable(dict(bound or {}))),
+        }
+        if ref is None:
+            payload["policy_ref"] = self._new_marker("private_content", policy_id)
+        self._append_vault_record(
+            "policy_evaluation",
+            payload,
+            stage_visit_id=stage_visit_id or self._current_visit,
+        )
 
     def record_tool_error(self, tool_call_id: str, exc: BaseException) -> None:
         """Capture a tool failure's stable error taxonomy (no message)."""
         self._require_begun()
-        self._tool_errors[tool_call_id] = stable_error(exc)
+        code, type_name = stable_error(exc)
+        self._tool_errors[tool_call_id] = (code, type_name)
+        if not self._vault_enabled:
+            return
+        capture = self._config.vault_capture
+        if not capture.include_tool_results:
+            return
+        try:
+            message = str(exc)[:4000]
+        except Exception:
+            message = ""
+        stashed = self._open_tool_calls.get(tool_call_id, {})
+        payload: dict[str, Any] = {
+            "error": {"code": code, "type": type_name},
+            "message": self._scrub_vault_value(message),
+        }
+        if stashed.get("args") is not None:
+            payload["args"] = self._scrub_vault_value(
+                _to_jsonable(dict(stashed["args"]))
+            )
+        if stashed.get("capability") is not None:
+            payload["capability"] = stashed["capability"]
+        self._append_vault_record(
+            "tool_result",
+            payload,
+            tool_call_id=tool_call_id,
+            stage_visit_id=self._current_visit,
+        )
 
     def record_transition_evaluation(
         self,
         stage_visit_id: str,
         candidates: list[dict[str, Any]],
     ) -> None:
-        """Retain guard-evaluation evidence for future semantic verification.
+        """Retain guard-evaluation evidence for semantic verification.
 
-        Phase 1 keeps this in memory only: the audit ledger publishes the
-        selected transition, while full candidate evidence ships with the
-        Phase 4 vault.
+        The audit ledger publishes only the selected transition. When
+        ``profile='replay'`` the full ordered candidate list (with per-guard
+        match results) enters the encrypted vault, linked to the following
+        ``transition_selected`` ledger sequence for that visit.
         """
         self._require_begun()
+        cleaned: list[dict[str, Any]] = []
+        for raw_candidate in cast("Any", candidates):
+            if not isinstance(raw_candidate, Mapping):
+                msg = "transition candidate must be an object"
+                raise TraceError(msg)
+            candidate_mapping = cast("dict[Any, Any]", raw_candidate)
+            to = candidate_mapping.get("to")
+            if not isinstance(to, str):
+                msg = "transition candidate requires a string 'to'"
+                raise TraceError(msg)
+            cleaned.append(
+                {
+                    "to": to,
+                    "priority": max(0, int(candidate_mapping.get("priority", 0) or 0)),
+                    "reason": candidate_mapping.get("reason", "other"),
+                    "matched": bool(candidate_mapping.get("matched", False)),
+                }
+            )
         self._transition_evidence.append(
-            {"stage_visit_id": stage_visit_id, "candidates": list(candidates)}
+            {"stage_visit_id": stage_visit_id, "candidates": cleaned}
         )
+        if not self._vault_enabled:
+            return
+        capture = self._config.vault_capture
+        if not capture.include_transition_policy:
+            return
+        pending = self._pending_transitions.setdefault(stage_visit_id, [])
+        pending.append({"candidates": cleaned})
+
+    # -- replay-vault capture ------------------------------------------
+
+    def _append_vault_record(
+        self,
+        record_type: str,
+        payload: Any,
+        *,
+        event_sequence: int | None = None,
+        stage_visit_id: str | None = None,
+        model_call_id: str | None = None,
+        tool_call_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Append one supplemental vault record (capture order is stable)."""
+        if record_type not in _VAULT_RECORD_TYPES:
+            msg = f"unknown vault record type {record_type!r}"
+            raise TraceError(msg)
+        self._vault_count += 1
+        record: dict[str, Any] = {
+            "record_id": f"v-{self._vault_count}",
+            "record_type": record_type,
+            "payload": payload,
+        }
+        if event_sequence is not None:
+            record["event_sequence"] = event_sequence
+        if stage_visit_id is not None:
+            record["stage_visit_id"] = stage_visit_id
+        if model_call_id is not None:
+            record["model_call_id"] = model_call_id
+        if tool_call_id is not None:
+            record["tool_call_id"] = tool_call_id
+        self._vault_records.append(record)
+        return record
+
+    def _scrub_vault_value(self, value: Any) -> Any:
+        """Scrub a vault-bound value before it reaches vault plaintext.
+
+        Drops transport credentials (headers/auth/api keys) to opaque
+        markers, masks registered-secret echoes, and degrades unregistered
+        absolute paths to opaque refs. Unlike cleartext projection this
+        never omits the enclosing record: a credential-bearing tool result
+        becomes a marker payload so replay fails closed with a clear
+        fixture error instead of silently shifting fixture order.
+        """
+        scrubbed = self._scrub_vault_node(value)
+        wrapper: dict[str, Any] = {"v": scrubbed}
+        for _ in range(_MAX_MASK_PASSES):
+            hits = [
+                f
+                for f in _scan_strings(wrapper, "", self._registry)
+                if f.rule == "registered_secret"
+            ]
+            if not hits:
+                break
+            pointer = hits[0].pointer
+            self._set_marker(wrapper, pointer, "credential")
+        else:
+            wrapper["v"] = self._new_marker("credential", wrapper.get("v"))
+        for _ in range(_MAX_MASK_PASSES):
+            findings = [
+                f
+                for f in _scan_strings(wrapper, "", self._registry)
+                if f.rule != "registered_secret"
+                and not self._vault_finding_excused(wrapper, f)
+            ]
+            if not findings:
+                break
+            finding = findings[0]
+            if finding.rule in _CREDENTIAL_RULES:
+                reason = "credential"
+            elif finding.rule == "home_path":
+                reason = "absolute_path"
+            else:
+                reason = "unapproved_field"
+            self._set_marker(wrapper, finding.pointer, reason)
+        else:
+            wrapper["v"] = self._new_marker("credential", wrapper.get("v"))
+        wrapper.pop("_omit", None)
+        return wrapper["v"]
+
+    def _vault_finding_excused(self, record: dict[str, Any], finding: Any) -> bool:
+        """Whether a scanner finding needs no action in vault plaintext.
+
+        Already-markered values are resolved. ``prohibited_field`` findings
+        for non-credential keys (``reasoning`` with opt-in capture,
+        ``stdout``/``stderr`` tool evidence, ...) are legal vault contents:
+        the cleartext key policy does not apply inside the encrypted vault,
+        and secret/credential patterns are still enforced separately.
+        """
+        if _is_redaction_marker(_node_at_pointer(record, finding.pointer)):
+            return True
+        if finding.rule == "prohibited_field":
+            key = finding.pointer.rsplit("/", 1)[-1].replace("~1", "/").replace(
+                "~0", "~"
+            )
+            return key.lower() not in _VAULT_CREDENTIAL_KEYS
+        return False
+
+    def _scrub_vault_node(self, value: Any) -> Any:
+        if isinstance(value, Mapping):
+            mapping = cast("Mapping[Any, Any]", value)
+            items: dict[str, Any] = {}
+            for raw_key, raw_item in mapping.items():
+                node_key = raw_key
+                lowered = node_key.lower() if isinstance(node_key, str) else ""
+                if lowered in _VAULT_CREDENTIAL_KEYS:
+                    items[node_key] = self._new_marker("credential", raw_item)
+                else:
+                    items[node_key] = self._scrub_vault_node(raw_item)
+            return items
+        if isinstance(value, list):
+            sequence = cast("Any", value)
+            return [self._scrub_vault_node(item) for item in sequence]
+        if isinstance(value, tuple):
+            pair = cast("Any", value)
+            return [self._scrub_vault_node(item) for item in pair]
+        if isinstance(value, str):
+            return self._scrub_vault_text(value)
+        return value
+
+    def _scrub_vault_text(self, text: str) -> Any:
+        """Alias registered paths; degrade unregistered absolutes to refs."""
+        candidate: Path | None = None
+        try:
+            candidate = Path(text).expanduser()
+            if not candidate.is_absolute():
+                candidate = Path.cwd() / candidate
+            candidate = candidate.resolve(strict=False)
+        except OSError:
+            candidate = None
+        if candidate is not None:
+            for alias, root in self._roots:
+                try:
+                    relative = candidate.relative_to(root)
+                except ValueError:
+                    continue
+                if alias in self._config.safe_path_aliases:
+                    return f"{alias}/{relative.as_posix()}"
+                ref = self._path_refs.get(str(candidate))
+                if ref is None:
+                    self._path_ref_count += 1
+                    ref = f"path-{self._path_ref_count}"
+                    self._path_refs[str(candidate)] = ref
+                return ref
+            if candidate.is_absolute() and str(candidate) != text:
+                # A bare filename that resolves under cwd is not a path
+                # leak; keep the original text.
+                pass
+            elif len(text) > 1 and Path(text).is_absolute():
+                ref = self._path_refs.get(text)
+                if ref is None:
+                    self._path_ref_count += 1
+                    ref = f"path-{self._path_ref_count}"
+                    self._path_refs[text] = ref
+                return ref
+        return text
 
     def record_annotation(
         self,
@@ -1128,8 +1875,59 @@ class TraceRecorder:
         ):
             self._visit_sequences.setdefault(visit_seq, []).append(seq_num)
         if record.get("kind") == "stage_completed":
+            self._capture_stage_snapshot(record, event)
             self._maybe_emit_stage_annotation(record, event)
+        if record.get("kind") == "transition_selected":
+            self._flush_transition_evidence(record, event)
         return record
+
+    def _capture_stage_snapshot(
+        self, record: dict[str, Any], event: WorkflowEvent
+    ) -> None:
+        """Retain full stage outputs for the encrypted vault (Phase 4)."""
+        if not self._vault_enabled:
+            return
+        if not self._config.vault_capture.include_stage_snapshots:
+            return
+        try:
+            payload = {
+                "stage_id": event.stage_id or record.get("stage_id"),
+                "output": self._scrub_vault_value(
+                    _to_jsonable(dict(event.output or {}))
+                ),
+            }
+        except TraceError:
+            payload = {
+                "stage_id": event.stage_id or record.get("stage_id"),
+                "output": self._new_marker("private_content", event.output or {}),
+            }
+        seq = getattr(event, "sequence", None)
+        self._append_vault_record(
+            "stage_snapshot",
+            payload,
+            event_sequence=seq if isinstance(seq, int) and seq >= 1 else None,
+            stage_visit_id=record.get("stage_visit_id"),
+        )
+
+    def _flush_transition_evidence(
+        self, record: dict[str, Any], event: WorkflowEvent
+    ) -> None:
+        """Link pending guard evidence to its ledger sequence (Phase 4)."""
+        if not self._vault_enabled:
+            return
+        visit = record.get("stage_visit_id")
+        if not isinstance(visit, str):
+            return
+        pending = self._pending_transitions.pop(visit, [])
+        seq = getattr(event, "sequence", None)
+        seq_num = seq if isinstance(seq, int) and not isinstance(seq, bool) and seq >= 1 else None
+        for item in pending:
+            self._append_vault_record(
+                "transition_evaluation",
+                {"candidates": item["candidates"]},
+                event_sequence=seq_num,
+                stage_visit_id=visit,
+            )
 
     def _maybe_emit_stage_annotation(
         self, record: dict[str, Any], event: WorkflowEvent
@@ -1264,9 +2062,12 @@ class TraceRecorder:
     def _pop_model(self, visit: str) -> str:
         queue = self._pending_models.get(visit)
         if queue:
-            return queue.pop(0)
-        self._model_count += 1
-        return f"m-{self._model_count}"
+            call_id = queue.pop(0)
+        else:
+            self._model_count += 1
+            call_id = f"m-{self._model_count}"
+        self._last_model_id[visit] = call_id
+        return call_id
 
     def _pop_tool(self, visit: str) -> str:
         """Consume the next begun-but-unstarted tool id for a started event."""
@@ -1399,9 +2200,14 @@ class TraceRecorder:
         # The schema requires model_call_id on every model_retry. A retry can
         # legally arrive with no pending call (e.g. models.py emits a
         # tool-error retry after model_completed already consumed the call
-        # id), so synthesize a fresh run-local id rather than emitting a
-        # schema-invalid record. Peek-hit behavior is unchanged.
+        # id). Reuse that consumed id: the retry announces the failure of
+        # the attempt it follows, which already has vault request/response
+        # evidence, so semantic verification stays complete. Synthesize a
+        # fresh id only when the visit has no prior model call at all.
+        # Peek-hit behavior is unchanged.
         call_id = self._peek_model(visit)
+        if call_id is None:
+            call_id = self._last_model_id.get(visit)
         if call_id is None:
             self._model_count += 1
             call_id = f"m-{self._model_count}"
@@ -1419,6 +2225,15 @@ class TraceRecorder:
         visit = self._current_or_new_visit()
         record = self._base(event, stage_visit_id=visit)
         call_id = self._pop_tool(visit)
+        # Stash pre-redaction args + tool name for the vault (Phase 4).
+        # Projection below never mutates ``event.args``.
+        if self._vault_enabled:
+            self._open_tool_calls[call_id] = {
+                "args": event.args,
+                "capability": event.capability,
+                "tool_name": event.tool_name,
+                "stage_visit_id": visit,
+            }
         record["tool_call_id"] = call_id
         capability = event.capability or "unknown"
         record["capability"] = capability
@@ -1780,6 +2595,11 @@ class TraceRecorder:
         for part in parts[:-1]:
             if isinstance(current, dict) and part in current:
                 current = cast("Any", current[part])
+            elif isinstance(current, list) and part.isdigit():
+                sequence = cast("list[Any]", current)
+                if int(part) >= len(sequence):
+                    return
+                current = sequence[int(part)]
             else:
                 return
         last = parts[-1]
@@ -1788,6 +2608,13 @@ class TraceRecorder:
             fields = record.setdefault("redacted_fields", [])
             if pointer not in fields:
                 fields.append(pointer)
+        elif isinstance(current, list) and last.isdigit():
+            sequence = cast("list[Any]", current)
+            if int(last) < len(sequence):
+                sequence[int(last)] = self._new_marker(reason, sequence[int(last)])
+                fields = record.setdefault("redacted_fields", [])
+                if pointer not in fields:
+                    fields.append(pointer)
 
     def _scan_and_mask(self, record: dict[str, Any]) -> bool:
         """Apply the secrets-v1 scanner. Returns True when the record must be
@@ -1847,18 +2674,29 @@ class TraceRecorder:
             provenance["model"] = model_obj
         exit_ids: Any = getattr(manifest, "exit_stage_ids", None)
         exits: list[str] = sorted(exit_ids) if exit_ids else []
-        manifest_obj: dict[str, Any] = {
-            "format": TRACE_FORMAT,
-            "trace_id": self._trace_id,
-            "created_at": format_timestamp(self._begin_time or self._now()),
-            "status": status,
-            "capture": {
+        vault_enabled = self._vault_enabled
+        if vault_enabled:
+            capture: dict[str, Any] = {
+                "profile": "replay",
+                "vault_present": True,
+                "publication_eligible": False,
+                "redaction_policy": REDACTION_POLICY,
+                "scanner": {"status": "passed", "ruleset": SCANNER_RULESET},
+            }
+        else:
+            capture = {
                 "profile": "audit",
                 "vault_present": False,
                 "publication_eligible": False,
                 "redaction_policy": REDACTION_POLICY,
                 "scanner": {"status": "passed", "ruleset": SCANNER_RULESET},
-            },
+            }
+        manifest_obj: dict[str, Any] = {
+            "format": TRACE_FORMAT,
+            "trace_id": self._trace_id,
+            "created_at": format_timestamp(self._begin_time or self._now()),
+            "status": status,
+            "capture": capture,
             "workflow": {
                 "id": workflow_id,
                 "ir_version": getattr(prov, "ir_version", "0.1"),
@@ -1897,11 +2735,15 @@ class TraceRecorder:
             EVENTS_PATH: events_bytes,
             SUMMARY_PATH: to_canonical_bytes(summary_obj),
         }
+        if vault_enabled:
+            self._seal_vault_entries(payloads, manifest_obj)
         integrity_entries = [
             {
                 "path": path,
                 "media_type": (
-                    "application/x-ndjson"
+                    "application/octet-stream"
+                    if path == VAULT_ENC_PATH
+                    else "application/x-ndjson"
                     if path.endswith(".ndjson")
                     else "application/json"
                 ),
@@ -1932,6 +2774,89 @@ class TraceRecorder:
         }
         payloads[INTEGRITY_PATH] = to_canonical_bytes(integrity_obj)
         return payloads
+
+    def _manifest_snapshot_for_vault(self) -> dict[str, Any]:
+        """Capture a replay-grade manifest snapshot for the vault."""
+        try:
+            manifest_dict = _to_jsonable(dataclasses.asdict(self._manifest))
+        except Exception:
+            # dataclasses.asdict fails on exotic field values; fall back to
+            # the reflective converter.
+            manifest_dict = _to_jsonable(self._manifest)
+        if not isinstance(manifest_dict, dict):
+            msg = "workflow manifest snapshot must be an object"
+            raise TraceError(msg)
+        prov = self._config.provenance
+        return {
+            "manifest": manifest_dict,
+            "ir_sha256": prov.ir_sha256,
+            "workflow_id": getattr(self._manifest, "workflow_id", "unknown"),
+        }
+
+    def _seal_vault_entries(
+        self, payloads: dict[str, bytes], manifest_obj: dict[str, Any]
+    ) -> None:
+        """Build, scan, encrypt, and attach vault entries (replay only)."""
+        capture_cfg = self._config.vault_capture
+        if self._vault_passphrase is None:
+            msg = "trace profile 'replay' requires vault_passphrase"
+            raise TraceError(msg)
+        if capture_cfg.include_ir:
+            try:
+                snapshot = self._manifest_snapshot_for_vault()
+            except TraceError as exc:
+                msg = f"cannot snapshot workflow manifest for vault: {exc}"
+                raise TraceError(msg) from exc
+            self._append_vault_record("full_workflow_ir", snapshot)
+        lines: list[bytes] = []
+        for record in self._vault_records:
+            shape_error = _vault_record_shape_error(record)
+            if shape_error is not None:
+                msg = shape_error
+                raise TraceError(msg)
+            lines.append(to_canonical_bytes(record) + b"\n")
+        plaintext = b"".join(lines)
+        if len(plaintext) > capture_cfg.max_vault_bytes:
+            msg = (
+                "vault plaintext exceeds max_vault_bytes "
+                f"({len(plaintext)} > {capture_cfg.max_vault_bytes})"
+            )
+            raise TraceError(msg)
+        # Belt-and-braces: scrubbed vault plaintext must carry no
+        # credential material. Markers are exempt (values already removed).
+        problems: list[str] = []
+        for number, record in enumerate(self._vault_records, 1):
+            for finding in _scan_strings(record, "", self._registry):
+                if self._vault_finding_excused(record, finding):
+                    continue
+                problems.append(f"vault:{number}:{finding.pointer} [{finding.rule}]")
+        if problems:
+            self._remove_partial_marker()
+            detail = "; ".join(problems[:10])
+            msg = (
+                "trace scanner blocked vault finalization with "
+                f"{len(problems)} finding(s): {detail}"
+            )
+            raise TraceError(msg)
+        manifest_bytes = payloads[MANIFEST_PATH]
+        events_bytes = payloads[EVENTS_PATH]
+        graph_bytes = payloads[GRAPH_PATH]
+        aad_dict: dict[str, Any] = {
+            "events_sha256": sha256_tag(events_bytes),
+            "format": VAULT_AAD_FORMAT,
+            "ir_sha256": manifest_obj["workflow"]["ir_sha256"]
+            or VAULT_NULL_IR_SHA256,
+            "manifest_sha256": sha256_tag(manifest_bytes),
+            "trace_id": self._trace_id,
+            "workflow_graph_sha256": sha256_tag(graph_bytes),
+        }
+        aad = to_canonical_bytes(aad_dict)
+        salt, nonce, sealed = encrypt_vault_records(
+            plaintext, self._vault_passphrase, aad
+        )
+        meta_obj = _vault_meta_object(salt=salt, nonce=nonce, aad_dict=aad_dict)
+        payloads[VAULT_ENC_PATH] = sealed
+        payloads[VAULT_META_PATH] = to_canonical_bytes(meta_obj)
 
     def _build_graph(self) -> dict[str, Any]:
         manifest = self._manifest
@@ -1994,6 +2919,10 @@ class TraceRecorder:
         """Block finalization when any cleartext entry leaks (locations only)."""
         problems: list[str] = []
         for path, data in entries.items():
+            if path == VAULT_ENC_PATH:
+                # Ciphertext is pseudorandom; scanning it is meaningless.
+                # Vault plaintext was scanned before encryption.
+                continue
             if path.endswith(".ndjson"):
                 lines = data.split(b"\n")
                 for number, line in enumerate(lines, 1):
@@ -2035,8 +2964,13 @@ class TraceRecorder:
     @staticmethod
     def _zip_info(name: str) -> zipfile.ZipInfo:
         info = zipfile.ZipInfo(filename=name, date_time=ZIP_EPOCH)
-        info.compress_type = zipfile.ZIP_DEFLATED
-        info.compress_level = ZIP_DEFLATE_LEVEL
+        # Ciphertext is incompressible and must not be compressed before
+        # or after encryption (spike §1); everything else is DEFLATE.
+        if name == VAULT_ENC_PATH:
+            info.compress_type = zipfile.ZIP_STORED
+        else:
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.compress_level = ZIP_DEFLATE_LEVEL
         info.create_system = 3
         info.external_attr = ZIP_UNIX_REGULAR << 16
         return info
@@ -2082,6 +3016,22 @@ class NoOpTraceRecorder:
     """Zero-cost recorder used when tracing is disabled. Every hook is a
     no-op; ``observe_workflow_event`` returns None."""
 
+    vault_enabled = False
+    # Taped policy outcomes for replay (same contract as
+    # TraceRecorder.consume_taped_policy). Replay sets this on its own
+    # instance; the class default keeps the shared NO_OP singleton tape-free.
+    policy_tape: dict[str, list[str]] | None = None
+
+    def consume_taped_policy(self, policy_id: Any) -> str | None:
+        """Pop the next recorded outcome for a deny-policy check, if taped."""
+        tape = self.policy_tape
+        if tape is None or not isinstance(policy_id, str):
+            return None
+        queue = tape.get(policy_id)
+        if not queue:
+            return None
+        return queue.pop(0)
+
     def begin_run(self, _manifest: Any) -> None:
         return None
 
@@ -2104,10 +3054,21 @@ class NoOpTraceRecorder:
     ) -> str:
         return ""
 
-    def record_tool_result(self, _tool_call_id: str, _result: Any) -> None:
+    def record_tool_result(self, _tool_call_id: str, _result: Any, **_kwargs: Any) -> None:
         return None
 
     def record_tool_error(self, _tool_call_id: str, _exc: BaseException) -> None:
+        return None
+
+    def record_model_request(self, _model_call_id: str, _request: Any) -> None:
+        return None
+
+    def record_run_inputs(self, _inputs: Any) -> None:
+        return None
+
+    def record_policy_evaluation(
+        self, _stage_visit_id: Any, _policy_id: Any, _bound: Any, _outcome: str
+    ) -> None:
         return None
 
     def record_run_error(self, _exc: BaseException) -> None:
@@ -2205,6 +3166,17 @@ class VerificationReport:
     content_identity: str | None
     warnings: tuple[str, ...]
     errors: tuple[str, ...]
+    # Phase 4 verification levels (plan.md §7.6). ``verify_archive`` fills
+    # integrity/structural/replayability without a passphrase; ``semantic``
+    # is evaluated by :func:`unlock_archive` / taped replay, which hold the
+    # vault evidence. Values: integrity/structural ``passed`` (+ structural
+    # ``passed-with-warnings``) or ``failed``; semantic ``not-evaluated``,
+    # ``passed``, or ``failed``; replayability ``taped-replay`` (vault
+    # present), ``playback-only``, or ``none`` (verification failed).
+    integrity: str = "failed"
+    structural: str = "failed"
+    semantic: str = "not-evaluated"
+    replayability: str = "none"
 
 
 def read_archive_entries(path: str | Path) -> dict[str, bytes]:
@@ -2228,7 +3200,7 @@ def read_archive_entries(path: str | Path) -> dict[str, bytes]:
             if sorted(names) != names or len(set(names)) != len(names):
                 msg = "trace archive entries must be sorted and unique"
                 raise TraceError(msg)
-            allowed = set(AUDIT_ENTRY_PATHS) | {INTEGRITY_PATH}
+            allowed = set(AUDIT_ENTRY_PATHS) | set(VAULT_ENTRY_PATHS) | {INTEGRITY_PATH}
             unknown = [n for n in names if n not in allowed]
             if unknown:
                 msg = f"trace archive has unexpected entries: {unknown}"
@@ -2239,9 +3211,13 @@ def read_archive_entries(path: str | Path) -> dict[str, bytes]:
                 if info.is_dir():
                     msg = f"trace archive must not contain directories: {info.filename}"
                     raise TraceError(msg)
-                # Phase 1 audit entries are always DEFLATE; STORE members
-                # are rejected (the Phase 4 vault is the only STORE entry).
-                if info.compress_type != zipfile.ZIP_DEFLATED:
+                # JSON/NDJSON entries are always DEFLATE; only the Phase 4
+                # vault ciphertext is STORE (it is already pseudorandom).
+                if info.filename == VAULT_ENC_PATH:
+                    if info.compress_type != zipfile.ZIP_STORED:
+                        msg = f"trace archive entry {info.filename} must use STORE"
+                        raise TraceError(msg)
+                elif info.compress_type != zipfile.ZIP_DEFLATED:
                     msg = f"trace archive entry {info.filename} must use DEFLATE"
                     raise TraceError(msg)
                 if info.file_size > LIMIT_UNCOMPRESSED_ENTRY_BYTES:
@@ -2677,18 +3653,434 @@ def verify_archive(path: str | Path) -> VerificationReport:
     except Exception as exc:
         errors.append(f"event validation failed: {exc}")
     _ = manifest_ok
+    # -- Phase 4: capture/vault consistency (errors) ----------------------
+    vault_present = False
+    capture_profile = cast("Any", None)
+    if isinstance(manifest, dict):
+        manifest_branch = cast("dict[Any, Any]", manifest)
+        cap = manifest_branch.get("capture")
+        if isinstance(cap, dict):
+            capture_branch = cast("Any", cap)
+            vault_present = capture_branch.get("vault_present") is True
+            capture_profile = capture_branch.get("profile")
+    has_vault_enc = VAULT_ENC_PATH in entries
+    has_vault_meta = VAULT_META_PATH in entries
+    if has_vault_enc != has_vault_meta:
+        errors.append("vault entries must co-occur: private/vault.enc + private/vault.meta.json")
+    has_vault = has_vault_enc and has_vault_meta
+    if vault_present and not has_vault:
+        errors.append("manifest capture declares vault_present but vault entries are missing")
+    if has_vault and not vault_present:
+        errors.append("vault entries present but manifest capture has vault_present=false")
+    if capture_profile == "replay" and not vault_present:
+        errors.append("replay profile requires vault_present=true")
+    if capture_profile == "publication" and has_vault:
+        errors.append("publication profile forbids a vault")
+    if capture_profile not in ("audit", "replay", "publication"):
+        errors.append(f"manifest capture has invalid profile {capture_profile!r}")
+    # -- Phase 4: structural path-shape check (warnings, never silent) ----
+    structural_notes: list[str] = []
+    try:
+        graph_branch = cast("Any", graph)
+        graph_nodes = cast(
+            "Any", graph_branch.get("nodes") if isinstance(graph, dict) else None
+        )
+        if isinstance(graph_nodes, list):
+            node_ids: set[Any] = set()
+            for node_entry in cast("Any", graph_nodes):
+                node = node_entry
+                if isinstance(node, dict):
+                    node_ids.add(cast("dict[Any, Any]", node).get("id"))
+            edges: set[Any] = set()
+            graph_transitions = graph_branch.get("transitions", [])
+            if isinstance(graph_transitions, list):
+                for transition_entry in cast("Any", graph_transitions):
+                    transition = transition_entry
+                    if isinstance(transition, dict):
+                        transition_mapping = cast("dict[Any, Any]", transition)
+                        edges.add(
+                            (transition_mapping.get("from"), transition_mapping.get("to"))
+                        )
+            unknown_stages: set[Any] = set()
+            bad_edges: set[Any] = set()
+            for line in event_lines:
+                ledger_event = _parse_ledger_line(line)
+                if ledger_event is None or not isinstance(ledger_event, dict):
+                    continue
+                ledger = cast("Any", ledger_event)
+                kind = ledger.get("kind")
+                if kind == "stage_started":
+                    stage_name = ledger.get("stage_id")
+                    if isinstance(stage_name, str) and stage_name not in node_ids:
+                        unknown_stages.add(stage_name)
+                if kind == "transition_selected":
+                    edge = (ledger.get("stage_id"), ledger.get("transition_to"))
+                    if edge not in edges:
+                        bad_edges.add(edge)
+            for stage in sorted(unknown_stages)[:10]:
+                structural_notes.append(
+                    f"ledger references stage {stage!r} absent from workflow graph"
+                )
+            if len(unknown_stages) > 10:
+                structural_notes.append(
+                    f"... and {len(unknown_stages) - 10} more unknown stages"
+                )
+            for edge in sorted(bad_edges, key=str)[:10]:
+                structural_notes.append(
+                    f"ledger transition {edge[0]!r}->{edge[1]!r} absent from workflow graph"
+                )
+            if len(bad_edges) > 10:
+                structural_notes.append(
+                    f"... and {len(bad_edges) - 10} more unknown transitions"
+                )
+    except Exception as exc:
+        structural_notes.append(f"structural check skipped: {exc}")
+    warnings.extend(structural_notes)
+    # -- Phase 4: level summary -------------------------------------------
+    integrity_markers = (
+        "hash mismatch",
+        "length mismatch",
+        "content identity",
+        "missing from integrity",
+        "integrity index",
+        "integrity.json",
+        "integrity contains",
+        "missing required entry",
+        "unparsable",
+    )
+    integrity_failed = any(m in e for e in errors for m in integrity_markers)
+    ledger_markers = ("events.ndjson", "workflow graph", "manifest")
+    ledger_failed = any(m in e for e in errors for m in ledger_markers)
+    integrity_level = "failed" if integrity_failed else "passed"
+    if ledger_failed:
+        structural_level = "failed"
+    elif structural_notes:
+        structural_level = "passed-with-warnings"
+    else:
+        structural_level = "passed"
+    ok = not errors
+    if ok and has_vault:
+        replayability = "taped-replay"
+    elif ok:
+        replayability = "playback-only"
+    else:
+        replayability = "none"
     return VerificationReport(
-        ok=not errors,
-        content_identity=content_identity if not errors else None,
+        ok=ok,
+        content_identity=content_identity if ok else None,
         warnings=tuple(warnings),
         errors=tuple(errors),
+        integrity=integrity_level,
+        structural=structural_level,
+        semantic="not-evaluated",
+        replayability=replayability,
     )
+
+
+def _check_vault_meta(meta: Any) -> dict[str, Any]:
+    """Validate vault metadata shape and frozen codec parameters."""
+    if not isinstance(meta, dict):
+        msg = "vault metadata must be an object"
+        raise TraceError(msg)
+    descriptor = cast("dict[Any, Any]", meta)
+    if descriptor.get("format") != VAULT_META_FORMAT:
+        msg = "vault metadata format mismatch"
+        raise TraceError(msg)
+    if descriptor.get("codec") != VAULT_CODEC:
+        msg = "vault uses an unsupported codec"
+        raise TraceError(msg)
+    passphrase = cast("Any", descriptor.get("passphrase"))
+    if not isinstance(passphrase, dict):
+        msg = "vault metadata passphrase descriptor invalid"
+        raise TraceError(msg)
+    passphrase_format = cast("dict[Any, Any]", passphrase)
+    if passphrase_format.get("encoding") != "UTF-8":
+        msg = "vault metadata passphrase descriptor invalid"
+        raise TraceError(msg)
+    passphrase_descriptor = cast("dict[Any, Any]", passphrase)
+    if passphrase_descriptor.get("normalization") != "NFC":
+        msg = "vault metadata passphrase descriptor invalid"
+        raise TraceError(msg)
+    kdf = cast("Any", descriptor.get("kdf"))
+    if not isinstance(kdf, dict):
+        msg = "vault uses an unsupported KDF"
+        raise TraceError(msg)
+    kdf_name = cast("dict[Any, Any]", kdf)
+    if kdf_name.get("name") != VAULT_KDF_NAME:
+        msg = "vault uses an unsupported KDF"
+        raise TraceError(msg)
+    kdf_descriptor = cast("dict[Any, Any]", kdf)
+    if kdf_descriptor.get("iterations") != VAULT_KDF_ITERATIONS:
+        # A lower work factor must never appear conformant (spike §1).
+        msg = "vault uses an unsupported KDF"
+        raise TraceError(msg)
+    if kdf_descriptor.get("derived_key_bits") != VAULT_DERIVED_KEY_BITS:
+        msg = "vault uses an unsupported KDF"
+        raise TraceError(msg)
+    cipher = cast("Any", descriptor.get("cipher"))
+    if not isinstance(cipher, dict):
+        msg = "vault uses an unsupported cipher"
+        raise TraceError(msg)
+    cipher_name = cast("dict[Any, Any]", cipher)
+    if cipher_name.get("name") != "AES-256-GCM":
+        msg = "vault uses an unsupported cipher"
+        raise TraceError(msg)
+    cipher_descriptor = cast("dict[Any, Any]", cipher)
+    if cipher_descriptor.get("tag_length_bits") != VAULT_TAG_BITS:
+        msg = "vault uses an unsupported cipher"
+        raise TraceError(msg)
+    if cipher_descriptor.get("tag_placement") != "ciphertext_suffix":
+        msg = "vault uses an unsupported cipher"
+        raise TraceError(msg)
+    plaintext = cast("Any", descriptor.get("plaintext"))
+    if not isinstance(plaintext, dict):
+        msg = "vault metadata plaintext descriptor invalid"
+        raise TraceError(msg)
+    plaintext_descriptor = cast("dict[Any, Any]", plaintext)
+    if (
+        plaintext_descriptor.get("media_type") != VAULT_PLAINTEXT_MEDIA_TYPE
+        or plaintext_descriptor.get("encoding") != "UTF-8"
+        or plaintext_descriptor.get("compression") != "none"
+    ):
+        msg = "vault metadata plaintext descriptor invalid"
+        raise TraceError(msg)
+    aad = cast("Any", descriptor.get("aad"))
+    if not isinstance(aad, dict):
+        msg = "vault metadata AAD descriptor invalid"
+        raise TraceError(msg)
+    aad_format = cast("dict[Any, Any]", aad)
+    if aad_format.get("format") != VAULT_AAD_FORMAT:
+        msg = "vault metadata AAD descriptor invalid"
+        raise TraceError(msg)
+    aad_descriptor = cast("dict[Any, Any]", aad)
+    for aad_name in (
+        "trace_id",
+        "ir_sha256",
+        "manifest_sha256",
+        "events_sha256",
+        "workflow_graph_sha256",
+    ):
+        if aad_name not in aad_descriptor:
+            msg = f"vault metadata AAD missing {aad_name!r}"
+            raise TraceError(msg)
+    return cast("dict[str, Any]", meta)
+
+
+def _expected_vault_aad(
+    entries: dict[str, bytes], manifest: dict[str, Any]
+) -> tuple[bytes, dict[str, Any]]:
+    """Recompute the vault AAD from the verified public artifact."""
+    workflow = manifest.get("workflow", {})
+    aad_dict: dict[str, Any] = {
+        "events_sha256": sha256_tag(entries[EVENTS_PATH]),
+        "format": VAULT_AAD_FORMAT,
+        "ir_sha256": workflow.get("ir_sha256") or VAULT_NULL_IR_SHA256,
+        "manifest_sha256": sha256_tag(entries[MANIFEST_PATH]),
+        "trace_id": manifest.get("trace_id"),
+        "workflow_graph_sha256": sha256_tag(entries[GRAPH_PATH]),
+    }
+    return to_canonical_bytes(aad_dict), aad_dict
+
+
+def unlock_archive(
+    path: str | Path, passphrase: str | bytes
+) -> tuple[list[dict[str, Any]], VerificationReport]:
+    """Decrypt a replay vault and evaluate semantic evidence completeness.
+
+    Returns ``(vault_records, report)`` where ``report.semantic`` is
+    ``"passed"`` when every ledger model/tool/transition event has matching
+    vault evidence, else ``"failed"`` with errors. Wrong passphrases and
+    modified vaults fail closed with a generic error. Decrypted records are
+    returned in memory only; callers must never persist them without an
+    explicit user action.
+    """
+    report = verify_archive(path)
+    if not report.ok:
+        return [], replace(
+            report,
+            ok=False,
+            semantic="failed",
+            errors=(*report.errors, "archive verification failed"),
+        )
+    if report.replayability != "taped-replay":
+        return [], replace(
+            report,
+            ok=False,
+            semantic="failed",
+            errors=(*report.errors, "archive has no replay vault"),
+        )
+    try:
+        entries = read_archive_entries(path)
+    except TraceError as exc:
+        return [], replace(report, ok=False, semantic="failed", errors=(*report.errors, str(exc)))
+    try:
+        meta_raw = parse_json_strict(entries[VAULT_META_PATH].decode("utf-8"))
+        manifest_raw = parse_json_strict(entries[MANIFEST_PATH].decode("utf-8"))
+    except Exception as exc:
+        return [], replace(
+            report, ok=False, semantic="failed", errors=(*report.errors, f"vault metadata invalid: {exc}")
+        )
+    try:
+        meta = _check_vault_meta(meta_raw)
+    except TraceError as exc:
+        return [], replace(
+            report, ok=False, semantic="failed", errors=(*report.errors, f"vault metadata invalid: {exc}")
+        )
+    if not isinstance(manifest_raw, dict):
+        return [], replace(
+            report,
+            ok=False,
+            semantic="failed",
+            errors=(*report.errors, "vault metadata invalid: manifest must be an object"),
+        )
+    manifest = cast("dict[Any, Any]", manifest_raw)
+    meta_branch = cast("dict[Any, Any]", meta)
+    kdf = cast("Any", meta_branch.get("kdf"))
+    cipher = cast("Any", meta_branch.get("cipher"))
+    try:
+        salt = _b64url_decode(
+            kdf["salt_base64url"], what="salt", expected=VAULT_SALT_BYTES
+        )
+        nonce = _b64url_decode(
+            cipher["nonce_base64url"], what="nonce", expected=VAULT_NONCE_BYTES
+        )
+    except TraceError as exc:
+        return [], replace(
+            report, ok=False, semantic="failed", errors=(*report.errors, f"vault metadata invalid: {exc}")
+        )
+    try:
+        pw_bytes = _normalize_passphrase(passphrase)
+    except TraceError:
+        pw_bytes = None
+    if pw_bytes is None:
+        return [], replace(
+            report, ok=False, semantic="failed", errors=(*report.errors, "vault unlock failed")
+        )
+    expected_aad, _ = _expected_vault_aad(entries, manifest)
+    stored_aad = cast("Any", meta_branch.get("aad"))
+    # The stored AAD descriptor must agree with the recomputed public
+    # artifact before decryption is attempted.
+    aad_ok = True
+    for aad_name, digest in (
+        ("manifest_sha256", sha256_tag(entries[MANIFEST_PATH])),
+        ("events_sha256", sha256_tag(entries[EVENTS_PATH])),
+        ("workflow_graph_sha256", sha256_tag(entries[GRAPH_PATH])),
+    ):
+        stored_descriptor = stored_aad
+        if not isinstance(stored_descriptor, dict) or cast(
+            "dict[Any, Any]", stored_descriptor
+        ).get(aad_name) != digest:
+            aad_ok = False
+    manifest_branch = manifest
+    if isinstance(stored_aad, dict):
+        stored_trace = cast("dict[Any, Any]", stored_aad)
+    else:
+        stored_trace = cast("dict[Any, Any]", {})
+    if not aad_ok or stored_trace.get("trace_id") != manifest_branch.get("trace_id"):
+        return [], replace(
+            report, ok=False, semantic="failed", errors=(*report.errors, "vault unlock failed")
+        )
+    try:
+        plaintext = decrypt_vault_records(
+            entries[VAULT_ENC_PATH], pw_bytes, expected_aad, salt=salt, nonce=nonce
+        )
+    except TraceError as exc:
+        return [], replace(report, ok=False, semantic="failed", errors=(*report.errors, str(exc)))
+    try:
+        raw_lines = [line for line in plaintext.split(b"\n") if line.strip()]
+        parsed: list[Any] = [
+            parse_json_strict(line.decode("utf-8")) for line in raw_lines
+        ]
+    except Exception as exc:
+        return [], replace(
+            report, ok=False, semantic="failed", errors=(*report.errors, f"vault invalid: {exc}")
+        )
+    if len(parsed) > LIMIT_EVENT_COUNT:
+        return [], replace(
+            report,
+            ok=False,
+            semantic="failed",
+            errors=(*report.errors, "vault invalid: record count exceeds budget"),
+        )
+    records: list[Any] = []
+    for number, raw_record in enumerate(parsed, 1):
+        record = raw_record
+        if not isinstance(record, dict):
+            return [], replace(
+                report,
+                semantic="failed",
+                errors=(*report.errors, f"vault invalid: record {number} must be an object"),
+            )
+        shape_error = _vault_record_shape_error(cast("Any", record))
+        if shape_error is not None:
+            return [], replace(
+                report,
+                semantic="failed",
+                errors=(*report.errors, f"vault invalid: {shape_error}"),
+            )
+        records.append(record)
+    semantic_errors = _check_vault_evidence(entries, records)
+    semantic = "passed" if not semantic_errors else "failed"
+    return records, replace(
+        report,
+        semantic=semantic,
+        warnings=report.warnings,
+        errors=(*report.errors, *semantic_errors),
+        ok=report.ok and not semantic_errors,
+    )
+
+
+def _check_vault_evidence(
+    entries: dict[str, bytes], records: list[dict[str, Any]]
+) -> list[str]:
+    """Check that every replay-relevant ledger event has vault evidence."""
+    problems: list[str] = []
+    model_ids: set[Any] = set()
+    tool_ids: set[Any] = set()
+    transition_visits: set[Any] = set()
+    for record in records:
+        entry = cast("dict[Any, Any]", record)
+        rtype = cast("Any", entry.get("record_type"))
+        if rtype in ("model_request", "model_response"):
+            call = cast("Any", entry.get("model_call_id"))
+            if isinstance(call, str):
+                model_ids.add(call)
+        elif rtype == "tool_result":
+            tool = cast("Any", entry.get("tool_call_id"))
+            if isinstance(tool, str):
+                tool_ids.add(tool)
+        elif rtype == "transition_evaluation":
+            seen_visit = cast("Any", entry.get("stage_visit_id"))
+            if isinstance(seen_visit, str):
+                transition_visits.add(seen_visit)
+    for line in entries[EVENTS_PATH].split(b"\n"):
+        if not line.strip():
+            continue
+        event = _parse_ledger_line(line)
+        if not isinstance(event, dict):
+            continue
+        ledger = cast("Any", event)
+        kind = ledger.get("kind")
+        if kind in ("model_completed", "model_retry"):
+            mid = ledger.get("model_call_id")
+            if isinstance(mid, str) and mid not in model_ids:
+                problems.append(f"vault missing model evidence for {mid}")
+        elif kind in ("tool_call_completed", "tool_call_failed"):
+            tid = ledger.get("tool_call_id")
+            if isinstance(tid, str) and tid not in tool_ids:
+                problems.append(f"vault missing tool evidence for {tid}")
+        elif kind == "transition_selected":
+            visit = ledger.get("stage_visit_id")
+            if isinstance(visit, str) and visit not in transition_visits:
+                problems.append(
+                    f"vault missing transition evidence for visit {visit}"
+                )
+    return problems[:50]
 
 
 # ---------------------------------------------------------------------------
 # Projection helpers
 # ---------------------------------------------------------------------------
-
 
 def _safe_int(value: Any, default: int, *, minimum: int = 0) -> int:
     if isinstance(value, bool):

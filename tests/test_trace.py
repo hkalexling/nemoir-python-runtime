@@ -628,10 +628,15 @@ def test_resolve_trace_recorder(tmp_path: Path) -> None:
 
 
 def test_profiles_and_annotations_refused(tmp_path: Path) -> None:
-    with pytest.raises(TraceError, match="only 'audit'"):
+    # Replay requires a passphrase; publication is still a later phase.
+    with pytest.raises(TraceError, match="requires vault_passphrase"):
         TraceRecorder.create(tmp_path / "x.nemotrace", profile="replay")
-    with pytest.raises(TraceError, match="only 'audit'"):
+    with pytest.raises(TraceError, match="unsupported trace profile"):
         TraceRecorder.create(tmp_path / "x.nemotrace", profile="publication")
+    recorder = TraceRecorder.create(
+        tmp_path / "r.nemotrace", profile="replay", vault_passphrase="pw-test-123"  # noqa: S106
+    )
+    assert recorder.vault_enabled is True
 
 
 def _trial_payload(**overrides: Any) -> dict[str, Any]:
@@ -965,3 +970,101 @@ def test_double_begin_and_finish_raise(tmp_path: Path) -> None:
         recorder.begin_run(_trace_manifest())
     with pytest.raises(TraceError, match="unknown trace status"):
         recorder.finish_run("bogus")
+
+
+def test_stage_completed_with_prohibited_output_keys_is_kept(tmp_path: Path) -> None:
+    """Regression: markered prohibited keys must not omit milestone events.
+
+    Harness outputs routinely contain ``stderr``/``stdout`` keys. The audit
+    projector replaces their values with markers, so the follow-up cleartext
+    scan must accept the markered keys — reporting them loops the mask
+    passes until the whole ``stage_completed`` is omitted, which also breaks
+    taped-replay path comparison (found in a real CVXPYgen trace: both
+    RunResearch completions missing from the public ledger). Raw values
+    under prohibited keys are still masked-or-omitted as before.
+    """
+    clock_at = datetime(2026, 3, 4, 5, 6, 7, tzinfo=UTC)
+    recorder = TraceRecorder.create(
+        tmp_path / "stderr.nemotrace",
+        provenance=HostProvenance(
+            frontend="stderr-regression",
+            target="python",
+            compiler_version="stderr-regression",
+            ir_version="0.1",
+            ir_sha256="sha256:" + "cd" * 32,
+        ),
+        trace_id="cd" * 16,
+        clock=lambda: clock_at,
+    )
+    manifest = WorkflowManifest(
+        workflow_id="MiniStderr",
+        entry_stage_id="A",
+        exit_stage_ids=frozenset({"A"}),
+        inputs=(),
+        capabilities=frozenset(),
+        policies=(),
+        stages=(
+            StageSpec(
+                id="A",
+                prompt="",
+                reads=(),
+                writes=(
+                    WriteSpec(name="ok", type="bool", optional=False),
+                    WriteSpec(name="report", type="string", optional=False),
+                    WriteSpec(name="stderr", type="string", optional=False),
+                    WriteSpec(name="stdout", type="string", optional=False),
+                ),
+                requires=frozenset(),
+                transitions=(),
+                execution=StageExecutionSpec(kind="model"),
+            ),
+        ),
+    )
+    dummy_ts = datetime(2020, 1, 1, tzinfo=UTC)
+
+    def observe(kind: str, sequence: int, **fields: Any) -> None:
+        recorder.observe_workflow_event(
+            WorkflowEvent(
+                kind=kind,  # type: ignore[arg-type]
+                run_id="c" * 32,
+                sequence=sequence,
+                timestamp=dummy_ts,
+                stage_id="A",
+                metadata=fields.pop("metadata", {}),
+                **fields,  # type: ignore[arg-type]
+            )
+        )
+
+    recorder.begin_run(manifest)
+    observe("run_started", 1)
+    recorder.begin_stage_visit("A")
+    observe("stage_started", 2)
+    observe(
+        "stage_completed",
+        3,
+        output={
+            "ok": False,
+            "report": "research run failed (exit=1)",
+            "stderr": "bwrap: Creating new namespace failed\n",
+            "stdout": "",
+        },
+    )
+    observe("run_completed", 4)
+    path = recorder.finish_run("complete")
+
+    report = verify_archive(path)
+    assert report.ok, report.errors
+    entries = read_archive_entries(path)
+    ledger = [
+        json.loads(line)
+        for line in entries["public/events.ndjson"].split(b"\n")
+        if line.strip()
+    ]
+    completed = [e for e in ledger if e["kind"] == "stage_completed"]
+    assert len(completed) == 1
+    output = completed[0]["output"]
+    for key in ("report", "stderr", "stdout"):
+        marker = output[key]
+        assert isinstance(marker, dict), key
+        assert "$redacted" in marker, key
+    assert "bwrap" not in entries["public/events.ndjson"].decode("utf-8")

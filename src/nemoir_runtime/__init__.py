@@ -55,6 +55,13 @@ from nemoir_runtime.models import (
     OpenAIResponsesModelAdapter,
     supports_streaming,
 )
+from nemoir_runtime.replay import (
+    ReplayReport,
+    TapedModelAdapter,
+    TapedReplayError,
+    TapedToolRegistry,
+    replay_trace,
+)
 from nemoir_runtime.runtime import (
     DeterministicStageExecutor,
     ExprSpec,
@@ -91,12 +98,16 @@ from nemoir_runtime.trace import (
     TraceError,
     TraceRecorder,
     TraceValue,
+    VaultCapture,
     VerificationReport,
+    decrypt_vault_records,
+    encrypt_vault_records,
     load_generated_provenance,
     read_archive_entries,
     resolve_recorder,
     resolve_trace_recorder,
     safe_model_descriptor,
+    unlock_archive,
     verify_archive,
 )
 
@@ -135,6 +146,7 @@ __all__ = [
     "PolicySpec",
     "ReadSpec",
     "RefSpec",
+    "ReplayReport",
     "RequiredCapabilitySpec",
     "RunOptions",
     "StageContext",
@@ -142,6 +154,9 @@ __all__ = [
     "StageExecutor",
     "StageOutputValidationError",
     "StageSpec",
+    "TapedModelAdapter",
+    "TapedReplayError",
+    "TapedToolRegistry",
     "Tool",
     "ToolContext",
     "ToolInvocationError",
@@ -153,6 +168,7 @@ __all__ = [
     "TraceValue",
     "TransitionSpec",
     "TriggerSpec",
+    "VaultCapture",
     "VerificationReport",
     "WorkflowManifest",
     "WorkflowResult",
@@ -161,10 +177,13 @@ __all__ = [
     "WorkflowTimeoutError",
     "WorkflowValidationError",
     "WriteSpec",
+    "decrypt_vault_records",
+    "encrypt_vault_records",
     "get_capability",
     "load_generated_provenance",
     "parse_json_strict",
     "read_archive_entries",
+    "replay_trace",
     "required_param_names",
     "resolve_recorder",
     "resolve_trace_recorder",
@@ -174,6 +193,7 @@ __all__ = [
     "to_canonical_bytes",
     "to_canonical_str",
     "tool",
+    "unlock_archive",
     "verify_archive",
 ]
 
