@@ -238,6 +238,33 @@ artifacts — they are never written inside the archive.
 Redaction reduces risk; it cannot prove that reviewed identifiers or approved
 scalar metrics are non-sensitive. Human review remains mandatory.
 
+### Sharing a trace on a public Gist
+
+Publishing stays a deliberate, credential-owning step. The CLI gates the
+artifact and verifies the result; the upload itself uses your own Git/GitHub
+credential (GitHub's API models file content as JSON text, so a binary
+`.nemotrace` must go over the Gist's Git remote — the viewer never uploads
+anything):
+
+```bash
+nemotrace publish-plan published/run.nemotrace \
+  --title "CVXPYgen autoresearch run" --license CC-BY-4.0   # gate + runbook
+
+# ...run the printed gh/git commands with your credential...
+
+nemotrace publish-verify <gist-id> --filename run.nemotrace \
+  --expect-content-identity sha256:...
+```
+
+`publish-plan` refuses an audit/replay archive, a vault, an unattested
+archive, a failed scanner, incomplete provenance, and anything over the 8 MiB
+public budget, then prints the upload runbook, a suggested Gist README, the
+Gist permanence warning, and a ready catalog entry.
+`publish-verify` re-downloads the public Gist through the documented
+metadata → pinned revision → `raw_url` path, re-verifies the archive, and
+prints the pinned citation URL. Remember that a public Gist is public and
+durable, and a secret Gist is not private storage.
+
 ## Requirements
 
 - Python ≥ 3.11

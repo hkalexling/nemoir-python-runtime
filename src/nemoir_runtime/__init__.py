@@ -75,6 +75,14 @@ from nemoir_runtime.publication import (
     write_attestation,
     write_publication_report,
 )
+from nemoir_runtime.publish import (
+    PUBLICATION_MAX_BYTES,
+    PublishCheck,
+    PublishPlan,
+    parse_gist_ref,
+    plan_publication,
+    verify_published,
+)
 from nemoir_runtime.replay import (
     ReplayReport,
     TapedModelAdapter,
@@ -134,6 +142,7 @@ from nemoir_runtime.trace import (
 __all__ = [
     "CAPABILITY_CATALOG",
     "PUBLICATION_ATTESTATION_FORMAT",
+    "PUBLICATION_MAX_BYTES",
     "PUBLICATION_REDACTION_POLICY",
     "PUBLICATION_REPORT_FORMAT",
     "CapabilityParam",
@@ -174,6 +183,8 @@ __all__ = [
     "PublicationResult",
     "PublicationSource",
     "PublicationStats",
+    "PublishCheck",
+    "PublishPlan",
     "ReadSpec",
     "RefSpec",
     "ReplayReport",
@@ -214,7 +225,9 @@ __all__ = [
     "get_capability",
     "load_attestation",
     "load_generated_provenance",
+    "parse_gist_ref",
     "parse_json_strict",
+    "plan_publication",
     "prepare_publication",
     "publication_report_path",
     "read_archive_entries",
@@ -231,6 +244,7 @@ __all__ = [
     "tool",
     "unlock_archive",
     "verify_archive",
+    "verify_published",
     "write_attestation",
     "write_publication_report",
 ]

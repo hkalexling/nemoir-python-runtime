@@ -6,6 +6,8 @@ Usage::
     nemotrace scan-publication <archive> [--allow-tool-name NAME]... [--keep-relative-paths]
     nemotrace attest-publication --report PATH --reviewer NAME --license ID --consent TEXT
     nemotrace prepare-publication <archive> <destination> --attest PATH
+    nemotrace publish-plan <archive> --title TITLE --license ID [--json]
+    nemotrace publish-verify <gist-id|url> [--expect-content-identity TAG]
 
 ``SRC`` is a passphrase source: ``env:VAR`` | ``file:PATH`` | ``prompt``.
 Plain ``verify`` reports the public archive levels (integrity, structural,
@@ -49,6 +51,14 @@ from nemoir_runtime.publication import (
     scan_publication,
     write_attestation,
     write_publication_report,
+)
+from nemoir_runtime.publish import (
+    DEFAULT_API_BASE,
+    DEFAULT_VIEWER_BASE,
+    PublishCheck,
+    PublishPlan,
+    plan_publication,
+    verify_published,
 )
 from nemoir_runtime.replay import ReplayReport, replay_trace
 from nemoir_runtime.trace import (
@@ -181,6 +191,47 @@ def _add_publication_parsers(subparsers: Any) -> None:
             "where to write the disclosure report "
             "(default: <destination>.publication-report.json)"
         ),
+    )
+    plan = subparsers.add_parser(
+        "publish-plan",
+        help="gate one publication archive and print the upload runbook",
+        description=(
+            "Refuse anything that is not an attested, vault-free, in-budget publication "
+            "archive, then print the Gist upload runbook, the permanence warning, and a "
+            "ready catalog entry. Publishing itself uses your own Git credential: the "
+            "GitHub API cannot carry a binary .nemotrace safely."
+        ),
+    )
+    plan.add_argument("archive", help="path to a publication .nemotrace archive")
+    plan.add_argument("--title", required=True, help="public title for the trace")
+    plan.add_argument("--license", required=True, metavar="ID", help="license identifier")
+    plan.add_argument("--filename", help="published filename (default: the archive name)")
+    plan.add_argument("--viewer-base", default=DEFAULT_VIEWER_BASE, help="viewer origin for links")
+    plan.add_argument("--json", action="store_true", help="print the catalog entry as JSON")
+    plan.add_argument(
+        "--write-readme",
+        metavar="PATH",
+        help="also write the suggested Gist README to PATH",
+    )
+    verify_pub = subparsers.add_parser(
+        "publish-verify",
+        help="verify a published Gist trace and print its pinned citation link",
+        description=(
+            "Read-only, credential-free re-download of a public Gist through the documented "
+            "metadata -> pinned revision -> raw_url path. Re-verifies the archive and reports "
+            "the pinned viewer link."
+        ),
+    )
+    verify_pub.add_argument("gist", help="gist id, gist URL, or <id>@<revision>")
+    verify_pub.add_argument("--filename", help="exact .nemotrace filename in the Gist")
+    verify_pub.add_argument("--api-base", default=DEFAULT_API_BASE, help="GitHub API base URL")
+    verify_pub.add_argument(
+        "--viewer-base", default=DEFAULT_VIEWER_BASE, help="viewer origin for links"
+    )
+    verify_pub.add_argument(
+        "--expect-content-identity",
+        metavar="TAG",
+        help="require the downloaded archive to have this sha256: content identity",
     )
 
 
@@ -583,6 +634,102 @@ def _prepare_publication_command(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def _publish_plan_lines(plan: PublishPlan) -> list[str]:
+    return [
+        f"archive: {plan.archive.name}",
+        f"filename: {plan.filename}",
+        f"title: {plan.title}",
+        f"license: {plan.license}",
+        "profile: publication",
+        "attested: true",
+        f"workflow: {plan.workflow_id}",
+        f"trace_id: {plan.trace_id}",
+        f"ir_sha256: {plan.ir_sha256}",
+        f"content_identity: {plan.content_identity}",
+        f"events: {plan.events}",
+        f"bytes: {plan.bytes}",
+        "publishable: true",
+        "upload: manual (your own Git credential)",
+    ]
+
+
+def _publish_plan_command(args: argparse.Namespace) -> int:
+    archive = Path(cast("str", args.archive))
+    problem = _require_archive(archive)
+    if problem is not None:
+        print(f"error: {problem}", file=sys.stderr)
+        return _EXIT_USAGE
+    try:
+        plan = plan_publication(
+            archive,
+            title=cast("str", args.title),
+            license_id=cast("str", args.license),
+            filename=cast("str | None", args.filename),
+            viewer_base=cast("str", args.viewer_base),
+        )
+    except (PublicationError, TraceError, OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return _EXIT_FAILED
+    readme_target = cast("str | None", args.write_readme)
+    if readme_target is not None:
+        try:
+            Path(readme_target).write_text(plan.readme, encoding="utf-8")
+        except OSError as exc:
+            print(f"error: cannot write README: {exc}", file=sys.stderr)
+            return _EXIT_FAILED
+    if bool(args.json):
+        print(json.dumps(plan.catalog_entry, indent=2, sort_keys=True))
+        return _EXIT_OK
+    lines = _publish_plan_lines(plan)
+    lines.append("")
+    lines.append("upload runbook:")
+    lines.extend(plan.commands)
+    lines.append("")
+    lines.extend(f"warning: {warning}" for warning in plan.warnings)
+    if readme_target is not None:
+        lines.append(f"readme: {Path(readme_target).name}")
+    lines.append("")
+    lines.append("catalog_entry:")
+    lines.append(json.dumps(plan.catalog_entry, indent=2, sort_keys=True))
+    for line in lines:
+        print(line)
+    return _EXIT_OK
+
+
+def _publish_check_lines(check: PublishCheck) -> list[str]:
+    lines = [
+        f"gist: {check.gist_id}",
+        f"revision: {check.revision}",
+        f"filename: {check.filename}",
+        f"bytes: {check.bytes}",
+        f"content_identity: {check.content_identity or _MISSING}",
+        f"expected_content_identity: {check.expected_identity or _MISSING}",
+        f"viewer: {check.viewer_url}",
+        f"pinned: {check.pinned_url}",
+    ]
+    lines += _diagnostic_lines("warning", check.warnings)
+    lines += _diagnostic_lines("error", check.errors)
+    lines.append(f"result: {'ok' if check.ok else 'failed'}")
+    return lines
+
+
+def _publish_verify_command(args: argparse.Namespace) -> int:
+    try:
+        check = verify_published(
+            cast("str", args.gist),
+            filename=cast("str | None", args.filename),
+            api_base=cast("str", args.api_base),
+            viewer_base=cast("str", args.viewer_base),
+            expect_content_identity=cast("str | None", args.expect_content_identity),
+        )
+    except (PublicationError, TraceError, OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return _EXIT_FAILED
+    for line in _publish_check_lines(check):
+        print(line)
+    return _EXIT_OK if check.ok else _EXIT_FAILED
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point for ``nemotrace`` and ``python -m nemoir_runtime``."""
     parser = _build_parser()
@@ -594,4 +741,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _attest_publication_command(args)
     if command == "prepare-publication":
         return _prepare_publication_command(args)
+    if command == "publish-plan":
+        return _publish_plan_command(args)
+    if command == "publish-verify":
+        return _publish_verify_command(args)
     return _verify_command(args)
