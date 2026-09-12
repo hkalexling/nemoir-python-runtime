@@ -184,6 +184,10 @@ portable execution record per run, optionally with an encrypted replay vault.
 Install the vault crypto extra for unlock/replay: `pip install
 "nemoir-runtime[trace]"`.
 
+The artifact format, capture profiles, verification and replay levels, and
+publication gates are documented in the public compiler docs:
+[Trace artifacts](https://github.com/hkalexling/nemoir/blob/master/docs/trace.md).
+
 The bundled `nemotrace` CLI verifies an archive and reports its levels —
 integrity, structural, semantic, and replayability — reusing the same library
 reports as the viewer:
