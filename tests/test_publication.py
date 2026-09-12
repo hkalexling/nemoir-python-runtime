@@ -671,3 +671,61 @@ def test_cli_prepare_refuses_stale_attestation(
     assert code == 1
     assert "does not cover this projection" in err
     assert not (tmp_path / "out.nemotrace").exists()
+
+
+def test_cvxpygen_publication_fixture_is_attested_and_clean() -> None:
+    """The reviewed showcase fixture: publication profile, attested, secret-free."""
+    fixture = PUBLICATION_VECTORS / "cvxpygen-publication.nemotrace"
+    if not fixture.exists():
+        pytest.skip("publication fixture requires the meta checkout")
+    report = verify_archive(fixture)
+    assert report.ok, report.errors
+    assert report.replayability == "playback-only"
+    entries = read_archive_entries(fixture)
+    manifest: dict[str, Any] = cast(
+        "dict[str, Any]", parse_json_strict(entries["manifest.json"].decode())
+    )
+    assert manifest["capture"] == {
+        "profile": "publication",
+        "vault_present": False,
+        "publication_eligible": True,
+        "redaction_policy": "publication-v1",
+        "scanner": {"status": "passed", "ruleset": "secrets-v1"},
+        "attested": True,
+    }
+    assert manifest["provenance"]["complete"] is True
+    assert "private/vault.enc" not in entries
+    assert fixture.stat().st_size < 8 * 1024 * 1024
+    for name, data in entries.items():
+        assert b"/home/" not in data, name
+        assert b"/Users/" not in data, name
+        assert b"sk-" not in data, name
+        assert b"BEGIN RSA PRIVATE KEY" not in data, name
+        assert b"run_harness" not in data, name
+        assert b"read_file" not in data, name
+    ledger = [
+        cast("dict[str, Any]", parse_json_strict(line.decode()))
+        for line in entries["public/events.ndjson"].split(b"\n")
+        if line.strip()
+    ]
+    trials = [event for event in ledger if event["kind"] == "annotation"]
+    assert [event["annotation"]["payload"]["verdict"] for event in trials] == [
+        "rejected",
+        "rejected",
+        "accepted",
+    ]
+    assert all("tool_name" not in event for event in ledger)
+    # The catalog entry must describe this exact artifact.
+    catalog: dict[str, Any] = cast(
+        "dict[str, Any]", json.loads((ROOT / "docs" / "trace" / "catalog.json").read_text())
+    )
+    entry = catalog["entries"][0]
+    integrity: dict[str, Any] = cast(
+        "dict[str, Any]", parse_json_strict(entries["integrity.json"].decode())
+    )
+    assert entry["artifact"]["content_identity"] == integrity["content_identity"]
+    assert entry["artifact"]["bytes"] == fixture.stat().st_size
+    assert entry["artifact"]["ir_sha256"] == manifest["workflow"]["ir_sha256"]
+    assert entry["artifact"]["profile"] == "publication"
+    assert entry["license"]
+    assert entry["attestation"]["consent"]
