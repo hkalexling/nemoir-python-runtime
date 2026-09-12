@@ -2917,42 +2917,7 @@ class TraceRecorder:
 
     def _final_scan(self, entries: dict[str, bytes]) -> None:
         """Block finalization when any cleartext entry leaks (locations only)."""
-        problems: list[str] = []
-        for path, data in entries.items():
-            if path == VAULT_ENC_PATH:
-                # Ciphertext is pseudorandom; scanning it is meaningless.
-                # Vault plaintext was scanned before encryption.
-                continue
-            if path.endswith(".ndjson"):
-                lines = data.split(b"\n")
-                for number, line in enumerate(lines, 1):
-                    if not line.strip():
-                        continue
-                    try:
-                        value = parse_json_strict(line.decode("utf-8"))
-                    except Exception as exc:
-                        problems.append(f"{path}:{number}: unparsable ({exc})")
-                        continue
-                    problems.extend(
-                        f"{path}:{number}:{finding.pointer} [{finding.rule}]"
-                        for finding in _scan_strings(value, "", self._registry)
-                    )
-                    if _has_unsafe_int(value):
-                        problems.append(f"{path}:{number} [unsafe_integer]")
-            else:
-                try:
-                    value = parse_json_strict(data.decode("utf-8"))
-                except Exception as exc:
-                    problems.append(f"{path}: unparsable ({exc})")
-                    continue
-                problems.extend(
-                    f"{path}:{finding.pointer} [{finding.rule}]"
-                    for finding in _scan_strings(value, "", self._registry)
-                )
-                if _has_unsafe_int(value):
-                    problems.append(f"{path} [unsafe_integer]")
-            if _scan_strings({"name": path}, "/name", self._registry):
-                problems.append(f"{path}: filename finding")
+        problems = scan_cleartext_entries(entries, self._registry)
         if problems:
             self._remove_partial_marker()
             detail = "; ".join(problems[:10])
@@ -2963,35 +2928,11 @@ class TraceRecorder:
 
     @staticmethod
     def _zip_info(name: str) -> zipfile.ZipInfo:
-        info = zipfile.ZipInfo(filename=name, date_time=ZIP_EPOCH)
-        # Ciphertext is incompressible and must not be compressed before
-        # or after encryption (spike §1); everything else is DEFLATE.
-        if name == VAULT_ENC_PATH:
-            info.compress_type = zipfile.ZIP_STORED
-        else:
-            info.compress_type = zipfile.ZIP_DEFLATED
-            info.compress_level = ZIP_DEFLATE_LEVEL
-        info.create_system = 3
-        info.external_attr = ZIP_UNIX_REGULAR << 16
-        return info
+        return _zip_info(name)
 
     @classmethod
     def _write_archive(cls, path: Path, entries: dict[str, bytes]) -> None:
-        path = Path(path)
-        if path.parent != Path() and str(path.parent):
-            path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + f".tmp-{os.getpid()}")
-        try:
-            with zipfile.ZipFile(tmp, "w") as archive:
-                for name in sorted(entries):
-                    archive.writestr(cls._zip_info(name), entries[name])
-            tmp.replace(path)
-        finally:
-            try:
-                if tmp.exists():
-                    tmp.unlink()
-            except OSError:
-                pass
+        _write_zip_archive(path, entries)
 
     def _partial_path(self) -> Path:
         return self._config.path.with_name(self._config.path.name + ".partial")
@@ -3177,6 +3118,102 @@ class VerificationReport:
     structural: str = "failed"
     semantic: str = "not-evaluated"
     replayability: str = "none"
+
+
+def scan_cleartext_entries(
+    entries: Mapping[str, bytes], registry: _SecretRegistry | None = None
+) -> list[str]:
+    """Scan cleartext entries for ``secrets-v1`` findings and unsafe integers.
+
+    Returns location-only problem strings (``entry:pointer [rule]``) and never
+    the matched value. Ciphertext (``private/vault.enc``) is skipped: it is
+    pseudorandom and its plaintext was scanned before encryption. Entry names
+    are scanned too. ``registry`` defaults to an empty registry, which is the
+    correct posture for a transform that has no capture-time secret values
+    (publication relies on capture-time redaction plus these detector rules).
+    """
+    active = registry if registry is not None else _SecretRegistry(())
+    problems: list[str] = []
+    for path, data in entries.items():
+        if path == VAULT_ENC_PATH:
+            # Ciphertext is pseudorandom; scanning it is meaningless.
+            # Vault plaintext was scanned before encryption.
+            continue
+        if path.endswith(".ndjson"):
+            lines = data.split(b"\n")
+            for number, line in enumerate(lines, 1):
+                if not line.strip():
+                    continue
+                try:
+                    value = parse_json_strict(line.decode("utf-8"))
+                except Exception as exc:
+                    problems.append(f"{path}:{number}: unparsable ({exc})")
+                    continue
+                problems.extend(
+                    f"{path}:{number}:{finding.pointer} [{finding.rule}]"
+                    for finding in _scan_strings(value, "", active)
+                )
+                if _has_unsafe_int(value):
+                    problems.append(f"{path}:{number} [unsafe_integer]")
+        else:
+            try:
+                value = parse_json_strict(data.decode("utf-8"))
+            except Exception as exc:
+                problems.append(f"{path}: unparsable ({exc})")
+                continue
+            problems.extend(
+                f"{path}:{finding.pointer} [{finding.rule}]"
+                for finding in _scan_strings(value, "", active)
+            )
+            if _has_unsafe_int(value):
+                problems.append(f"{path} [unsafe_integer]")
+        if _scan_strings({"name": path}, "/name", active):
+            problems.append(f"{path}: filename finding")
+    return problems
+
+
+def _zip_info(name: str) -> zipfile.ZipInfo:
+    """Deterministic ZIP entry metadata for the NemoTrace container profile."""
+    info = zipfile.ZipInfo(filename=name, date_time=ZIP_EPOCH)
+    # Ciphertext is incompressible and must not be compressed before
+    # or after encryption (spike §1); everything else is DEFLATE.
+    if name == VAULT_ENC_PATH:
+        info.compress_type = zipfile.ZIP_STORED
+    else:
+        info.compress_type = zipfile.ZIP_DEFLATED
+        info.compress_level = ZIP_DEFLATE_LEVEL
+    info.create_system = 3
+    info.external_attr = ZIP_UNIX_REGULAR << 16
+    return info
+
+
+def _write_zip_archive(path: Path, entries: Mapping[str, bytes]) -> None:
+    """Deterministic ZIP write with an atomic rename (shared with the recorder)."""
+    path = Path(path)
+    if path.parent != Path() and str(path.parent):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".tmp-{os.getpid()}")
+    try:
+        with zipfile.ZipFile(tmp, "w") as archive:
+            for name in sorted(entries):
+                archive.writestr(_zip_info(name), entries[name])
+        tmp.replace(path)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+
+
+def write_trace_archive(path: str | Path, entries: Mapping[str, bytes]) -> None:
+    """Write one deterministic ``*.nemotrace`` ZIP atomically.
+
+    Same ZIP profile as the recorder (sorted entries, fixed metadata,
+    DEFLATE-6 except the STORE vault ciphertext); used by the publication
+    transform, which rebuilds every entry from an audited source archive.
+    """
+    _write_zip_archive(Path(path), entries)
 
 
 def read_archive_entries(path: str | Path) -> dict[str, bytes]:

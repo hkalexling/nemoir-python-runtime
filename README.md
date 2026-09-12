@@ -205,6 +205,39 @@ Taped replay re-executes the recorded state machine with recorded model/tool
 fixtures only — no provider calls, no real tool effects. It is deterministic
 playback of captured evidence, not a live rerun.
 
+### Publishing a trace (`publication-v1`)
+
+An `audit` archive is safe-by-default local capture, not automatically safe to
+post. Publication is a separate, reviewed transform that produces one stricter,
+vault-free `publication` artifact:
+
+```bash
+# 1. project for review (writes a disclosure report; publishes nothing)
+nemotrace scan-publication runs/<id>/run.nemotrace
+
+# 2. bind your review to the projection digest it reported
+nemotrace attest-publication \
+  --report runs/<id>/run.nemotrace.publication-report.json \
+  --reviewer "Your Name" --license CC-BY-4.0 \
+  --consent "I reviewed the disclosure report and certify this trace is safe to publish."
+
+# 3. write the attested archive (+ its report sidecar)
+nemotrace prepare-publication runs/<id>/run.nemotrace published/run.nemotrace \
+  --attest runs/<id>/run.nemotrace.publication-report.json.attestation.json
+```
+
+Publication refuses a vault-bearing or already-published source, an
+interrupted run, incomplete compiler provenance, a projection the attestation
+does not cover, and any `secrets-v1` scanner finding. By default it drops
+static tool names and replaces alias-relative paths with opaque `path-N`
+refs; `--allow-tool-name NAME` (repeatable) and `--keep-relative-paths` opt
+individual review decisions back in, and each choice changes the projection
+digest you are asked to attest. Reports and attestations are local review
+artifacts — they are never written inside the archive.
+
+Redaction reduces risk; it cannot prove that reviewed identifiers or approved
+scalar metrics are non-sensitive. Human review remains mandatory.
+
 ## Requirements
 
 - Python ≥ 3.11

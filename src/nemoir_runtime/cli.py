@@ -3,6 +3,9 @@
 Usage::
 
     nemotrace verify <archive> [--unlock SRC | --replay SRC]
+    nemotrace scan-publication <archive> [--allow-tool-name NAME]... [--keep-relative-paths]
+    nemotrace attest-publication --report PATH --reviewer NAME --license ID --consent TEXT
+    nemotrace prepare-publication <archive> <destination> --attest PATH
 
 ``SRC`` is a passphrase source: ``env:VAR`` | ``file:PATH`` | ``prompt``.
 Plain ``verify`` reports the public archive levels (integrity, structural,
@@ -33,6 +36,20 @@ from typing import TYPE_CHECKING, Any, cast
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence
 
+from nemoir_runtime.publication import (
+    PublicationAttestation,
+    PublicationError,
+    PublicationOptions,
+    PublicationProjection,
+    PublicationResult,
+    attestation_from_report,
+    load_attestation,
+    prepare_publication,
+    publication_report_path,
+    scan_publication,
+    write_attestation,
+    write_publication_report,
+)
 from nemoir_runtime.replay import ReplayReport, replay_trace
 from nemoir_runtime.trace import (
     TraceError,
@@ -76,7 +93,95 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="SRC",
         help="unlock and taped-replay: env:VAR | file:PATH | prompt",
     )
+    _add_publication_parsers(subparsers)
     return parser
+
+
+def _add_publication_option_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--allow-tool-name",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="retain this static tool declaration after review (repeatable)",
+    )
+    parser.add_argument(
+        "--keep-relative-paths",
+        action="store_true",
+        help="keep alias-relative paths instead of opaque path-N refs (requires review)",
+    )
+
+
+def _add_publication_parsers(subparsers: Any) -> None:
+    scan = subparsers.add_parser(
+        "scan-publication",
+        help="project an audit archive for publication review (writes a report)",
+        description=(
+            "Project one audit profile archive under the publication-v1 policy and "
+            "write a disclosure report. Nothing is published: the report shows the "
+            "projection digest, the scan result, and what the transform drops. "
+            "Attest with attest-publication, then write with prepare-publication."
+        ),
+    )
+    scan.add_argument("archive", help="path to an audit .nemotrace archive")
+    _add_publication_option_flags(scan)
+    scan.add_argument(
+        "--report",
+        metavar="PATH",
+        help="where to write the disclosure report (default: <archive>.publication-report.json)",
+    )
+    attest = subparsers.add_parser(
+        "attest-publication",
+        help="sign the disclosure report you reviewed",
+        description=(
+            "Read one disclosure report and bind the reviewer, license, and consent "
+            "statement to the projection digest it contains. Cannot attest a failed "
+            "scan, and cannot invent a digest."
+        ),
+    )
+    attest.add_argument(
+        "--report", required=True, metavar="PATH", help="disclosure report to attest"
+    )
+    attest.add_argument("--reviewer", required=True, metavar="NAME", help="reviewer name")
+    attest.add_argument(
+        "--license", required=True, metavar="ID", help="license for the published trace"
+    )
+    attest.add_argument(
+        "--consent", required=True, metavar="TEXT", help="consent/attestation statement"
+    )
+    attest.add_argument(
+        "--out",
+        metavar="PATH",
+        help="where to write the attestation (default: <report>.attestation.json)",
+    )
+    attest.add_argument(
+        "--reviewed-at",
+        metavar="TIMESTAMP",
+        help="fixed review timestamp (default: now); use for reproducible attestations",
+    )
+    prepare = subparsers.add_parser(
+        "prepare-publication",
+        help="write one attested, vault-free publication archive",
+        description=(
+            "Re-project the source, re-run the blocking scan, and write the "
+            "publication archive plus its disclosure report. Refuses a source that "
+            "is not an audit archive, a projection the attestation does not cover, "
+            "or any scanner finding."
+        ),
+    )
+    prepare.add_argument("archive", help="path to an audit .nemotrace archive")
+    prepare.add_argument("destination", help="path to write the publication archive")
+    prepare.add_argument(
+        "--attest", required=True, metavar="PATH", help="attestation written by attest-publication"
+    )
+    prepare.add_argument(
+        "--report",
+        metavar="PATH",
+        help=(
+            "where to write the disclosure report "
+            "(default: <destination>.publication-report.json)"
+        ),
+    )
 
 
 def _resolve_passphrase(spec: str) -> str:
@@ -309,8 +414,184 @@ def _verify_command(args: argparse.Namespace) -> int:
     return _EXIT_OK if result_ok else _EXIT_FAILED
 
 
+def _publication_options(args: argparse.Namespace) -> PublicationOptions:
+    try:
+        return PublicationOptions(
+            allow_tool_names=tuple(cast("list[str]", args.allow_tool_name)),
+            keep_relative_paths=bool(args.keep_relative_paths),
+        )
+    except PublicationError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _require_archive(path: Path, what: str = "archive") -> str | None:
+    """Shared existence check; returns an error message when unusable."""
+    if not path.exists():
+        return f"{what} not found: {path}"
+    if not path.is_file():
+        return f"{what} is not a file: {path}"
+    return None
+
+
+def _scan_lines(projection: PublicationProjection, report: Path | None) -> list[str]:
+    stats = projection.stats
+    lines = [
+        f"archive: {projection.source.archive}",
+        f"trace_id: {projection.source.trace_id}",
+        f"content_identity: {projection.source.content_identity or _MISSING}",
+        f"profile: {projection.source.profile}",
+        f"status: {projection.source.status}",
+        f"events: {stats.event_count}",
+        f"stage_visits: {stats.stage_visit_count}",
+        f"tool_names_removed: {stats.tool_names_removed}",
+        f"tool_names_retained: {stats.tool_names_retained}",
+        f"paths_opaque: {stats.paths_opaque}",
+        f"projection_sha256: {projection.projection_sha256}",
+        f"predicted_content_identity: {projection.content_identity}",
+        f"scan: {'passed' if projection.ok else 'failed'}",
+        f"findings: {len(projection.findings)}",
+    ]
+    lines += _diagnostic_lines("finding", projection.findings)
+    lines.append(f"report: {report.name if report is not None else _MISSING}")
+    lines.append(f"result: {'ok' if projection.ok else 'failed'}")
+    return lines
+
+
+def _scan_publication_command(args: argparse.Namespace) -> int:
+    archive = Path(cast("str", args.archive))
+    problem = _require_archive(archive)
+    if problem is not None:
+        print(f"error: {problem}", file=sys.stderr)
+        return _EXIT_USAGE
+    try:
+        options = _publication_options(args)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return _EXIT_USAGE
+    try:
+        projection = scan_publication(archive, options=options)
+    except (PublicationError, TraceError, OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return _EXIT_FAILED
+    report_path = (
+        Path(cast("str", args.report))
+        if args.report is not None
+        else publication_report_path(archive)
+    )
+    try:
+        write_publication_report(
+            report_path, projection.report(attested=False, attestation=None)
+        )
+    except OSError as exc:
+        print(f"error: cannot write report: {exc}", file=sys.stderr)
+        return _EXIT_FAILED
+    for line in _scan_lines(projection, report_path):
+        print(line)
+    return _EXIT_OK if projection.ok else _EXIT_FAILED
+
+
+def _attest_publication_command(args: argparse.Namespace) -> int:
+    report_path = Path(cast("str", args.report))
+    problem = _require_archive(report_path, "report")
+    if problem is not None:
+        print(f"error: {problem}", file=sys.stderr)
+        return _EXIT_USAGE
+    try:
+        parsed: Any = json.loads(report_path.read_bytes().decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        print(f"error: report is not valid JSON: {exc}", file=sys.stderr)
+        return _EXIT_FAILED
+    if not isinstance(parsed, dict):
+        print("error: report must be a JSON object", file=sys.stderr)
+        return _EXIT_FAILED
+    try:
+        attestation = attestation_from_report(
+            cast("dict[str, Any]", parsed),
+            reviewer=cast("str", args.reviewer),
+            license_id=cast("str", args.license),
+            consent=cast("str", args.consent),
+            reviewed_at=cast("str | None", args.reviewed_at),
+        )
+    except PublicationError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return _EXIT_FAILED
+    out_path = (
+        Path(cast("str", args.out))
+        if args.out is not None
+        else report_path.with_name(report_path.name + ".attestation.json")
+    )
+    try:
+        write_attestation(out_path, attestation)
+    except OSError as exc:
+        print(f"error: cannot write attestation: {exc}", file=sys.stderr)
+        return _EXIT_FAILED
+    lines = [
+        f"report: {report_path.name}",
+        f"projection_sha256: {attestation.projection_sha256}",
+        f"source_trace_id: {attestation.source_trace_id}",
+        f"reviewer: {attestation.reviewer}",
+        f"license: {attestation.license}",
+        f"reviewed_at: {attestation.reviewed_at}",
+        f"attestation: {out_path.name}",
+        "result: ok",
+    ]
+    for line in lines:
+        print(line)
+    return _EXIT_OK
+
+
+def _prepare_publication_command(args: argparse.Namespace) -> int:
+    archive = Path(cast("str", args.archive))
+    problem = _require_archive(archive)
+    if problem is not None:
+        print(f"error: {problem}", file=sys.stderr)
+        return _EXIT_USAGE
+    try:
+        attestation: PublicationAttestation = load_attestation(
+            Path(cast("str", args.attest))
+        )
+    except PublicationError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return _EXIT_FAILED
+    report_path = Path(cast("str", args.report)) if args.report is not None else None
+    try:
+        result: PublicationResult = prepare_publication(
+            archive,
+            Path(cast("str", args.destination)),
+            attestation=attestation,
+            report_path=report_path,
+        )
+    except (PublicationError, TraceError, OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return _EXIT_FAILED
+    lines = [
+        f"archive: {archive.name}",
+        f"publication: {result.destination.name}",
+        f"trace_id: {result.trace_id}",
+        f"projection_sha256: {result.projection_sha256}",
+        "scan: passed",
+        "attested: true",
+        f"reviewer: {attestation.reviewer}",
+        f"license: {attestation.license}",
+        f"events: {result.stats.event_count}",
+        f"content_identity: {result.content_identity}",
+        f"report: {result.report_path.name}",
+        "result: ok",
+    ]
+    for line in lines:
+        print(line)
+    return _EXIT_OK
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point for ``nemotrace`` and ``python -m nemoir_runtime``."""
     parser = _build_parser()
     args = parser.parse_args(argv)
+    command = args.command
+    if command == "scan-publication":
+        return _scan_publication_command(args)
+    if command == "attest-publication":
+        return _attest_publication_command(args)
+    if command == "prepare-publication":
+        return _prepare_publication_command(args)
     return _verify_command(args)
