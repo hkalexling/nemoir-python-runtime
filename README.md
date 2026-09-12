@@ -177,6 +177,34 @@ Or per-run via `RunOptions(reasoning="raw")`.
 Reasoning text is **never merged into the final structured-output content**;
 stage output validation is unaffected.
 
+## Trace verification
+
+The runtime writes **NemoTrace** archives (`*.nemotrace`): one redacted,
+portable execution record per run, optionally with an encrypted replay vault.
+Install the vault crypto extra for unlock/replay: `pip install
+"nemoir-runtime[trace]"`.
+
+The bundled `nemotrace` CLI verifies an archive and reports its levels —
+integrity, structural, semantic, and replayability — reusing the same library
+reports as the viewer:
+
+```bash
+nemotrace verify run.nemotrace                          # public levels only
+nemotrace verify run.nemotrace --unlock env:VAULT_PW    # + semantic evidence
+nemotrace verify run.nemotrace --replay file:./pw.txt   # + taped replay
+```
+
+`--unlock` and `--replay` are mutually exclusive and take a passphrase source:
+`env:VAR`, `file:PATH`, or `prompt`. Output is a stable `key: value` report on
+stdout; the exit code is `0` when the requested level passed, `1` when it
+failed, and `2` for usage errors. Passphrase values, vault plaintext, and
+stack traces are never printed. `python -m nemoir_runtime verify …` is
+equivalent when the console script is not on `PATH`.
+
+Taped replay re-executes the recorded state machine with recorded model/tool
+fixtures only — no provider calls, no real tool effects. It is deterministic
+playback of captured evidence, not a live rerun.
+
 ## Requirements
 
 - Python ≥ 3.11
