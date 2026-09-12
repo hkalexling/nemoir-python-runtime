@@ -188,8 +188,7 @@ def _add_publication_parsers(subparsers: Any) -> None:
         "--report",
         metavar="PATH",
         help=(
-            "where to write the disclosure report "
-            "(default: <destination>.publication-report.json)"
+            "where to write the disclosure report (default: <destination>.publication-report.json)"
         ),
     )
     plan = subparsers.add_parser(
@@ -530,9 +529,7 @@ def _scan_publication_command(args: argparse.Namespace) -> int:
         else publication_report_path(archive)
     )
     try:
-        write_publication_report(
-            report_path, projection.report(attested=False, attestation=None)
-        )
+        write_publication_report(report_path, projection.report(attested=False, attestation=None))
     except OSError as exc:
         print(f"error: cannot write report: {exc}", file=sys.stderr)
         return _EXIT_FAILED
@@ -598,9 +595,7 @@ def _prepare_publication_command(args: argparse.Namespace) -> int:
         print(f"error: {problem}", file=sys.stderr)
         return _EXIT_USAGE
     try:
-        attestation: PublicationAttestation = load_attestation(
-            Path(cast("str", args.attest))
-        )
+        attestation: PublicationAttestation = load_attestation(Path(cast("str", args.attest)))
     except PublicationError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return _EXIT_FAILED

@@ -36,7 +36,7 @@ from nemoir_runtime.trace import (
     verify_archive,
     write_trace_archive,
 )
-from tests.test_parity import _drive_fixture
+from tests.test_parity import _drive_fixture  # type: ignore[reportPrivateUsage]
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -80,9 +80,7 @@ def _attest(projection: Any, options: PublicationOptions) -> Any:
     )
 
 
-def _rebuild_archive(
-    source: Path, target: Path, mutate: Callable[[dict[str, Any]], None]
-) -> Path:
+def _rebuild_archive(source: Path, target: Path, mutate: Callable[[dict[str, Any]], None]) -> Path:
     """Rewrite an archive with mutated canonical entries and a fresh index."""
     entries = read_archive_entries(source)
     graph: dict[str, Any] = cast(
@@ -94,9 +92,7 @@ def _rebuild_archive(
         if line.strip()
     ]
     document: dict[str, Any] = {
-        "manifest": cast(
-            "dict[str, Any]", parse_json_strict(entries["manifest.json"].decode())
-        ),
+        "manifest": cast("dict[str, Any]", parse_json_strict(entries["manifest.json"].decode())),
         "graph": graph,
         "events": events,
         "summary": cast(
@@ -108,8 +104,7 @@ def _rebuild_archive(
         "manifest.json": to_canonical_bytes(document["manifest"]),
         "public/workflow.graph.json": to_canonical_bytes(document["graph"]),
         "public/events.ndjson": b"".join(
-            to_canonical_bytes(record) + b"\n"
-            for record in cast("list[Any]", document["events"])
+            to_canonical_bytes(record) + b"\n" for record in cast("list[Any]", document["events"])
         ),
         "public/summary.json": to_canonical_bytes(document["summary"]),
     }
@@ -482,9 +477,7 @@ def test_attestation_cannot_cover_a_failed_scan(tmp_path: Path) -> None:
     poisoned = _rebuild_archive(source, tmp_path / "poisoned.nemotrace", poison)
     projection = scan_publication(poisoned)
     report_path = tmp_path / "poisoned-report.json"
-    write_publication_report(
-        report_path, projection.report(attested=False, attestation=None)
-    )
+    write_publication_report(report_path, projection.report(attested=False, attestation=None))
     report: dict[str, Any] = cast(
         "dict[str, Any]", json.loads(report_path.read_text(encoding="utf-8"))
     )
@@ -500,9 +493,7 @@ def test_attestation_document_round_trips(tmp_path: Path) -> None:
     path = write_attestation(tmp_path / "attest.json", attestation)
     loaded = load_attestation(path)
     assert loaded == attestation
-    document: dict[str, Any] = cast(
-        "dict[str, Any]", json.loads(path.read_text(encoding="utf-8"))
-    )
+    document: dict[str, Any] = cast("dict[str, Any]", json.loads(path.read_text(encoding="utf-8")))
     assert document["format"] == PUBLICATION_ATTESTATION_FORMAT
     assert document["projection"]["sha256"] == projection.projection_sha256
     document["format"] = "nemoir.trace.publication-attestation/9.9"
@@ -637,9 +628,7 @@ def test_cli_usage_errors(tmp_path: Path, capsys: pytest.CaptureFixture[str]) ->
     assert code == 2
     assert "not found" in err
     with pytest.raises(SystemExit) as excinfo:
-        cli.main(
-            ["prepare-publication", str(AUDIT_FIXTURE), str(tmp_path / "x.nemotrace")]
-        )
+        cli.main(["prepare-publication", str(AUDIT_FIXTURE), str(tmp_path / "x.nemotrace")])
     assert excinfo.value.code == 2  # --attest is required
     code, err = _run_err(
         capsys, ["scan-publication", str(AUDIT_FIXTURE), "--allow-tool-name", "not/a name"]

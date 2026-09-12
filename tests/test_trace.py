@@ -116,9 +116,7 @@ def _assert_valid_archive(
 def _writer_tool(calls: list[tuple[str, dict[str, Any]]]) -> Any:
     @tool(capability="fs.write", description="w", returns={"note": str, "summary": str})
     async def writer(*, path: Path, content: str, ctx: ToolContext) -> dict[str, str]:
-        calls.append(
-            ("fs.write", {"path": str(path), "content": content, "stage": ctx.stage_id})
-        )
+        calls.append(("fs.write", {"path": str(path), "content": content, "stage": ctx.stage_id}))
         return {"note": f"wrote {content}", "summary": f"wrote {content}"}
 
     return writer
@@ -311,9 +309,7 @@ async def test_seeded_secrets_absent_from_cleartext(tmp_path: Path) -> None:
 
     @tool(capability="fs.write", description="w", returns={"note": str})
     async def writer(*, path: Path, content: str, ctx: ToolContext) -> dict[str, str]:
-        calls.append(
-            ("fs.write", {"path": str(path), "content": content, "stage": ctx.stage_id})
-        )
+        calls.append(("fs.write", {"path": str(path), "content": content, "stage": ctx.stage_id}))
         return {"note": "ok"}
 
     manifest = WorkflowManifest(
@@ -356,9 +352,7 @@ async def test_seeded_secrets_absent_from_cleartext(tmp_path: Path) -> None:
     )
     await runtime.run({"p": str(tmp_path / "secret.txt")}, trace_recorder=recorder)
     entries = read_archive_entries(tmp_path / "run.nemotrace")
-    blob = b"\n".join(
-        name.encode() + b"\n" + data for name, data in sorted(entries.items())
-    )
+    blob = b"\n".join(name.encode() + b"\n" + data for name, data in sorted(entries.items()))
     for seed in seeds:
         assert seed.encode() not in blob, seed
     # Alias not marked safe: paths degrade to opaque refs, never segments.
@@ -516,9 +510,7 @@ async def test_model_stage_records_response_bytes_and_metrics(tmp_path: Path) ->
     assert result.output["score"] == 0.9
     entries = read_archive_entries(tmp_path / "run.nemotrace")
     events = [
-        json.loads(line)
-        for line in entries["public/events.ndjson"].split(b"\n")
-        if line.strip()
+        json.loads(line) for line in entries["public/events.ndjson"].split(b"\n") if line.strip()
     ]
     completed = [e for e in events if e["kind"] == "model_completed"]
     assert len(completed) == 1
@@ -594,18 +586,14 @@ def test_resolve_trace_recorder(tmp_path: Path) -> None:
         resolve_trace_recorder(lambda: "nope")  # type: ignore[return-value]
 
     bare = TraceConfig(path=tmp_path / "a.nemotrace")
-    recorder = resolve_trace_recorder(
-        bare, default_provenance=generated, default_model=model
-    )
+    recorder = resolve_trace_recorder(bare, default_provenance=generated, default_model=model)
     assert recorder is not None
     assert recorder.config.provenance == generated
     assert recorder.config.model == model
 
     explicit = HostProvenance(frontend="x", target="manual", compiler_version="y")
     manual = TraceConfig(path=tmp_path / "b.nemotrace", provenance=explicit)
-    recorder = resolve_trace_recorder(
-        manual, default_provenance=generated, default_model=model
-    )
+    recorder = resolve_trace_recorder(manual, default_provenance=generated, default_model=model)
     assert recorder is not None
     # Provenance is atomic: without a host fingerprint the generated
     # descriptor (whose hash was verified against its own resources) wins
@@ -634,7 +622,9 @@ def test_profiles_and_annotations_refused(tmp_path: Path) -> None:
     with pytest.raises(TraceError, match="unsupported trace profile"):
         TraceRecorder.create(tmp_path / "x.nemotrace", profile="publication")
     recorder = TraceRecorder.create(
-        tmp_path / "r.nemotrace", profile="replay", vault_passphrase="pw-test-123"  # noqa: S106
+        tmp_path / "r.nemotrace",
+        profile="replay",
+        vault_passphrase="pw-test-123",  # noqa: S106
     )
     assert recorder.vault_enabled is True
 
@@ -668,9 +658,7 @@ def test_annotation_accepted_and_shaped(tmp_path: Path) -> None:
     assert record["anchor_sequence"] == 7
     assert record["run_id"] == FIXED_TRACE_ID
     validators["public-event.schema.json"].validate(record)
-    validators["autoresearch-annotation.schema.json"].validate(
-        record["annotation"]["payload"]
-    )
+    validators["autoresearch-annotation.schema.json"].validate(record["annotation"]["payload"])
 
 
 def test_verifier_rejects_malformed_known_annotation(tmp_path: Path) -> None:
@@ -683,20 +671,25 @@ def test_verifier_rejects_malformed_known_annotation(tmp_path: Path) -> None:
     recorder.begin_run(_trace_manifest())
     recorder.begin_stage_visit("RecordTrial")
     evt = WorkflowEvent(
-        kind="stage_completed", run_id="x", sequence=1, timestamp=FIXED_TIME,
-        stage_id="RecordTrial", output={"report": "x"},
+        kind="stage_completed",
+        run_id="x",
+        sequence=1,
+        timestamp=FIXED_TIME,
+        stage_id="RecordTrial",
+        output={"report": "x"},
     )
     recorder.observe_workflow_event(evt)
     recorder.record_annotation(
-        "nemoir.autoresearch/v1", "trial_finished", _trial_payload(), anchor_sequence=1,
+        "nemoir.autoresearch/v1",
+        "trial_finished",
+        _trial_payload(),
+        anchor_sequence=1,
     )
     good_path = recorder.finish_run("complete")
     entries = read_archive_entries(good_path)
     # Forge: trial_id 0 violates schema; recompute hashes + identity deterministically.
     lines = [
-        json.loads(line)
-        for line in entries["public/events.ndjson"].split(b"\n")
-        if line.strip()
+        json.loads(line) for line in entries["public/events.ndjson"].split(b"\n") if line.strip()
     ]
     for line in lines:
         if line["kind"] == "annotation":
@@ -720,9 +713,7 @@ def test_verifier_rejects_malformed_known_annotation(tmp_path: Path) -> None:
         {
             "path": path,
             "media_type": (
-                "application/x-ndjson"
-                if path.endswith(".ndjson")
-                else "application/json"
+                "application/x-ndjson" if path.endswith(".ndjson") else "application/json"
             ),
             "uncompressed_bytes": len(data),
             "sha256": sha256_tag(data),
@@ -744,10 +735,14 @@ def test_verifier_rejects_malformed_known_annotation(tmp_path: Path) -> None:
             key=lambda e: e["path"],
         ),
     }
-    forged_entries["integrity.json"] = to_canonical_bytes({
-        "format": "nemoir.trace.integrity/0.1", "algorithm": "sha256",
-        "entries": integrity_entries, "content_identity": sha256_tag(to_canonical_bytes(identity)),
-    })
+    forged_entries["integrity.json"] = to_canonical_bytes(
+        {
+            "format": "nemoir.trace.integrity/0.1",
+            "algorithm": "sha256",
+            "entries": integrity_entries,
+            "content_identity": sha256_tag(to_canonical_bytes(identity)),
+        }
+    )
     forged_path = tmp_path / "forged.nemotrace"
     with zipfile.ZipFile(forged_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         for name in sorted(forged_entries):
@@ -775,8 +770,12 @@ def test_hook_anchor_forced_and_malformed_counted(tmp_path: Path) -> None:
     recorder.begin_run(_trace_manifest())
     recorder.begin_stage_visit("RecordTrial")
     evt = WorkflowEvent(
-        kind="stage_completed", run_id="x", sequence=5, timestamp=FIXED_TIME,
-        stage_id="RecordTrial", output={"report": "x"},
+        kind="stage_completed",
+        run_id="x",
+        sequence=5,
+        timestamp=FIXED_TIME,
+        stage_id="RecordTrial",
+        output={"report": "x"},
     )
     recorder.observe_workflow_event(evt)
     assert recorder.annotations_dropped == 1
@@ -793,13 +792,20 @@ def test_hook_anchor_forced_and_malformed_counted(tmp_path: Path) -> None:
     recorder2.begin_run(_trace_manifest())
     recorder2.begin_stage_visit("RecordTrial")
     evt2 = WorkflowEvent(
-        kind="stage_completed", run_id="x", sequence=3, timestamp=FIXED_TIME,
-        stage_id="RecordTrial", output={"report": "x"},
+        kind="stage_completed",
+        run_id="x",
+        sequence=3,
+        timestamp=FIXED_TIME,
+        stage_id="RecordTrial",
+        output={"report": "x"},
     )
     recorder2.observe_workflow_event(evt2)
     with pytest.raises(TraceError, match="does not belong to visit"):
         recorder2.record_annotation(
-            "nemoir.autoresearch/v1", "trial_finished", _trial_payload(), anchor_sequence=999,
+            "nemoir.autoresearch/v1",
+            "trial_finished",
+            _trial_payload(),
+            anchor_sequence=999,
         )
 
 
@@ -876,9 +882,7 @@ def test_annotation_malformed_rejected(tmp_path: Path) -> None:
     fresh = _make_recorder(tmp_path, name="b.nemotrace")
     fresh.begin_run(_trace_manifest())
     with pytest.raises(TraceError, match="enclosing stage visit"):
-        fresh.record_annotation(
-            "nemoir.autoresearch/v1", "trial_finished", _trial_payload()
-        )
+        fresh.record_annotation("nemoir.autoresearch/v1", "trial_finished", _trial_payload())
 
 
 def test_annotation_secret_scan_omits_or_masks(tmp_path: Path) -> None:
@@ -923,13 +927,9 @@ async def test_blocked_finalization_is_loud_without_double_terminal(tmp_path: Pa
     async def sink(event: Any) -> None:
         seen.append(event)
 
-    recorder = _make_recorder(
-        tmp_path, model=ModelDescriptor(name="sk-blocked-0123456789abcdef")
-    )
+    recorder = _make_recorder(tmp_path, model=ModelDescriptor(name="sk-blocked-0123456789abcdef"))
     with pytest.raises(TraceError, match="blocked finalization"):
-        await runtime.run(
-            {"p": str(tmp_path / "f.txt")}, event_sink=sink, trace_recorder=recorder
-        )
+        await runtime.run({"p": str(tmp_path / "f.txt")}, event_sink=sink, trace_recorder=recorder)
     kinds = [event.kind for event in seen]
     assert "run_completed" in kinds
     assert "run_failed" not in kinds
@@ -1056,9 +1056,7 @@ def test_stage_completed_with_prohibited_output_keys_is_kept(tmp_path: Path) -> 
     assert report.ok, report.errors
     entries = read_archive_entries(path)
     ledger = [
-        json.loads(line)
-        for line in entries["public/events.ndjson"].split(b"\n")
-        if line.strip()
+        json.loads(line) for line in entries["public/events.ndjson"].split(b"\n") if line.strip()
     ]
     completed = [e for e in ledger if e["kind"] == "stage_completed"]
     assert len(completed) == 1

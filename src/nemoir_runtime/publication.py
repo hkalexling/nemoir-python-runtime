@@ -422,9 +422,7 @@ def _string(value: Any, what: str) -> str:
 
 
 def _string_list(value: Any, what: str) -> list[str]:
-    return [
-        _string(item, f"{what} item") for item in _list(value, what)
-    ]
+    return [_string(item, f"{what} item") for item in _list(value, what)]
 
 
 def _require_keys(
@@ -901,9 +899,7 @@ def scan_publication(
     summary = _build_summary(projected, events_bytes, source_summary)
     payloads = _build_entries(_build_manifest(manifest, trace_id), graph, projected, summary)
     findings = tuple(scan_cleartext_entries(payloads))
-    visits = {
-        str(record["stage_visit_id"]) for record in projected if "stage_visit_id" in record
-    }
+    visits = {str(record["stage_visit_id"]) for record in projected if "stage_visit_id" in record}
     stats = PublicationStats(
         event_count=len(projected),
         stage_visit_count=len(visits),
@@ -1000,9 +996,7 @@ def attestation_from_report(
     source = _dict(node.get("source"), "report source")
     publication = _dict(node.get("publication"), "report publication")
     options_node = _dict(node.get("options"), "report options")
-    _require_keys(
-        options_node, _OPTIONS_KEYS, "report options", required=sorted(_OPTIONS_KEYS)
-    )
+    _require_keys(options_node, _OPTIONS_KEYS, "report options", required=sorted(_OPTIONS_KEYS))
     keep = options_node["keep_relative_paths"]
     if not isinstance(keep, bool):
         msg = "report options keep_relative_paths must be a boolean"
@@ -1193,9 +1187,7 @@ def prepare_publication(
     compressed_bytes = destination_path.stat().st_size
     report = projection.report(attested=True, attestation=attestation)
     report_target = (
-        Path(report_path)
-        if report_path is not None
-        else publication_report_path(destination_path)
+        Path(report_path) if report_path is not None else publication_report_path(destination_path)
     )
     write_publication_report(report_target, report)
     return PublicationResult(

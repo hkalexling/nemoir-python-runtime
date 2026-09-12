@@ -130,9 +130,7 @@ def _artifact_facts(archive: Path) -> tuple[dict[str, Any], dict[str, Any]]:
 
 
 def _counter(entries: dict[str, bytes]) -> int:
-    return len(
-        [line for line in entries["public/events.ndjson"].split(b"\n") if line.strip()]
-    )
+    return len([line for line in entries["public/events.ndjson"].split(b"\n") if line.strip()])
 
 
 def plan_publication(
@@ -220,9 +218,7 @@ def plan_publication(
         "attestation": {
             "reviewer": None,
             "reviewed_at": None,
-            "redaction_policy": str(
-                capture.get("redaction_policy", PUBLICATION_REDACTION_POLICY)
-            ),
+            "redaction_policy": str(capture.get("redaction_policy", PUBLICATION_REDACTION_POLICY)),
             "scanner": SCANNER_RULESET,
             "consent": None,
         },
@@ -422,9 +418,7 @@ def verify_published(
                 "dict[str, Any]", json.loads(entries["integrity.json"].decode("utf-8"))
             )
             content_identity = str(integrity.get("content_identity", ""))
-            manifest = cast(
-                "dict[str, Any]", json.loads(entries[MANIFEST_PATH].decode("utf-8"))
-            )
+            manifest = cast("dict[str, Any]", json.loads(entries[MANIFEST_PATH].decode("utf-8")))
             capture: dict[str, Any] = manifest.get("capture") or {}
             if capture.get("profile") != "publication":
                 errors.append(

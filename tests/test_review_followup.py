@@ -7,6 +7,7 @@ Covers:
 - Medium-1 forward-compat unknown fields
 - Medium-2 unsafe-int in summary/integrity
 """
+
 from __future__ import annotations
 
 import json
@@ -31,8 +32,16 @@ from nemoir_runtime.trace import (
     SUMMARY_PATH,
 )
 from nemoir_runtime.runtime import (
-    InputSpec, StageSpec, WriteSpec, ReadSpec, RefSpec, GuardSpec, TransitionSpec,
-    StageExecutionSpec, WorkflowManifest, RunOptions,
+    InputSpec,
+    StageSpec,
+    WriteSpec,
+    ReadSpec,
+    RefSpec,
+    GuardSpec,
+    TransitionSpec,
+    StageExecutionSpec,
+    WorkflowManifest,
+    RunOptions,
 )
 from nemoir_runtime.tools import ToolRegistry
 from nemoir_runtime.errors import StageOutputValidationError
@@ -40,8 +49,10 @@ from nemoir_runtime.errors import StageOutputValidationError
 FIXED_TRACE_ID = "0123456789abcdef0123456789abcdef"
 FIXED_TIME = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
 
+
 def _fixed_clock():
     return FIXED_TIME
+
 
 def _validators_manifest():
     return WorkflowManifest(
@@ -53,17 +64,24 @@ def _validators_manifest():
         policies=(),
         stages=(
             StageSpec(
-                id="Start", prompt="start",
+                id="Start",
+                prompt="start",
                 reads=(ReadSpec(ref=RefSpec(kind="input", name="p"), optional=False),),
                 writes=(WriteSpec(name="note", type="string", optional=False),),
                 requires=frozenset(),
                 transitions=(
-                    TransitionSpec(to="Done", priority=0, reason="explicit_transition", guard=GuardSpec(kind="always")),
+                    TransitionSpec(
+                        to="Done",
+                        priority=0,
+                        reason="explicit_transition",
+                        guard=GuardSpec(kind="always"),
+                    ),
                 ),
                 execution=StageExecutionSpec(),
             ),
             StageSpec(
-                id="Done", prompt="done",
+                id="Done",
+                prompt="done",
                 reads=(),
                 writes=(WriteSpec(name="summary", type="string", optional=False),),
                 requires=frozenset(),
@@ -73,21 +91,31 @@ def _validators_manifest():
         ),
     )
 
+
 class _ScriptedExecutor(StageExecutor):
     def __init__(self, outputs):
         self._outputs = list(outputs)
+
     async def execute(self, ctx: StageContext):
         return self._outputs.pop(0)
+
 
 def _make_recorder(tmp_path: Path, **kwargs):
     params = {
         "profile": "audit",
-        "provenance": HostProvenance(frontend="nemo_dsl", target="python", compiler_version="0.1.9", ir_version="0.1", ir_sha256="sha256:"+"ab"*32),
+        "provenance": HostProvenance(
+            frontend="nemo_dsl",
+            target="python",
+            compiler_version="0.1.9",
+            ir_version="0.1",
+            ir_sha256="sha256:" + "ab" * 32,
+        ),
         "trace_id": FIXED_TRACE_ID,
         "clock": _fixed_clock,
     }
     params.update(kwargs)
     return TraceRecorder.create(tmp_path / "run.nemotrace", **params)
+
 
 def _build_valid_archive(tmp_path: Path) -> Path:
     # Run a minimal workflow to get a valid archive
@@ -97,6 +125,7 @@ def _build_valid_archive(tmp_path: Path) -> Path:
     runtime = WorkflowRuntime(manifest=manifest, tools=ToolRegistry([]), stage_executor=exec)
     rec = _make_recorder(tmp_path)
     import asyncio
+
     asyncio.run(runtime.run({"p": "x"}, trace_recorder=rec))
     # finalize already done by run? No, need finish_run
     # runtime.run with recorder will have begun/finished via runtime? Actually runtime.run calls rec.begin_run/finish via trace_recorder arg
@@ -112,9 +141,11 @@ def _build_valid_archive(tmp_path: Path) -> Path:
         rec.finish_run("complete")
     return path
 
+
 def _read_entries(path: Path):
     with zipfile.ZipFile(path) as z:
         return {name: z.read(name) for name in z.namelist()}
+
 
 def _write_entries(tmp_path: Path, entries: dict[str, bytes], out_path: Path):
     # Recompute integrity and content identity
@@ -124,22 +155,41 @@ def _write_entries(tmp_path: Path, entries: dict[str, bytes], out_path: Path):
     # Build integrity entries sorted
     integrity_entries = []
     for name, data in sorted(payloads.items()):
-        integrity_entries.append({
-            "path": name,
-            "media_type": "application/x-ndjson" if name.endswith(".ndjson") else "application/json",
-            "uncompressed_bytes": len(data),
-            "sha256": sha256_tag(data),
-        })
-    identity_entries = sorted([{"path": e["path"], "sha256": e["sha256"], "uncompressed_bytes": e["uncompressed_bytes"]} for e in integrity_entries], key=lambda x: x["path"])
+        integrity_entries.append(
+            {
+                "path": name,
+                "media_type": "application/x-ndjson"
+                if name.endswith(".ndjson")
+                else "application/json",
+                "uncompressed_bytes": len(data),
+                "sha256": sha256_tag(data),
+            }
+        )
+    identity_entries = sorted(
+        [
+            {
+                "path": e["path"],
+                "sha256": e["sha256"],
+                "uncompressed_bytes": e["uncompressed_bytes"],
+            }
+            for e in integrity_entries
+        ],
+        key=lambda x: x["path"],
+    )
     identity_obj = {"format": "nemoir.trace.content-identity/0.1", "entries": identity_entries}
     content_id = sha256_tag(to_canonical_bytes(identity_obj))
-    integrity_obj = {"format": "nemoir.trace.integrity/0.1", "algorithm": "sha256", "entries": integrity_entries, "content_identity": content_id}
+    integrity_obj = {
+        "format": "nemoir.trace.integrity/0.1",
+        "algorithm": "sha256",
+        "entries": integrity_entries,
+        "content_identity": content_id,
+    }
     payloads[INTEGRITY_PATH] = to_canonical_bytes(integrity_obj)
     # Write deterministic zip
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(out_path, "w") as z:
         for name in sorted(payloads):
-            info = zipfile.ZipInfo(filename=name, date_time=(1980,1,1,0,0,0))
+            info = zipfile.ZipInfo(filename=name, date_time=(1980, 1, 1, 0, 0, 0))
             info.compress_type = zipfile.ZIP_DEFLATED
             info.compress_level = 6
             info.create_system = 3
@@ -203,7 +253,7 @@ def test_verifier_handles_incomplete_integrity_without_crash(tmp_path: Path):
     tmp_bad = tmp_path / "bad2.nemotrace"
     with zipfile.ZipFile(tmp_bad, "w") as z:
         for name in sorted(new_payloads):
-            info = zipfile.ZipInfo(filename=name, date_time=(1980,1,1,0,0,0))
+            info = zipfile.ZipInfo(filename=name, date_time=(1980, 1, 1, 0, 0, 0))
             info.compress_type = zipfile.ZIP_DEFLATED
             info.compress_level = 6
             info.create_system = 3
@@ -214,20 +264,27 @@ def test_verifier_handles_incomplete_integrity_without_crash(tmp_path: Path):
     # Should not have raised, and should contain integrity error, not KeyError
     assert any("integrity" in e.lower() for e in report.errors)
 
+
 def test_observer_does_not_turn_success_into_failure(tmp_path: Path):
     # Direct test of emitter isolation: observer that raises should not prevent sink
     import asyncio
+
     async def _run():
         sink_events = []
+
         async def sink(ev):
             sink_events.append(ev.kind)
+
         async def failing_observer(ev):
             raise RuntimeError("observer boom")
+
         emitter = WorkflowEventEmitter(run_id="abc", sink=sink, observer=failing_observer)
         await emitter.emit("run_started", metadata={"workflow_id": "x", "entry": "Start"})
         return sink_events
+
     events = __import__("asyncio").run(_run())
     assert "run_started" in events
+
 
 def test_lone_surrogate_validation_consistent():
     # Both runtimes should reject lone surrogate in string output
@@ -236,13 +293,26 @@ def test_lone_surrogate_validation_consistent():
     lone = "\ud800"
     # Check Runtime validation directly
     from nemoir_runtime.runtime import StageSpec as SSpec
+
     # Use the helper validation function indirectly via runtime.run
     import asyncio
+
     async def _run_one(with_trace: bool):
         exec = _ScriptedExecutor([{"note": lone}, {"summary": "bye"}])
         runtime = WorkflowRuntime(manifest=manifest, tools=ToolRegistry([]), stage_executor=exec)
         if with_trace:
-            rec = TraceRecorder.create(Path("/tmp") / f"lone_{id(exec)}.nemotrace", profile="audit", provenance=HostProvenance(frontend="nemo_dsl", target="python", compiler_version="0.1.9", ir_version="0.1", ir_sha256="sha256:"+"ab"*32), clock=_fixed_clock)
+            rec = TraceRecorder.create(
+                Path("/tmp") / f"lone_{id(exec)}.nemotrace",
+                profile="audit",
+                provenance=HostProvenance(
+                    frontend="nemo_dsl",
+                    target="python",
+                    compiler_version="0.1.9",
+                    ir_version="0.1",
+                    ir_sha256="sha256:" + "ab" * 32,
+                ),
+                clock=_fixed_clock,
+            )
             try:
                 await runtime.run({"p": "x"}, trace_recorder=rec)
             except StageOutputValidationError:
@@ -267,11 +337,13 @@ def test_lone_surrogate_validation_consistent():
             except Exception as e:
                 return type(e).__name__
         return "ok"
+
     # Both should be validation_error, not observer crash
     r1 = asyncio.run(_run_one(False))
     r2 = asyncio.run(_run_one(True))
     assert r1 == "validation_error"
     assert r2 == "validation_error"
+
 
 def test_response_bytes_canonical_parity():
     # {"a": 1, "label": "é"} canonical is 20 bytes, not 27 with sort_keys spaces/escapes
@@ -279,6 +351,7 @@ def test_response_bytes_canonical_parity():
     assert _response_bytes(ModelResponse(content="a", tool_calls=())) == len("a".encode())
     # tool call with unicode
     from nemoir_runtime.models import ModelToolCall
+
     tc = ModelToolCall(id="call_0", name="t", arguments={"a": 1, "label": "é"})
     resp2 = ModelResponse(content=None, tool_calls=(tc,))
     # Canonical bytes: {"a":1,"label":"é"} -> length 20
@@ -288,9 +361,10 @@ def test_response_bytes_canonical_parity():
     # Ensure not the old escaped length 27
     assert _response_bytes(resp2) != 27
     # Nested
-    tc2 = ModelToolCall(id="call_0", name="t", arguments={"a": 1, "nested": {"x": [1,2]}})
+    tc2 = ModelToolCall(id="call_0", name="t", arguments={"a": 1, "nested": {"x": [1, 2]}})
     resp3 = ModelResponse(content=None, tool_calls=(tc2,))
-    assert _response_bytes(resp3) == len(to_canonical_bytes({"a": 1, "nested": {"x": [1,2]}}))
+    assert _response_bytes(resp3) == len(to_canonical_bytes({"a": 1, "nested": {"x": [1, 2]}}))
+
 
 def test_forward_compat_extra_field_is_warning_not_error(tmp_path: Path):
     path = _build_valid_archive(tmp_path)
@@ -312,6 +386,7 @@ def test_forward_compat_extra_field_is_warning_not_error(tmp_path: Path):
     assert report.ok, report.errors
     assert any("unexpected fields" in w for w in report.warnings)
 
+
 def test_unsafe_int_in_summary_rejected(tmp_path: Path):
     path = _build_valid_archive(tmp_path)
     entries = _read_entries(path)
@@ -323,6 +398,7 @@ def test_unsafe_int_in_summary_rejected(tmp_path: Path):
     report = verify_archive(out)
     assert not report.ok
     assert any("unsafe" in e for e in report.errors)
+
 
 def test_unsafe_int_in_events_rejected_via_writer_scan(tmp_path: Path):
     # Ensure writer final_scan blocks unsafe int

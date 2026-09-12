@@ -21,6 +21,7 @@ from nemoir_runtime.replay import (
     TapedModelAdapter,
     TapedReplayError,
     TapedToolRegistry,
+    _unmark_fixture,  # type: ignore[reportPrivateUsage]
     replay_trace,
 )
 from nemoir_runtime.runtime import (
@@ -246,16 +247,12 @@ async def test_taped_fixtures_fail_closed() -> None:
     model = TapedModelAdapter({})
     with pytest.raises(TapedReplayError, match="no model fixture"):
         await model.complete(
-            ModelRequest(
-                stage_id="B", messages=(), tools=(), output_schema={}, options={}
-            )
+            ModelRequest(stage_id="B", messages=(), tools=(), output_schema={}, options={})
         )
 
     tools = TapedToolRegistry([])
     with pytest.raises(TapedReplayError, match="no tool fixture"):
-        await tools.call(
-            "fs.read", {}, ToolContext(workflow_id="w", stage_id="A", inputs={})
-        )
+        await tools.call("fs.read", {}, ToolContext(workflow_id="w", stage_id="A", inputs={}))
 
 
 class _ToolCallAdapter:
@@ -306,9 +303,7 @@ def _scoped_manifest() -> WorkflowManifest:
                     expr=ExprSpec(
                         kind="method_call",
                         method="contains",
-                        receiver=ExprSpec(
-                            kind="ref", ref=RefSpec(kind="bound", name="command")
-                        ),
+                        receiver=ExprSpec(kind="ref", ref=RefSpec(kind="bound", name="command")),
                         args=(ExprSpec(kind="literal", value="python"),),
                     ),
                 ),
@@ -376,7 +371,6 @@ async def test_taped_replay_reproduces_policy_outcomes(tmp_path: Path) -> None:
 
 def test_fixture_placeholders_cover_marker_types() -> None:
     """Typed placeholders satisfy validation without trusting values."""
-    from nemoir_runtime.replay import _unmark_fixture  # noqa: PLC0415
 
     def marker(value_type: str, length: Any = None) -> dict[str, Any]:
         inner: dict[str, Any] = {"token": "r-1", "reason": "x", "value_type": value_type}

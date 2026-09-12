@@ -231,9 +231,7 @@ def test_generated_package_run_with_fake_adapter_succeeds(tmp_path: Path) -> Non
         async def complete(self, request: Any) -> ModelResponse:
             self.calls.append(request)
             stage_id = request.stage_id
-            return self._responses.get(
-                stage_id, ModelResponse(content='{"summary": "unknown"}')
-            )
+            return self._responses.get(stage_id, ModelResponse(content='{"summary": "unknown"}'))
 
     fake = StageAwareAdapter()
     agent = coding_agent.Agent(model=fake, tools=_make_tools())

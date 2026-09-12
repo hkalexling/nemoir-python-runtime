@@ -201,9 +201,7 @@ def _manifest_from_dict(data: Any) -> WorkflowManifest:
     manifest_data = root.get("manifest", root)
     manifest_map = _req_dict(manifest_data, "vault manifest snapshot")
     raw_stages = _req_list(manifest_map.get("stages"), "vault manifest stages")
-    raw_policies = _req_list(
-        manifest_map.get("policies") or [], "vault manifest policies"
-    )
+    raw_policies = _req_list(manifest_map.get("policies") or [], "vault manifest policies")
     raw_inputs = _req_list(manifest_map.get("inputs") or [], "vault manifest inputs")
     raw_exits = _req_list(manifest_map.get("exit_stage_ids") or [], "vault manifest exits")
     raw_capabilities = _req_list(
@@ -212,21 +210,15 @@ def _manifest_from_dict(data: Any) -> WorkflowManifest:
     stages: list[StageSpec] = []
     for raw_stage in raw_stages:
         stage = _req_dict(raw_stage, "vault manifest stage")
-        execution_map = _req_dict(
-            stage.get("execution") or {}, "vault manifest execution"
-        )
-        exec_args_map = _req_dict(
-            execution_map.get("args") or {}, "vault manifest execution args"
-        )
+        execution_map = _req_dict(stage.get("execution") or {}, "vault manifest execution")
+        exec_args_map = _req_dict(execution_map.get("args") or {}, "vault manifest execution args")
         exec_args: dict[str, ExprSpec] = {}
         for arg_name, arg_expr in exec_args_map.items():
             parsed = _expr_from_dict(arg_expr)
             if parsed is not None:
                 exec_args[str(arg_name)] = parsed
         raw_writes = _req_list(stage.get("writes") or [], "vault manifest writes")
-        raw_transitions = _req_list(
-            stage.get("transitions") or [], "vault manifest transitions"
-        )
+        raw_transitions = _req_list(stage.get("transitions") or [], "vault manifest transitions")
         raw_reads = _req_list(stage.get("reads") or [], "vault manifest reads")
         raw_requires = _req_list(stage.get("requires") or [], "vault manifest requires")
         transitions: list[TransitionSpec] = []
@@ -279,9 +271,7 @@ def _manifest_from_dict(data: Any) -> WorkflowManifest:
                 if parsed_ref is not None:
                     req_args[str(req_name)] = parsed_ref
             requires.append(
-                RequiredCapabilitySpec(
-                    capability=str(req_map.get("capability")), args=req_args
-                )
+                RequiredCapabilitySpec(capability=str(req_map.get("capability")), args=req_args)
             )
         policy_kind = policy_map.get("kind", "deny")
         policies.append(
@@ -324,7 +314,6 @@ def _read_from_dict(data: Any) -> Any:
     return ReadSpec(ref=ref, optional=bool(mapping.get("optional", False)))
 
 
-
 # ---------------------------------------------------------------------------
 # Taped fixtures (no live effects by construction)
 # ---------------------------------------------------------------------------
@@ -360,9 +349,7 @@ def _marker_aware_equal(replayed: Any, recorded: Any) -> bool:
         recorded_map = cast("dict[Any, Any]", recorded)
         replayed_map = cast("dict[Any, Any]", replayed)
         for key, expected in recorded_map.items():
-            if key not in replayed_map or not _marker_aware_equal(
-                replayed_map[key], expected
-            ):
+            if key not in replayed_map or not _marker_aware_equal(replayed_map[key], expected):
                 return False
         return True
     if isinstance(recorded, list):
@@ -650,10 +637,7 @@ class TapedToolRegistry(ToolRegistry):
             raise ToolInvocationError(msg)
         result = payload_map.get("result")
         if _is_redaction_marker(result):
-            msg = (
-                f"taped replay cannot serve a redacted fixture for "
-                f"capability '{capability}'"
-            )
+            msg = f"taped replay cannot serve a redacted fixture for capability '{capability}'"
             raise TapedReplayError(msg)
         # Nested markers become typed placeholders: the live run already
         # proved validity at those positions, so validation must not fail
@@ -742,9 +726,7 @@ def _ledger_key(record: Mapping[str, Any]) -> tuple[Any, ...]:
 
 @dataclass
 class _ReplayCollector:
-    events: list[WorkflowEvent] = field(
-        default_factory=lambda: cast("list[WorkflowEvent]", [])
-    )
+    events: list[WorkflowEvent] = field(default_factory=lambda: cast("list[WorkflowEvent]", []))
 
     async def __call__(self, event: WorkflowEvent) -> None:
         self.events.append(event)
@@ -774,9 +756,7 @@ async def replay_trace(
             verification=unlock_report,
         )
     try:
-        manifest_record = next(
-            r for r in records if r.get("record_type") == "full_workflow_ir"
-        )
+        manifest_record = next(r for r in records if r.get("record_type") == "full_workflow_ir")
     except StopIteration:
         return ReplayReport(
             matched=False,
@@ -812,9 +792,7 @@ async def replay_trace(
             verification=unlock_report,
         )
     try:
-        run_inputs_record = next(
-            r for r in records if r.get("record_type") == "run_inputs"
-        )
+        run_inputs_record = next(r for r in records if r.get("record_type") == "run_inputs")
     except StopIteration:
         return ReplayReport(
             matched=False,
@@ -867,7 +845,7 @@ async def replay_trace(
         for capability in stage.requires:
             schema = stub_schemas.setdefault(capability, {"inputs": {}, "outputs": {}})
             if stage.execution.kind == "tool" and stage.execution.capability == capability:
-                for arg_name in (stage.execution.args or {}):
+                for arg_name in stage.execution.args or {}:
                     schema["inputs"].setdefault(arg_name, "json")
             for write in stage.writes:
                 schema["outputs"].setdefault(write.name, write.type)
@@ -915,9 +893,7 @@ async def replay_trace(
     if manifest_status == "failed" and replayed_status != "failed":
         divergences.append("recorded run failed but replay completed")
     elif manifest_status == "complete" and replayed_status != "complete":
-        divergences.append(
-            replay_error or "recorded run completed but replay did not finish"
-        )
+        divergences.append(replay_error or "recorded run completed but replay did not finish")
     steps = sum(1 for e in collector.events if e.kind == "stage_completed")
     return ReplayReport(
         matched=not divergences,

@@ -79,6 +79,7 @@ def _empty_alias_map() -> dict[str, str | Path]:
     """Typed empty factory for :attr:`TraceConfig.path_aliases`."""
     return {}
 
+
 MANIFEST_PATH = "manifest.json"
 GRAPH_PATH = "public/workflow.graph.json"
 EVENTS_PATH = "public/events.ndjson"
@@ -420,9 +421,7 @@ class _Finding:
     pointer: str
 
 
-def _iter_strings(
-    node: Any, pointer: str
-) -> Iterator[tuple[str, str | None, str | None]]:
+def _iter_strings(node: Any, pointer: str) -> Iterator[tuple[str, str | None, str | None]]:
     """Yield (pointer, key_or_None, string) for every string in a structure."""
     if isinstance(node, str):
         yield pointer, None, node
@@ -500,9 +499,11 @@ _MASKABLE_PREFIXES = (
 
 
 def _is_maskable(pointer: str) -> bool:
-    return pointer in ("/text", "/result") or pointer.startswith(
-        ("/output/", "/annotation/payload/")
-    ) or pointer in _MASKABLE_PREFIXES
+    return (
+        pointer in ("/text", "/result")
+        or pointer.startswith(("/output/", "/annotation/payload/"))
+        or pointer in _MASKABLE_PREFIXES
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -590,7 +591,7 @@ def _validate_autoresearch_metrics(value: Any, *, field: str) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         msg = f"trial_finished payload has invalid {field}: must be an object"
         raise TraceError(msg)
-    mapping = dict(value)
+    mapping = dict(cast("Mapping[str, Any]", value))
     for key in mapping:
         if key not in _ANNOTATION_METRIC_NUMBERS and key not in _ANNOTATION_METRIC_BOOLS:
             msg = f"trial_finished payload has unknown metrics field {key!r} in {field}"
@@ -622,7 +623,7 @@ def _validate_autoresearch_metrics(value: Any, *, field: str) -> dict[str, Any]:
     return mapping
 
 
-def _validate_autoresearch_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+def _validate_autoresearch_payload(payload: Any) -> dict[str, Any]:
     """Validate a ``trial_finished`` payload and return a plain copy.
 
     Raises :class:`TraceError` on any shape violation. Raw prose, patches,
@@ -633,7 +634,7 @@ def _validate_autoresearch_payload(payload: Mapping[str, Any]) -> dict[str, Any]
     if not isinstance(payload, Mapping):
         msg = "trial_finished payload must be an object"
         raise TraceError(msg)
-    data = dict(payload)
+    data = dict(cast("Mapping[str, Any]", payload))
     unknown = set(data) - _ANNOTATION_ALLOWED
     if unknown:
         msg = f"trial_finished payload has unknown fields {sorted(unknown)}"
@@ -659,16 +660,14 @@ def _validate_autoresearch_payload(payload: Mapping[str, Any]) -> dict[str, Any]
         raise TraceError(msg)
     parent_ref = data.get("parent_ref")
     if parent_ref is not None and (
-        not isinstance(parent_ref, str)
-        or not re.fullmatch(r"candidate-[1-9][0-9]*", parent_ref)
+        not isinstance(parent_ref, str) or not re.fullmatch(r"candidate-[1-9][0-9]*", parent_ref)
     ):
         msg = f"trial_finished payload has invalid parent_ref {parent_ref!r}"
         raise TraceError(msg)
     for digest_key in ("candidate_digest", "parent_digest"):
         digest = data.get(digest_key)
         if digest is not None and (
-            not isinstance(digest, str)
-            or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+            not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
         ):
             msg = f"trial_finished payload has invalid {digest_key} {digest!r}"
             raise TraceError(msg)
@@ -705,8 +704,7 @@ def _validate_autoresearch_payload(payload: Mapping[str, Any]) -> dict[str, Any]
         raise TraceError(msg)
     mechanism_id = data.get("mechanism_id")
     if mechanism_id is not None and (
-        not isinstance(mechanism_id, str)
-        or not 1 <= len(mechanism_id) <= 128
+        not isinstance(mechanism_id, str) or not 1 <= len(mechanism_id) <= 128
     ):
         msg = "trial_finished payload has invalid mechanism_id"
         raise TraceError(msg)
@@ -714,7 +712,7 @@ def _validate_autoresearch_payload(payload: Mapping[str, Any]) -> dict[str, Any]
     if not isinstance(artifact_refs, (list, tuple)) or isinstance(artifact_refs, (str, bytes)):
         msg = "trial_finished payload has invalid artifact_refs: must be an array"
         raise TraceError(msg)
-    refs = list(artifact_refs)
+    refs = list(cast("list[Any] | tuple[Any, ...]", artifact_refs))
     if len(set(refs)) != len(refs):
         msg = "trial_finished payload has duplicate artifact_refs"
         raise TraceError(msg)
@@ -948,9 +946,7 @@ def _vault_primitives() -> tuple[Any, Any]:
 
 
 def _derive_vault_key(passphrase: bytes, salt: bytes) -> bytes:
-    return hashlib.pbkdf2_hmac(
-        "sha256", passphrase, salt, VAULT_KDF_ITERATIONS, dklen=32
-    )
+    return hashlib.pbkdf2_hmac("sha256", passphrase, salt, VAULT_KDF_ITERATIONS, dklen=32)
 
 
 def encrypt_vault_records(
@@ -1016,13 +1012,13 @@ def load_generated_provenance(package_name: str) -> HostProvenance:
     try:
         from importlib import resources  # noqa: PLC0415
 
-        workflow_text = resources.files(package_name).joinpath("workflow.json").read_text(
-            encoding="utf-8"
+        workflow_text = (
+            resources.files(package_name).joinpath("workflow.json").read_text(encoding="utf-8")
         )
         provenance_text = (
-            resources.files(package_name).joinpath("trace-provenance.json").read_text(
-                encoding="utf-8"
-            )
+            resources.files(package_name)
+            .joinpath("trace-provenance.json")
+            .read_text(encoding="utf-8")
         )
         workflow_value = parse_json_strict(workflow_text)
         actual = sha256_tag(to_canonical_bytes(workflow_value))
@@ -1228,8 +1224,7 @@ class TraceRecorder:
         secrets: tuple[str, ...] | list[str] | None = None,
         trace_id: str | None = None,
         clock: Callable[[], datetime] | None = None,
-        on_stage_completed: Callable[[Mapping[str, Any]], Mapping[str, Any] | None]
-        | None = None,
+        on_stage_completed: Callable[[Mapping[str, Any]], Mapping[str, Any] | None] | None = None,
         vault_passphrase: str | bytes | None = None,
         vault_capture: VaultCapture | None = None,
     ) -> TraceRecorder:
@@ -1320,9 +1315,7 @@ class TraceRecorder:
         self._visit_to_stage[visit_id] = stage_id
         return visit_id
 
-    def begin_model_call(
-        self, _stage_id: str = "", stage_visit_id: str | None = None
-    ) -> str:
+    def begin_model_call(self, _stage_id: str = "", stage_visit_id: str | None = None) -> str:
         """Assign the next run-local model-call id."""
         self._require_begun()
         self._model_count += 1
@@ -1331,9 +1324,7 @@ class TraceRecorder:
         self._pending_models.setdefault(visit, []).append(call_id)
         return call_id
 
-    def record_model_request(
-        self, model_call_id: str, request: Mapping[str, Any] | None
-    ) -> None:
+    def record_model_request(self, model_call_id: str, request: Mapping[str, Any] | None) -> None:
         """Retain a model request for the encrypted replay vault.
 
         The public ledger keeps only counts; messages, tool schemas, and
@@ -1515,9 +1506,7 @@ class TraceRecorder:
             "message": self._scrub_vault_value(message),
         }
         if stashed.get("args") is not None:
-            payload["args"] = self._scrub_vault_value(
-                _to_jsonable(dict(stashed["args"]))
-            )
+            payload["args"] = self._scrub_vault_value(_to_jsonable(dict(stashed["args"])))
         if stashed.get("capability") is not None:
             payload["capability"] = stashed["capability"]
         self._append_vault_record(
@@ -1558,9 +1547,7 @@ class TraceRecorder:
                     "matched": bool(candidate_mapping.get("matched", False)),
                 }
             )
-        self._transition_evidence.append(
-            {"stage_visit_id": stage_visit_id, "candidates": cleaned}
-        )
+        self._transition_evidence.append({"stage_visit_id": stage_visit_id, "candidates": cleaned})
         if not self._vault_enabled:
             return
         capture = self._config.vault_capture
@@ -1630,8 +1617,7 @@ class TraceRecorder:
             findings = [
                 f
                 for f in _scan_strings(wrapper, "", self._registry)
-                if f.rule != "registered_secret"
-                and not self._vault_finding_excused(wrapper, f)
+                if f.rule != "registered_secret" and not self._vault_finding_excused(wrapper, f)
             ]
             if not findings:
                 break
@@ -1660,9 +1646,7 @@ class TraceRecorder:
         if _is_redaction_marker(_node_at_pointer(record, finding.pointer)):
             return True
         if finding.rule == "prohibited_field":
-            key = finding.pointer.rsplit("/", 1)[-1].replace("~1", "/").replace(
-                "~0", "~"
-            )
+            key = finding.pointer.rsplit("/", 1)[-1].replace("~1", "/").replace("~0", "~")
             return key.lower() not in _VAULT_CREDENTIAL_KEYS
         return False
 
@@ -1750,9 +1734,7 @@ class TraceRecorder:
             return None
         visit = stage_visit_id or self._current_visit
         stage = stage_id or (
-            self._visit_to_stage.get(visit, self._current_stage_id)
-            if visit is not None
-            else None
+            self._visit_to_stage.get(visit, self._current_stage_id) if visit is not None else None
         )
         if visit is None or stage is None:
             msg = "trace annotation requires an enclosing stage visit"
@@ -1760,19 +1742,20 @@ class TraceRecorder:
         if not re.fullmatch(r"s-[1-9][0-9]*", visit):
             msg = f"trace annotation has invalid stage_visit_id {visit!r}"
             raise TraceError(msg)
-        if not isinstance(stage, str) or not 1 <= len(stage) <= 256:
-            msg = f"trace annotation has invalid stage_id {stage!r}"
+        # ``stage`` is derived from host-supplied ids: validate as untrusted.
+        stage_value: Any = stage
+        if not isinstance(stage_value, str) or not 1 <= len(stage_value) <= 256:
+            msg = f"trace annotation has invalid stage_id {stage_value!r}"
             raise TraceError(msg)
-        if (
-            anchor_sequence is not None
-            and (
-                isinstance(anchor_sequence, bool)
-                or not isinstance(anchor_sequence, int)
-                or anchor_sequence < 1
-                or not MIN_SAFE_INT <= anchor_sequence <= MAX_SAFE_INT
-            )
+        # ``anchor_sequence`` comes from host hooks: validate as untrusted.
+        anchor_value: Any = anchor_sequence
+        if anchor_value is not None and (
+            isinstance(anchor_value, bool)
+            or not isinstance(anchor_value, int)
+            or anchor_value < 1
+            or not MIN_SAFE_INT <= anchor_value <= MAX_SAFE_INT
         ):
-            msg = f"trace annotation has invalid anchor_sequence {anchor_sequence!r}"
+            msg = f"trace annotation has invalid anchor_sequence {anchor_value!r}"
             raise TraceError(msg)
         if anchor_sequence is not None:
             # Anchor must belong to the declared visit when that visit has
@@ -1795,17 +1778,18 @@ class TraceRecorder:
             # mechanism IDs require explicit publication review. The audit
             # profile keeps only opaque refs; reject cleartext identifiers.
             if self._config.profile == "audit":
-                if not isinstance(projected_payload, dict):
-                    msg = "trial_finished payload must be an object"
-                    raise TraceError(msg)
                 if projected_payload.get("candidate_digest") is not None:
                     msg = "audit profile rejects non-null candidate_digest (requires publication review)"
                     raise TraceError(msg)
                 if projected_payload.get("parent_digest") is not None:
-                    msg = "audit profile rejects non-null parent_digest (requires publication review)"
+                    msg = (
+                        "audit profile rejects non-null parent_digest (requires publication review)"
+                    )
                     raise TraceError(msg)
                 if projected_payload.get("mechanism_id") is not None:
-                    msg = "audit profile rejects non-null mechanism_id (requires publication review)"
+                    msg = (
+                        "audit profile rejects non-null mechanism_id (requires publication review)"
+                    )
                     raise TraceError(msg)
         else:
             # Unknown namespace: retain only namespace/kind per policy §11.
@@ -1827,7 +1811,7 @@ class TraceRecorder:
         }
         if anchor_sequence is not None:
             record["anchor_sequence"] = anchor_sequence
-        if isinstance(projected_payload, dict) and "$redacted" in projected_payload:
+        if "$redacted" in projected_payload:
             record["redacted_fields"] = ["/annotation/payload"]
         record = self._apply_registry(record)
         omitted = self._scan_and_mask(record)
@@ -1881,9 +1865,7 @@ class TraceRecorder:
             self._flush_transition_evidence(record, event)
         return record
 
-    def _capture_stage_snapshot(
-        self, record: dict[str, Any], event: WorkflowEvent
-    ) -> None:
+    def _capture_stage_snapshot(self, record: dict[str, Any], event: WorkflowEvent) -> None:
         """Retain full stage outputs for the encrypted vault (Phase 4)."""
         if not self._vault_enabled:
             return
@@ -1892,9 +1874,7 @@ class TraceRecorder:
         try:
             payload = {
                 "stage_id": event.stage_id or record.get("stage_id"),
-                "output": self._scrub_vault_value(
-                    _to_jsonable(dict(event.output or {}))
-                ),
+                "output": self._scrub_vault_value(_to_jsonable(dict(event.output or {}))),
             }
         except TraceError:
             payload = {
@@ -1909,9 +1889,7 @@ class TraceRecorder:
             stage_visit_id=record.get("stage_visit_id"),
         )
 
-    def _flush_transition_evidence(
-        self, record: dict[str, Any], event: WorkflowEvent
-    ) -> None:
+    def _flush_transition_evidence(self, record: dict[str, Any], event: WorkflowEvent) -> None:
         """Link pending guard evidence to its ledger sequence (Phase 4)."""
         if not self._vault_enabled:
             return
@@ -1929,9 +1907,7 @@ class TraceRecorder:
                 stage_visit_id=visit,
             )
 
-    def _maybe_emit_stage_annotation(
-        self, record: dict[str, Any], event: WorkflowEvent
-    ) -> None:
+    def _maybe_emit_stage_annotation(self, record: dict[str, Any], event: WorkflowEvent) -> None:
         """Invoke the host ``on_stage_completed`` hook, if configured.
 
         Hook failures never break the run: they are swallowed so workflow
@@ -1957,7 +1933,7 @@ class TraceRecorder:
         if spec is None:
             return
         try:
-            if not isinstance(spec, Mapping):
+            if not isinstance(spec, Mapping):  # type: ignore[reportUnnecessaryIsInstance]
                 self._record_annotation_warning(record, "invalid_spec")
                 return
             namespace = spec.get("namespace")
@@ -1969,6 +1945,7 @@ class TraceRecorder:
             if not isinstance(payload, Mapping):
                 self._record_annotation_warning(record, "invalid_payload")
                 return
+            payload = cast("Mapping[str, Any]", payload)
             # Force the anchor to the triggering sequence; never trust a
             # hook-returned anchor (prevents cross-visit mislinking).
             triggering = getattr(event, "sequence", None)
@@ -1998,7 +1975,11 @@ class TraceRecorder:
         stage = record.get("stage_id")
         stage_str = stage if isinstance(stage, str) else "unknown"
         # Safe fixed vocabulary only; never echo payload values.
-        safe_reason = reason if reason in ("hook_failed", "invalid_spec", "invalid_payload") else "invalid_payload"
+        safe_reason = (
+            reason
+            if reason in ("hook_failed", "invalid_spec", "invalid_payload")
+            else "invalid_payload"
+        )
         self._annotation_warnings.append(f"{stage_str}:{safe_reason}")
 
     # -- projection ------------------------------------------------------
@@ -2327,9 +2308,7 @@ class TraceRecorder:
         else:
             required: Any = metadata.get("required_capabilities")
             req_items: list[Any] = (
-                list(cast("Sequence[Any]", required))
-                if isinstance(required, (list, tuple))
-                else []
+                list(cast("Sequence[Any]", required)) if isinstance(required, (list, tuple)) else []
             )
             if req_items and all(isinstance(c, str) for c in req_items):
                 meta["required_capabilities"] = sorted(set(req_items))
@@ -2421,7 +2400,7 @@ class TraceRecorder:
         try:
             candidate = Path(text).expanduser()
             if not candidate.is_absolute():
-                candidate = (Path.cwd() / candidate)
+                candidate = Path.cwd() / candidate
             candidate = candidate.resolve(strict=False)
         except OSError:
             candidate = None
@@ -2490,9 +2469,7 @@ class TraceRecorder:
             )
             return projected, redacted
         if capability in ("user.elicit", "user.confirm"):
-            projected = {
-                key: self._new_marker("private_content", args[key]) for key in args
-            }
+            projected = {key: self._new_marker("private_content", args[key]) for key in args}
             redacted.extend(f"/args/{key}" for key in args)
             return projected, redacted
         if capability in (
@@ -2501,9 +2478,7 @@ class TraceRecorder:
             "browser.js.run",
             "browser.js.sandbox",
         ):
-            projected = {
-                key: self._new_marker("private_content", args[key]) for key in args
-            }
+            projected = {key: self._new_marker("private_content", args[key]) for key in args}
             redacted.extend(f"/args/{key}" for key in args)
             return projected, redacted
         # Unknown capability: name/status/timing only; all args private.
@@ -2653,9 +2628,7 @@ class TraceRecorder:
             "complete": complete,
             "frontend": prov.frontend,
             "target": (
-                prov.target
-                if prov.target in ("python", "web", "manual", "imported")
-                else "manual"
+                prov.target if prov.target in ("python", "web", "manual", "imported") else "manual"
             ),
             "compiler_version": prov.compiler_version,
             "runtime": {"name": RUNTIME_NAME, "version": runtime_version()},
@@ -2793,9 +2766,7 @@ class TraceRecorder:
             "workflow_id": getattr(self._manifest, "workflow_id", "unknown"),
         }
 
-    def _seal_vault_entries(
-        self, payloads: dict[str, bytes], manifest_obj: dict[str, Any]
-    ) -> None:
+    def _seal_vault_entries(self, payloads: dict[str, bytes], manifest_obj: dict[str, Any]) -> None:
         """Build, scan, encrypt, and attach vault entries (replay only)."""
         capture_cfg = self._config.vault_capture
         if self._vault_passphrase is None:
@@ -2844,16 +2815,13 @@ class TraceRecorder:
         aad_dict: dict[str, Any] = {
             "events_sha256": sha256_tag(events_bytes),
             "format": VAULT_AAD_FORMAT,
-            "ir_sha256": manifest_obj["workflow"]["ir_sha256"]
-            or VAULT_NULL_IR_SHA256,
+            "ir_sha256": manifest_obj["workflow"]["ir_sha256"] or VAULT_NULL_IR_SHA256,
             "manifest_sha256": sha256_tag(manifest_bytes),
             "trace_id": self._trace_id,
             "workflow_graph_sha256": sha256_tag(graph_bytes),
         }
         aad = to_canonical_bytes(aad_dict)
-        salt, nonce, sealed = encrypt_vault_records(
-            plaintext, self._vault_passphrase, aad
-        )
+        salt, nonce, sealed = encrypt_vault_records(plaintext, self._vault_passphrase, aad)
         meta_obj = _vault_meta_object(salt=salt, nonce=nonce, aad_dict=aad_dict)
         payloads[VAULT_ENC_PATH] = sealed
         payloads[VAULT_META_PATH] = to_canonical_bytes(meta_obj)
@@ -2877,7 +2845,7 @@ class TraceRecorder:
                     ],
                 }
             )
-            for trans in (getattr(stage, "transitions", ()) or ()):
+            for trans in getattr(stage, "transitions", ()) or ():
                 guard = getattr(trans, "guard", None)
                 guard_kind = getattr(guard, "kind", "always")
                 if guard_kind not in ("always", "has_value", "missing", "eq", "if"):
@@ -2982,17 +2950,13 @@ class NoOpTraceRecorder:
     def begin_stage_visit(self, _stage_id: str) -> str:
         return ""
 
-    def begin_model_call(
-        self, _stage_id: str = "", _stage_visit_id: str | None = None
-    ) -> str:
+    def begin_model_call(self, _stage_id: str = "", _stage_visit_id: str | None = None) -> str:
         return ""
 
     def record_model_response(self, _model_call_id: str, **_kwargs: Any) -> None:
         return None
 
-    def begin_tool_call(
-        self, _stage_id: str = "", _stage_visit_id: str | None = None
-    ) -> str:
+    def begin_tool_call(self, _stage_id: str = "", _stage_visit_id: str | None = None) -> str:
         return ""
 
     def record_tool_result(self, _tool_call_id: str, _result: Any, **_kwargs: Any) -> None:
@@ -3086,10 +3050,7 @@ def resolve_trace_recorder(
         # Untyped factories may return anything at runtime; validate.
         recorder: Any = value()
         if recorder is not None and not isinstance(recorder, TraceRecorder):
-            msg = (
-                "trace factory must return TraceRecorder or None, "
-                f"got {type(recorder).__name__}"
-            )
+            msg = f"trace factory must return TraceRecorder or None, got {type(recorder).__name__}"
             raise TraceError(msg)
         return recorder
     msg = f"unsupported trace value: {type(value).__name__}"
@@ -3350,7 +3311,9 @@ def verify_archive(path: str | Path) -> VerificationReport:
         sha_v = entry.get("sha256")
         ub_v = entry.get("uncompressed_bytes")
         if isinstance(sha_v, str) and isinstance(ub_v, int):
-            identity_entries.append({"path": entry_path, "sha256": sha_v, "uncompressed_bytes": ub_v})
+            identity_entries.append(
+                {"path": entry_path, "sha256": sha_v, "uncompressed_bytes": ub_v}
+            )
     identity_obj: dict[str, Any] = {
         "format": CONTENT_IDENTITY_FORMAT,
         "entries": sorted(identity_entries, key=lambda item: item["path"]),  # type: ignore[reportUnknownArgumentType, reportUnknownLambdaType]
@@ -3461,7 +3424,15 @@ def verify_archive(path: str | Path) -> VerificationReport:
         if not isinstance(graph, dict):
             errors.append("workflow graph must be an object")
         else:
-            for req in ("format", "workflow_id", "entry", "exits", "nodes", "transitions", "policies"):
+            for req in (
+                "format",
+                "workflow_id",
+                "entry",
+                "exits",
+                "nodes",
+                "transitions",
+                "policies",
+            ):
                 if req not in graph:
                     errors.append(f"workflow graph missing required field '{req}'")
             if graph.get("format") != "nemoir.trace.workflow-graph/0.1":  # type: ignore[reportUnknownMemberType, reportUnknownVariableType, reportUnknownArgumentType]
@@ -3558,7 +3529,10 @@ def verify_archive(path: str | Path) -> VerificationReport:
             extra_ev = set(ev.keys()) - allowed_keys  # type: ignore[reportUnknownMemberType, reportUnknownVariableType, reportUnknownArgumentType]
             if extra_ev:  # type: ignore[reportUnknownMemberType, reportUnknownVariableType, reportUnknownArgumentType]
                 # Forward-compatible reader ignores unknown fields (schema README §1).
-                warnings.append(f"public/events.ndjson:{idx} has unexpected fields {sorted(extra_ev)} (ignored)")  # type: ignore[reportUnknownArgumentType]
+                unexpected = sorted(extra_ev)  # type: ignore[reportUnknownArgumentType]
+                warnings.append(
+                    f"public/events.ndjson:{idx} has unexpected fields {unexpected} (ignored)"
+                )
             rid = ev.get("run_id")  # type: ignore[reportUnknownMemberType, reportUnknownVariableType, reportUnknownArgumentType]
             if not isinstance(rid, str) or not re.fullmatch(r"[0-9a-f]{32}", rid):
                 errors.append(f"public/events.ndjson:{idx} invalid run_id")
@@ -3623,11 +3597,21 @@ def verify_archive(path: str | Path) -> VerificationReport:
             # Validate remaining optional fields with type/bounds per public-event.schema.json
             if "channel" in ev:
                 ch = ev.get("channel")  # type: ignore[reportUnknownMemberType, reportUnknownVariableType, reportUnknownArgumentType]
-                if ch is not None and ch not in ("assistant", "progress", "reasoning", "reasoning_summary", "debug"):
+                if ch is not None and ch not in (
+                    "assistant",
+                    "progress",
+                    "reasoning",
+                    "reasoning_summary",
+                    "debug",
+                ):
                     errors.append(f"public/events.ndjson:{idx} invalid channel")
             if "tool_name" in ev:
                 tn = ev.get("tool_name")  # type: ignore[reportUnknownMemberType, reportUnknownVariableType, reportUnknownArgumentType]
-                if not isinstance(tn, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:\-]*", tn) or len(tn) > 128:
+                if (
+                    not isinstance(tn, str)
+                    or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:\-]*", tn)
+                    or len(tn) > 128
+                ):
                     errors.append(f"public/events.ndjson:{idx} invalid tool_name")
             if "capability" in ev:
                 cap = ev.get("capability")  # type: ignore[reportUnknownMemberType, reportUnknownVariableType, reportUnknownArgumentType]
@@ -3635,7 +3619,11 @@ def verify_archive(path: str | Path) -> VerificationReport:
                     errors.append(f"public/events.ndjson:{idx} invalid capability")
             if "error" in ev:
                 err = ev.get("error")  # type: ignore[reportUnknownMemberType, reportUnknownVariableType, reportUnknownArgumentType]
-                if not isinstance(err, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", err) or len(err) > 64:
+                if (
+                    not isinstance(err, str)
+                    or not re.fullmatch(r"[a-z][a-z0-9_]*", err)
+                    or len(err) > 64
+                ):
                     errors.append(f"public/events.ndjson:{idx} invalid error")
             if "transition_to" in ev:
                 tr = ev.get("transition_to")  # type: ignore[reportUnknownMemberType, reportUnknownVariableType, reportUnknownArgumentType]
@@ -3663,12 +3651,18 @@ def verify_archive(path: str | Path) -> VerificationReport:
                     errors.append(f"public/events.ndjson:{idx} invalid result")
             if "annotation" in ev:
                 ann = ev.get("annotation")  # type: ignore[reportUnknownMemberType, reportUnknownVariableType, reportUnknownArgumentType]
-                if not isinstance(ann, dict) or "namespace" not in ann or "kind" not in ann or "payload" not in ann:
+                if (
+                    not isinstance(ann, dict)
+                    or "namespace" not in ann
+                    or "kind" not in ann
+                    or "payload" not in ann
+                ):
                     errors.append(f"public/events.ndjson:{idx} invalid annotation")
                 else:
-                    ns = ann.get("namespace")
-                    kd = ann.get("kind")
-                    pl = ann.get("payload")
+                    ann_map = cast("dict[str, Any]", ann)
+                    ns = ann_map.get("namespace")
+                    kd = ann_map.get("kind")
+                    pl = ann_map.get("payload")
                     if not isinstance(ns, str) or not (1 <= len(ns) <= 128):
                         errors.append(f"public/events.ndjson:{idx} invalid annotation namespace")
                     elif not isinstance(kd, str) or not (1 <= len(kd) <= 128):
@@ -3719,9 +3713,7 @@ def verify_archive(path: str | Path) -> VerificationReport:
     structural_notes: list[str] = []
     try:
         graph_branch = cast("Any", graph)
-        graph_nodes = cast(
-            "Any", graph_branch.get("nodes") if isinstance(graph, dict) else None
-        )
+        graph_nodes = cast("Any", graph_branch.get("nodes") if isinstance(graph, dict) else None)
         if isinstance(graph_nodes, list):
             node_ids: set[Any] = set()
             for node_entry in cast("Any", graph_nodes):
@@ -3735,9 +3727,7 @@ def verify_archive(path: str | Path) -> VerificationReport:
                     transition = transition_entry
                     if isinstance(transition, dict):
                         transition_mapping = cast("dict[Any, Any]", transition)
-                        edges.add(
-                            (transition_mapping.get("from"), transition_mapping.get("to"))
-                        )
+                        edges.add((transition_mapping.get("from"), transition_mapping.get("to")))
             unknown_stages: set[Any] = set()
             bad_edges: set[Any] = set()
             for line in event_lines:
@@ -3759,17 +3749,13 @@ def verify_archive(path: str | Path) -> VerificationReport:
                     f"ledger references stage {stage!r} absent from workflow graph"
                 )
             if len(unknown_stages) > 10:
-                structural_notes.append(
-                    f"... and {len(unknown_stages) - 10} more unknown stages"
-                )
+                structural_notes.append(f"... and {len(unknown_stages) - 10} more unknown stages")
             for edge in sorted(bad_edges, key=str)[:10]:
                 structural_notes.append(
                     f"ledger transition {edge[0]!r}->{edge[1]!r} absent from workflow graph"
                 )
             if len(bad_edges) > 10:
-                structural_notes.append(
-                    f"... and {len(bad_edges) - 10} more unknown transitions"
-                )
+                structural_notes.append(f"... and {len(bad_edges) - 10} more unknown transitions")
     except Exception as exc:
         structural_notes.append(f"structural check skipped: {exc}")
     warnings.extend(structural_notes)
@@ -3955,13 +3941,19 @@ def unlock_archive(
         manifest_raw = parse_json_strict(entries[MANIFEST_PATH].decode("utf-8"))
     except Exception as exc:
         return [], replace(
-            report, ok=False, semantic="failed", errors=(*report.errors, f"vault metadata invalid: {exc}")
+            report,
+            ok=False,
+            semantic="failed",
+            errors=(*report.errors, f"vault metadata invalid: {exc}"),
         )
     try:
         meta = _check_vault_meta(meta_raw)
     except TraceError as exc:
         return [], replace(
-            report, ok=False, semantic="failed", errors=(*report.errors, f"vault metadata invalid: {exc}")
+            report,
+            ok=False,
+            semantic="failed",
+            errors=(*report.errors, f"vault metadata invalid: {exc}"),
         )
     if not isinstance(manifest_raw, dict):
         return [], replace(
@@ -3975,15 +3967,14 @@ def unlock_archive(
     kdf = cast("Any", meta_branch.get("kdf"))
     cipher = cast("Any", meta_branch.get("cipher"))
     try:
-        salt = _b64url_decode(
-            kdf["salt_base64url"], what="salt", expected=VAULT_SALT_BYTES
-        )
-        nonce = _b64url_decode(
-            cipher["nonce_base64url"], what="nonce", expected=VAULT_NONCE_BYTES
-        )
+        salt = _b64url_decode(kdf["salt_base64url"], what="salt", expected=VAULT_SALT_BYTES)
+        nonce = _b64url_decode(cipher["nonce_base64url"], what="nonce", expected=VAULT_NONCE_BYTES)
     except TraceError as exc:
         return [], replace(
-            report, ok=False, semantic="failed", errors=(*report.errors, f"vault metadata invalid: {exc}")
+            report,
+            ok=False,
+            semantic="failed",
+            errors=(*report.errors, f"vault metadata invalid: {exc}"),
         )
     try:
         pw_bytes = _normalize_passphrase(passphrase)
@@ -4004,9 +3995,10 @@ def unlock_archive(
         ("workflow_graph_sha256", sha256_tag(entries[GRAPH_PATH])),
     ):
         stored_descriptor = stored_aad
-        if not isinstance(stored_descriptor, dict) or cast(
-            "dict[Any, Any]", stored_descriptor
-        ).get(aad_name) != digest:
+        if (
+            not isinstance(stored_descriptor, dict)
+            or cast("dict[Any, Any]", stored_descriptor).get(aad_name) != digest
+        ):
             aad_ok = False
     manifest_branch = manifest
     if isinstance(stored_aad, dict):
@@ -4025,9 +4017,7 @@ def unlock_archive(
         return [], replace(report, ok=False, semantic="failed", errors=(*report.errors, str(exc)))
     try:
         raw_lines = [line for line in plaintext.split(b"\n") if line.strip()]
-        parsed: list[Any] = [
-            parse_json_strict(line.decode("utf-8")) for line in raw_lines
-        ]
+        parsed: list[Any] = [parse_json_strict(line.decode("utf-8")) for line in raw_lines]
     except Exception as exc:
         return [], replace(
             report, ok=False, semantic="failed", errors=(*report.errors, f"vault invalid: {exc}")
@@ -4067,9 +4057,7 @@ def unlock_archive(
     )
 
 
-def _check_vault_evidence(
-    entries: dict[str, bytes], records: list[dict[str, Any]]
-) -> list[str]:
+def _check_vault_evidence(entries: dict[str, bytes], records: list[dict[str, Any]]) -> list[str]:
     """Check that every replay-relevant ledger event has vault evidence."""
     problems: list[str] = []
     model_ids: set[Any] = set()
@@ -4109,15 +4097,14 @@ def _check_vault_evidence(
         elif kind == "transition_selected":
             visit = ledger.get("stage_visit_id")
             if isinstance(visit, str) and visit not in transition_visits:
-                problems.append(
-                    f"vault missing transition evidence for visit {visit}"
-                )
+                problems.append(f"vault missing transition evidence for visit {visit}")
     return problems[:50]
 
 
 # ---------------------------------------------------------------------------
 # Projection helpers
 # ---------------------------------------------------------------------------
+
 
 def _safe_int(value: Any, default: int, *, minimum: int = 0) -> int:
     if isinstance(value, bool):

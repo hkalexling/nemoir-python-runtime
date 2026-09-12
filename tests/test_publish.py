@@ -14,7 +14,7 @@ import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import pytest
 
@@ -45,9 +45,7 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture
 def plan() -> PublishPlan:
-    return plan_publication(
-        FIXTURE, title="CVXPYgen fake-model fixture", license_id="Apache-2.0"
-    )
+    return plan_publication(FIXTURE, title="CVXPYgen fake-model fixture", license_id="Apache-2.0")
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +150,7 @@ class _GistHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, _format: str, *_args: Any) -> None:
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002, ARG002
         return None
 
 
@@ -185,7 +183,7 @@ def _metadata(
 ) -> bytes:
     files: dict[str, Any] = {filename: {"filename": filename, "raw_url": raw_url, "size": 1}}
     if extra:
-        files.update(cast("dict[str, Any]", extra))
+        files.update(extra)
     payload = {
         "id": GIST_ID,
         "description": "fixture",
@@ -304,9 +302,7 @@ def test_verify_published_requires_one_trace_file(
     with pytest.raises(PublicationError, match=r"exactly one \.nemotrace"):
         verify_published(GIST_ID, api_base=base, allow_insecure=True)
     # An explicit filename resolves the ambiguity.
-    check = verify_published(
-        GIST_ID, api_base=base, filename=FIXTURE.name, allow_insecure=True
-    )
+    check = verify_published(GIST_ID, api_base=base, filename=FIXTURE.name, allow_insecure=True)
     assert check.ok
 
 

@@ -325,7 +325,9 @@ def test_replay_requires_passphrase(tmp_path: Path) -> None:
         TraceRecorder.create(tmp_path / "x.nemotrace", profile="replay")
     with pytest.raises(TraceError, match="requires trace profile 'replay'"):
         TraceRecorder.create(
-            tmp_path / "x.nemotrace", profile="audit", vault_passphrase="pw"  # noqa: S106
+            tmp_path / "x.nemotrace",
+            profile="audit",
+            vault_passphrase="pw",  # noqa: S106
         )
     with pytest.raises(TraceError, match="unsupported trace profile"):
         TraceRecorder.create(tmp_path / "x.nemotrace", profile="publication")
@@ -440,9 +442,7 @@ def test_retry_after_completed_reuses_attempt_id(tmp_path: Path) -> None:
 
     entries = read_archive_entries(path)
     ledger = [
-        json.loads(line)
-        for line in entries["public/events.ndjson"].split(b"\n")
-        if line.strip()
+        json.loads(line) for line in entries["public/events.ndjson"].split(b"\n") if line.strip()
     ]
     by_seq = {event["sequence"]: event for event in ledger}
     assert by_seq[3]["model_call_id"] == "m-1"
@@ -456,7 +456,5 @@ def test_retry_after_completed_reuses_attempt_id(tmp_path: Path) -> None:
     records, unlocked = unlock_archive(path, FAKE_PASSPHRASE)
     assert unlocked.ok, unlocked.errors
     assert unlocked.semantic == "passed", unlocked.errors
-    requested = {
-        r.get("model_call_id") for r in records if r.get("record_type") == "model_request"
-    }
+    requested = {r.get("model_call_id") for r in records if r.get("record_type") == "model_request"}
     assert requested == {"m-1", "m-2"}
