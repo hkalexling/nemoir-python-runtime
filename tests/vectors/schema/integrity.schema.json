@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nemoir.dev/schema/trace/0.1/integrity.schema.json",
+  "title": "NemoTrace 0.1 integrity index",
+  "type": "object",
+  "required": ["format", "algorithm", "entries", "content_identity"],
+  "properties": {
+    "format": {"const": "nemoir.trace.integrity/0.1"},
+    "algorithm": {"const": "sha256"},
+    "entries": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 6,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "required": ["path", "media_type", "uncompressed_bytes", "sha256"],
+        "properties": {
+          "path": {
+            "enum": [
+              "manifest.json",
+              "public/workflow.graph.json",
+              "public/events.ndjson",
+              "public/summary.json",
+              "private/vault.enc",
+              "private/vault.meta.json"
+            ]
+          },
+          "media_type": {
+            "enum": ["application/json", "application/x-ndjson", "application/octet-stream"]
+          },
+          "uncompressed_bytes": {"type": "integer", "minimum": 0, "maximum": 201326592},
+          "sha256": {"$ref": "common.schema.json#/$defs/sha256"}
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "path": {
+                  "enum": [
+                    "manifest.json",
+                    "public/workflow.graph.json",
+                    "public/summary.json",
+                    "private/vault.meta.json"
+                  ]
+                }
+              },
+              "required": ["path"]
+            },
+            "then": {"properties": {"media_type": {"const": "application/json"}}}
+          },
+          {
+            "if": {"properties": {"path": {"const": "public/events.ndjson"}}, "required": ["path"]},
+            "then": {"properties": {"media_type": {"const": "application/x-ndjson"}}}
+          },
+          {
+            "if": {"properties": {"path": {"const": "private/vault.enc"}}, "required": ["path"]},
+            "then": {"properties": {"media_type": {"const": "application/octet-stream"}}}
+          }
+        ],
+        "additionalProperties": false
+      },
+      "allOf": [
+        {
+          "contains": {"properties": {"path": {"const": "manifest.json"}}, "required": ["path"]},
+          "minContains": 1,
+          "maxContains": 1
+        },
+        {
+          "contains": {"properties": {"path": {"const": "public/workflow.graph.json"}}, "required": ["path"]},
+          "minContains": 1,
+          "maxContains": 1
+        },
+        {
+          "contains": {"properties": {"path": {"const": "public/events.ndjson"}}, "required": ["path"]},
+          "minContains": 1,
+          "maxContains": 1
+        },
+        {
+          "contains": {"properties": {"path": {"const": "public/summary.json"}}, "required": ["path"]},
+          "minContains": 0,
+          "maxContains": 1
+        },
+        {
+          "contains": {"properties": {"path": {"const": "private/vault.enc"}}, "required": ["path"]},
+          "minContains": 0,
+          "maxContains": 1
+        },
+        {
+          "contains": {"properties": {"path": {"const": "private/vault.meta.json"}}, "required": ["path"]},
+          "minContains": 0,
+          "maxContains": 1
+        },
+        {
+          "if": {
+            "contains": {"properties": {"path": {"const": "private/vault.enc"}}, "required": ["path"]},
+            "minContains": 1
+          },
+          "then": {
+            "contains": {"properties": {"path": {"const": "private/vault.meta.json"}}, "required": ["path"]},
+            "minContains": 1
+          }
+        },
+        {
+          "if": {
+            "contains": {"properties": {"path": {"const": "private/vault.meta.json"}}, "required": ["path"]},
+            "minContains": 1
+          },
+          "then": {
+            "contains": {"properties": {"path": {"const": "private/vault.enc"}}, "required": ["path"]},
+            "minContains": 1
+          }
+        }
+      ]
+    },
+    "content_identity": {"$ref": "common.schema.json#/$defs/sha256"}
+  },
+  "additionalProperties": false
+}

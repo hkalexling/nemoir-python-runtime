@@ -1,0 +1,1 @@
+{"counts_by_kind":{"model_completed":1,"model_delta":1,"run_completed":1,"run_started":1,"stage_completed":1,"stage_started":1},"duration_ms":5,"event_count":6,"events_sha256":"sha256:9d415d143eb94caa79e48764c5b5c657bf81ec89d44f15bbab385cbe8d29a405","format":"nemoir.trace.summary/0.1","stage_visit_count":1}

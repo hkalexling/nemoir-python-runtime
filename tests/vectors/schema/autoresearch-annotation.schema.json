@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nemoir.dev/schema/trace/0.1/autoresearch-annotation.schema.json",
+  "title": "nemoir.autoresearch/v1 trial_finished annotation payload",
+  "$defs": {
+    "metrics": {
+      "type": "object",
+      "properties": {
+        "candidate_median_ns": {"type": "number"},
+        "incumbent_median_ns": {"type": "number"},
+        "delta_ns": {"type": "number"},
+        "effect_ns": {"type": "number"},
+        "speedup_pct": {"type": "number"},
+        "valid": {"type": "boolean"},
+        "noise_ok": {"type": "boolean"},
+        "regressions_ok": {"type": "boolean"},
+        "candidate_spread_pct": {"type": "number"},
+        "p95_regression_pct": {"type": "number"},
+        "cold_regression_pct": {"type": "number"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "type": "object",
+  "required": ["trial_id", "candidate_ref", "verdict", "reason_code", "selection_metrics", "artifact_refs"],
+  "properties": {
+    "trial_id": {"type": "integer", "minimum": 1},
+    "candidate_ref": {"type": "string", "pattern": "^candidate-[1-9][0-9]*$"},
+    "parent_ref": {
+      "oneOf": [
+        {"type": "string", "pattern": "^candidate-[1-9][0-9]*$"},
+        {"type": "null"}
+      ]
+    },
+    "candidate_digest": {
+      "oneOf": [
+        {"$ref": "common.schema.json#/$defs/sha256"},
+        {"type": "null"}
+      ]
+    },
+    "parent_digest": {
+      "oneOf": [
+        {"$ref": "common.schema.json#/$defs/sha256"},
+        {"type": "null"}
+      ]
+    },
+    "selection_metrics": {"$ref": "#/$defs/metrics"},
+    "confirmation_metrics": {
+      "oneOf": [
+        {"$ref": "#/$defs/metrics"},
+        {"type": "null"}
+      ]
+    },
+    "verdict": {"enum": ["accepted", "rejected", "inconclusive"]},
+    "reason_code": {
+      "enum": [
+        "accepted",
+        "no_change",
+        "duplicate",
+        "preflight_integrity",
+        "preflight_scope",
+        "preflight_static_scan",
+        "preflight_build",
+        "preflight_smoke",
+        "preflight_sanitizer",
+        "selection_correctness",
+        "selection_noise",
+        "selection_tail_regression",
+        "confirmation_correctness",
+        "confirmation_noise",
+        "confirmation_tail_regression",
+        "no_improvement",
+        "full_sanitizer",
+        "no_evaluation",
+        "policy_denied",
+        "tool_failed",
+        "budget_exhausted",
+        "other"
+      ]
+    },
+    "source_reason_code": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]*$",
+      "maxLength": 64
+    },
+    "mechanism_ref": {
+      "oneOf": [
+        {"type": "string", "pattern": "^mechanism-[1-9][0-9]*$"},
+        {"type": "null"}
+      ]
+    },
+    "mechanism_id": {
+      "oneOf": [
+        {"type": "string", "minLength": 1, "maxLength": 128},
+        {"type": "null"}
+      ]
+    },
+    "artifact_refs": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^artifact-[1-9][0-9]*$"}
+    }
+  },
+  "additionalProperties": false
+}

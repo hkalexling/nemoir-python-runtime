@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nemoir.dev/schema/trace/0.1/common.schema.json",
+  "title": "NemoTrace 0.1 common types",
+  "$defs": {
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "opaque_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "trace_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "stage_visit_id": {
+      "type": "string",
+      "pattern": "^s-[1-9][0-9]*$"
+    },
+    "tool_call_id": {
+      "type": "string",
+      "pattern": "^t-[1-9][0-9]*$"
+    },
+    "model_call_id": {
+      "type": "string",
+      "pattern": "^m-[1-9][0-9]*$"
+    },
+    "base64url_no_pad": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "redaction_marker": {
+      "type": "object",
+      "required": ["$redacted"],
+      "properties": {
+        "$redacted": {
+          "type": "object",
+          "required": ["token", "reason", "value_type"],
+          "properties": {
+            "token": {
+              "type": "string",
+              "pattern": "^r-[1-9][0-9]*$"
+            },
+            "reason": {
+              "enum": [
+                "credential",
+                "private_content",
+                "personal_data",
+                "absolute_path",
+                "reasoning",
+                "unsafe_error",
+                "unapproved_field"
+              ]
+            },
+            "value_type": {
+              "enum": ["string", "number", "boolean", "object", "array", "null", "binary"]
+            },
+            "length": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "json_value": {
+      "anyOf": [
+        {"type": "null"},
+        {"type": "boolean"},
+        {"type": "number"},
+        {"type": "string", "maxLength": 1048576},
+        {
+          "type": "array",
+          "maxItems": 10000,
+          "items": {"$ref": "#/$defs/json_value"}
+        },
+        {
+          "type": "object",
+          "maxProperties": 10000,
+          "additionalProperties": {"$ref": "#/$defs/json_value"}
+        }
+      ]
+    }
+  }
+}

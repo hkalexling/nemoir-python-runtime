@@ -1,0 +1,39 @@
+{
+  "format": "nemoir.trace.catalog/0.1",
+  "updated_at": "2026-09-12T00:00:00.000Z",
+  "$comment": "Static trace library for the NemoTrace viewer. No server: the viewer reads this document and resolves each entry's artifact itself. An entry may only be listed with an artifact that is publication-profile, vault-free, and attested; `gist` stays null until a maintainer publishes it with their own credential (plan.md §5.4, §9.1).",
+  "entries": [
+    {
+      "id": "cvxpygen-publication-fake-model",
+      "title": "CVXPYgen H50 autoresearch — reviewed fake-model publication fixture",
+      "description": "A real compiled autoresearch.nemo workflow run against the fake model and fake harness, transformed by the publication transform. Shows a three-trial constrained search (preflight failure, no-improvement rejection, accepted improvement), policy checks, and tool calls.",
+      "artifact": {
+        "path": "docs/trace/schema/test-vectors/publication/cvxpygen-publication.nemotrace",
+        "format": "nemoir.trace/0.1",
+        "profile": "publication",
+        "content_identity": "sha256:ab5b12752581424ca3fe3a3445cc53101bd062000a8ecb1da00041680005c587",
+        "trace_id": "33447ca407892b30c24cb02f6855f040",
+        "workflow_id": "CvxpygenH50Autoresearch",
+        "ir_sha256": "sha256:97ec64c3694ec20a73829f6b2bbb9f29f9fd6a29f0404e7f6ecdbc50aaf6d947",
+        "bytes": 8749
+      },
+      "gist": null,
+      "tags": ["autoresearch", "python", "nvcc", "policy-denial", "tool-failure", "no-improvement"],
+      "license": "Apache-2.0",
+      "attestation": {
+        "reviewer": "NemoIR maintainers",
+        "reviewed_at": "2026-09-12T00:00:00.000Z",
+        "redaction_policy": "publication-v1",
+        "scanner": "secrets-v1",
+        "consent": "Fake-model campaign fixture reviewed field by field: no credentials, no absolute paths, no raw reasoning, no candidate source. Safe to publish."
+      },
+      "citation": {
+        "title": "NemoTrace CVXPYgen autoresearch publication fixture",
+        "publisher": "NemoIR project",
+        "year": 2026,
+        "url": null
+      },
+      "notes": "Fake model and fake harness: this fixture exercises the trace format and viewer, not benchmark performance. The candidate digests and mechanism IDs stay opaque even here (redaction-policy §11); the archive carries no vault."
+    }
+  ]
+}

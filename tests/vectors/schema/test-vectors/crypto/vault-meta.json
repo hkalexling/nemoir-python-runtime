@@ -1,0 +1,33 @@
+{
+  "aad": {
+    "events_sha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "format": "nemoir.trace.vault-aad/0.1",
+    "ir_sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "manifest_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "trace_id": "0123456789abcdef0123456789abcdef",
+    "workflow_graph_sha256": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+  },
+  "cipher": {
+    "name": "AES-256-GCM",
+    "nonce_base64url": "EBESExQVFhcYGRob",
+    "tag_length_bits": 128,
+    "tag_placement": "ciphertext_suffix"
+  },
+  "codec": "PBKDF2-HMAC-SHA-256+A256GCM",
+  "format": "nemoir.trace.vault-meta/0.1",
+  "kdf": {
+    "derived_key_bits": 256,
+    "iterations": 600000,
+    "name": "PBKDF2-HMAC-SHA-256",
+    "salt_base64url": "AAECAwQFBgcICQoLDA0ODw"
+  },
+  "passphrase": {
+    "encoding": "UTF-8",
+    "normalization": "NFC"
+  },
+  "plaintext": {
+    "compression": "none",
+    "encoding": "UTF-8",
+    "media_type": "application/x-ndjson"
+  }
+}

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nemoir-runtime"
-version = "0.10.1"
+version = "0.11.0"
 description = "Python runtime core for NemoIR — execute compiled agent workflows as structured state machines with tool orchestration, policy enforcement, model-backed stage execution, and live event streaming."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -31,7 +31,13 @@ dependencies = [
     "openai>=1.40.0",
 ]
 
+[project.scripts]
+nemotrace = "nemoir_runtime.cli:main"
+
 [project.optional-dependencies]
+trace = [
+    "cryptography>=44.0.0",
+]
 dev = [
     "pyright==1.1.410",
     "ruff==0.15.18",
@@ -46,9 +52,11 @@ asyncio_mode = "auto"
 typeCheckingMode = "strict"
 venv = ".venv"
 venvPath = "."
+exclude = ["**/.venv", "tests/test_review_followup.py", "tests/vectors"]
 
 [tool.ruff]
 line-length = 100
+extend-exclude = ["tests/vectors"]
 
 [tool.ruff.lint]
 select = ["ALL"]
@@ -66,6 +74,9 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+"src/nemoir_runtime/cli.py" = ["T201"]
+"src/nemoir_runtime/trace.py" = ["E501", "S110", "PERF401", "SIM110", "RUF100", "PLR2004"]
+"tests/test_review_followup.py" = ["ALL"]
 "tests/**" = [
     "S101",
     "ARG001",

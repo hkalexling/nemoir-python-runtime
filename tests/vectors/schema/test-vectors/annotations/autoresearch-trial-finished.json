@@ -1,0 +1,33 @@
+{
+  "anchor_sequence": 42,
+  "annotation": {
+    "kind": "trial_finished",
+    "namespace": "nemoir.autoresearch/v1",
+    "payload": {
+      "artifact_refs": ["artifact-1"],
+      "candidate_ref": "candidate-2",
+      "confirmation_metrics": {
+        "candidate_median_ns": 352644,
+        "incumbent_median_ns": 375000,
+        "valid": true
+      },
+      "mechanism_ref": "mechanism-1",
+      "parent_ref": "candidate-1",
+      "reason_code": "accepted",
+      "selection_metrics": {
+        "candidate_median_ns": 350973,
+        "incumbent_median_ns": 375000,
+        "valid": true
+      },
+      "source_reason_code": "accepted",
+      "trial_id": 2,
+      "verdict": "accepted"
+    }
+  },
+  "kind": "annotation",
+  "redacted_fields": [],
+  "run_id": "0123456789abcdef0123456789abcdef",
+  "stage_id": "RecordTrial",
+  "stage_visit_id": "s-17",
+  "timestamp": "2026-01-02T03:04:06.000Z"
+}

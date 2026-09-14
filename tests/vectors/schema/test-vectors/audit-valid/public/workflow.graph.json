@@ -1,0 +1,1 @@
+{"entry":"Done","exits":["Done"],"format":"nemoir.trace.workflow-graph/0.1","nodes":[{"capabilities":[],"execution":"model","id":"Done","writes":[{"name":"answer","optional":false,"type":"string"}]}],"policies":[],"transitions":[],"workflow_id":"MinimalTrace"}

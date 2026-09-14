@@ -177,6 +177,98 @@ Or per-run via `RunOptions(reasoning="raw")`.
 Reasoning text is **never merged into the final structured-output content**;
 stage output validation is unaffected.
 
+## Trace verification
+
+The runtime writes **NemoTrace** archives (`*.nemotrace`): one redacted,
+portable execution record per run, optionally with an encrypted replay vault.
+Install the vault crypto extra for unlock/replay: `pip install
+"nemoir-runtime[trace]"`.
+
+The artifact format, capture profiles, verification and replay levels, and
+publication gates are documented in the public compiler docs:
+[Trace artifacts](https://github.com/hkalexling/nemoir/blob/master/docs/trace.md).
+
+The bundled `nemotrace` CLI verifies an archive and reports its levels —
+integrity, structural, semantic, and replayability — reusing the same library
+reports as the viewer:
+
+```bash
+nemotrace verify run.nemotrace                          # public levels only
+nemotrace verify run.nemotrace --unlock env:VAULT_PW    # + semantic evidence
+nemotrace verify run.nemotrace --replay file:./pw.txt   # + taped replay
+```
+
+`--unlock` and `--replay` are mutually exclusive and take a passphrase source:
+`env:VAR`, `file:PATH`, or `prompt`. Output is a stable `key: value` report on
+stdout; the exit code is `0` when the requested level passed, `1` when it
+failed, and `2` for usage errors. Passphrase values, vault plaintext, and
+stack traces are never printed. `python -m nemoir_runtime verify …` is
+equivalent when the console script is not on `PATH`.
+
+Taped replay re-executes the recorded state machine with recorded model/tool
+fixtures only — no provider calls, no real tool effects. It is deterministic
+playback of captured evidence, not a live rerun.
+
+### Publishing a trace (`publication-v1`)
+
+An `audit` archive is safe-by-default local capture, not automatically safe to
+post. Publication is a separate, reviewed transform that produces one stricter,
+vault-free `publication` artifact:
+
+```bash
+# 1. project for review (writes a disclosure report; publishes nothing)
+nemotrace scan-publication runs/<id>/run.nemotrace
+
+# 2. bind your review to the projection digest it reported
+nemotrace attest-publication \
+  --report runs/<id>/run.nemotrace.publication-report.json \
+  --reviewer "Your Name" --license CC-BY-4.0 \
+  --consent "I reviewed the disclosure report and certify this trace is safe to publish."
+
+# 3. write the attested archive (+ its report sidecar)
+nemotrace prepare-publication runs/<id>/run.nemotrace published/run.nemotrace \
+  --attest runs/<id>/run.nemotrace.publication-report.json.attestation.json
+```
+
+Publication refuses a vault-bearing or already-published source, an
+interrupted run, incomplete compiler provenance, a projection the attestation
+does not cover, and any `secrets-v1` scanner finding. By default it drops
+static tool names and replaces alias-relative paths with opaque `path-N`
+refs; `--allow-tool-name NAME` (repeatable) and `--keep-relative-paths` opt
+individual review decisions back in, and each choice changes the projection
+digest you are asked to attest. Reports and attestations are local review
+artifacts — they are never written inside the archive.
+
+Redaction reduces risk; it cannot prove that reviewed identifiers or approved
+scalar metrics are non-sensitive. Human review remains mandatory.
+
+### Sharing a trace on a public Gist
+
+Publishing stays a deliberate, credential-owning step. The CLI gates the
+artifact and verifies the result; the upload itself uses your own Git/GitHub
+credential (GitHub's API models file content as JSON text, so a binary
+`.nemotrace` must go over the Gist's Git remote — the viewer never uploads
+anything):
+
+```bash
+nemotrace publish-plan published/run.nemotrace \
+  --title "CVXPYgen autoresearch run" --license CC-BY-4.0   # gate + runbook
+
+# ...run the printed gh/git commands with your credential...
+
+nemotrace publish-verify <gist-id> --filename run.nemotrace \
+  --expect-content-identity sha256:...
+```
+
+`publish-plan` refuses an audit/replay archive, a vault, an unattested
+archive, a failed scanner, incomplete provenance, and anything over the 8 MiB
+public budget, then prints the upload runbook, a suggested Gist README, the
+Gist permanence warning, and a ready catalog entry.
+`publish-verify` re-downloads the public Gist through the documented
+metadata → pinned revision → `raw_url` path, re-verifies the archive, and
+prints the pinned citation URL. Remember that a public Gist is public and
+durable, and a secret Gist is not private storage.
+
 ## Requirements
 
 - Python ≥ 3.11

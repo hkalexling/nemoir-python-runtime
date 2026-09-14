@@ -1,0 +1,206 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nemoir.dev/schema/trace/0.1/manifest.schema.json",
+  "title": "NemoTrace 0.1 manifest",
+  "type": "object",
+  "required": [
+    "format",
+    "trace_id",
+    "created_at",
+    "status",
+    "capture",
+    "workflow",
+    "provenance",
+    "integrity",
+    "viewer"
+  ],
+  "properties": {
+    "format": {"const": "nemoir.trace/0.1"},
+    "trace_id": {"$ref": "common.schema.json#/$defs/trace_id"},
+    "created_at": {"$ref": "common.schema.json#/$defs/timestamp"},
+    "status": {"enum": ["complete", "failed", "interrupted"]},
+    "capture": {
+      "type": "object",
+      "required": [
+        "profile",
+        "vault_present",
+        "publication_eligible",
+        "redaction_policy",
+        "scanner"
+      ],
+      "properties": {
+        "profile": {"enum": ["audit", "replay", "publication"]},
+        "vault_present": {"type": "boolean"},
+        "publication_eligible": {"type": "boolean"},
+        "redaction_policy": {"enum": ["audit-v1", "publication-v1"]},
+        "scanner": {
+          "type": "object",
+          "required": ["status", "ruleset"],
+          "properties": {
+            "status": {"const": "passed"},
+            "ruleset": {"type": "string", "minLength": 1, "maxLength": 64}
+          },
+          "additionalProperties": false
+        },
+        "attested": {"type": "boolean"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"profile": {"const": "audit"}}, "required": ["profile"]},
+          "then": {
+            "properties": {
+              "vault_present": {"const": false},
+              "publication_eligible": {"const": false},
+              "redaction_policy": {"const": "audit-v1"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"profile": {"const": "replay"}}, "required": ["profile"]},
+          "then": {
+            "properties": {
+              "vault_present": {"const": true},
+              "publication_eligible": {"const": false},
+              "redaction_policy": {"const": "audit-v1"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"profile": {"const": "publication"}}, "required": ["profile"]},
+          "then": {
+            "required": ["scanner", "attested"],
+            "properties": {
+              "vault_present": {"const": false},
+              "publication_eligible": {"const": true},
+              "redaction_policy": {"const": "publication-v1"},
+              "scanner": {
+                "properties": {"status": {"const": "passed"}},
+                "required": ["status"]
+              },
+              "attested": {"const": true}
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "workflow": {
+      "type": "object",
+      "required": ["id", "ir_version", "ir_sha256", "entry", "exits"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "ir_version": {"type": "string", "minLength": 1, "maxLength": 32},
+        "ir_sha256": {
+          "oneOf": [
+            {"$ref": "common.schema.json#/$defs/sha256"},
+            {"type": "null"}
+          ]
+        },
+        "entry": {"type": "string", "minLength": 1, "maxLength": 256},
+        "exits": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 256}
+        }
+      },
+      "additionalProperties": false
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["complete", "frontend", "target", "compiler_version", "runtime"],
+      "properties": {
+        "complete": {"type": "boolean"},
+        "frontend": {"type": "string", "minLength": 1, "maxLength": 64},
+        "target": {"enum": ["python", "web", "manual", "imported"]},
+        "compiler_version": {"type": "string", "minLength": 1, "maxLength": 64},
+        "runtime": {
+          "type": "object",
+          "required": ["name", "version"],
+          "properties": {
+            "name": {"type": "string", "minLength": 1, "maxLength": 128},
+            "version": {"type": "string", "minLength": 1, "maxLength": 64}
+          },
+          "additionalProperties": false
+        },
+        "model": {
+          "type": "object",
+          "required": ["name"],
+          "properties": {
+            "name": {"type": "string", "minLength": 1, "maxLength": 256},
+            "api_mode": {"type": "string", "minLength": 1, "maxLength": 64},
+            "sampling": {
+              "type": "object",
+              "properties": {
+                "temperature": {"type": "number"},
+                "max_tokens": {"type": "integer", "minimum": 1}
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "integrity": {
+      "type": "object",
+      "required": ["algorithm", "entry"],
+      "properties": {
+        "algorithm": {"const": "sha256"},
+        "entry": {"const": "integrity.json"}
+      },
+      "additionalProperties": false
+    },
+    "viewer": {
+      "type": "object",
+      "required": ["min_format"],
+      "properties": {
+        "min_format": {"const": "nemoir.trace/0.1"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "provenance": {
+            "properties": {"complete": {"const": true}},
+            "required": ["complete"]
+          }
+        },
+        "required": ["provenance"]
+      },
+      "then": {
+        "properties": {
+          "workflow": {
+            "properties": {
+              "ir_sha256": {"$ref": "common.schema.json#/$defs/sha256"}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "capture": {
+            "properties": {"profile": {"const": "publication"}},
+            "required": ["profile"]
+          }
+        },
+        "required": ["capture"]
+      },
+      "then": {
+        "properties": {
+          "provenance": {
+            "properties": {"complete": {"const": true}},
+            "required": ["complete"]
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

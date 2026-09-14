@@ -1,0 +1,30 @@
+{
+  "aad": {
+    "events_sha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "format": "nemoir.trace.vault-aad/0.1",
+    "ir_sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "manifest_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "trace_id": "0123456789abcdef0123456789abcdef",
+    "workflow_graph_sha256": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+  },
+  "aad_utf8_base64url": "eyJldmVudHNfc2hhMjU2Ijoic2hhMjU2OjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIiLCJmb3JtYXQiOiJuZW1vaXIudHJhY2UudmF1bHQtYWFkLzAuMSIsImlyX3NoYTI1NiI6InNoYTI1NjoxMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExIiwibWFuaWZlc3Rfc2hhMjU2Ijoic2hhMjU2OjMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMiLCJ0cmFjZV9pZCI6IjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmIiwid29ya2Zsb3dfZ3JhcGhfc2hhMjU2Ijoic2hhMjU2OjQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQifQ",
+  "cipher": {
+    "ciphertext_and_tag_base64url": "ref_2v1PsakytcpDO9hpAPEMs60ZKcAT63pBab9cL2ICLqSV1_lvXRUmH9a0-Vqv7RpzOa2gGi0Wt29ULOC3KiryYDtfgebV-FMz7zQ2m4WNAUEAMkRt3O720cYzg5CugzgwUiJgR4HZrHrDAoh9NZHNEIasdaB1yA",
+    "name": "AES-256-GCM",
+    "nonce_base64url": "EBESExQVFhcYGRob",
+    "tag_length_bits": 128
+  },
+  "codec": "PBKDF2-HMAC-SHA-256+A256GCM",
+  "format": "nemoir.trace.crypto-vector/0.1",
+  "kdf": {
+    "derived_key_bits": 256,
+    "iterations": 600000,
+    "name": "PBKDF2-HMAC-SHA-256",
+    "salt_base64url": "AAECAwQFBgcICQoLDA0ODw"
+  },
+  "passphrase_input": "NemoIR replay café 🔐",
+  "passphrase_normalization": "NFC",
+  "passphrase_utf8_base64url": "TmVtb0lSIHJlcGxheSBjYWbDqSDwn5SQ",
+  "plaintext_media_type": "application/x-ndjson",
+  "plaintext_utf8_base64url": "eyJwYXlsb2FkIjp7InByaXZhdGVfaW5wdXQiOiJQUklWQVRFLVJFUExBWS1WQUxVRS1QSEFTRTAifSwicmVjb3JkX2lkIjoidi0xIiwicmVjb3JkX3R5cGUiOiJydW5faW5wdXRzIn0K"
+}

@@ -1,0 +1,30 @@
+{
+  "ir_version": "0.1",
+  "kind": "workflow_ir",
+  "source": {"frontend": "nemo_dsl", "file": "minimal.nemo"},
+  "workflow": {
+    "id": "MinimalTrace",
+    "entry": "Done",
+    "exits": ["Done"],
+    "transition_semantics": {
+      "selection": "first_match_by_priority",
+      "no_match": "error_unless_exit"
+    }
+  },
+  "inputs": [{"id": "task", "type": "string"}],
+  "capabilities": [],
+  "policies": [],
+  "nodes": [{
+    "id": "Done",
+    "annotations": [],
+    "prompt": "Return a short answer.",
+    "reads": [{
+      "ref": {"kind": "input", "name": "task"},
+      "optional": false,
+      "origin": "implicit_entry_input"
+    }],
+    "writes": [{"name": "answer", "type": "string", "optional": false}],
+    "requires": [],
+    "transitions": []
+  }]
+}

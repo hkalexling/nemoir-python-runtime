@@ -1,0 +1,570 @@
+{
+  "note": "Shared Python/Web parity fixture. Both runtimes drive their TraceRecorder through ops in order (fixed clock + trace id) and must emit byte-identical public/events.ndjson and public/workflow.graph.json. Live events use snake_case neutral keys; the TypeScript recorder additionally accepts its native camelCase (covered by live integration tests). All values are synthetic.",
+  "manifest": {
+    "workflow_id": "LoopTest",
+    "entry": "A",
+    "exits": [
+      "C"
+    ],
+    "policies": [
+      {
+        "id": "deny fs.write if guard",
+        "kind": "deny",
+        "trigger_capability": "fs.write"
+      }
+    ],
+    "stages": [
+      {
+        "id": "A",
+        "execution": "tool",
+        "requires": [
+          "fs.write"
+        ],
+        "writes": [
+          {
+            "name": "note",
+            "type": "string",
+            "optional": false
+          }
+        ],
+        "transitions": [
+          {
+            "to": "B",
+            "priority": 0,
+            "reason": "explicit_transition",
+            "guard_kind": "always"
+          }
+        ]
+      },
+      {
+        "id": "B",
+        "execution": "model",
+        "requires": [],
+        "writes": [
+          {
+            "name": "score",
+            "type": "number",
+            "optional": false
+          }
+        ],
+        "transitions": [
+          {
+            "to": "C",
+            "priority": 0,
+            "reason": "explicit_transition",
+            "guard_kind": "always"
+          }
+        ]
+      },
+      {
+        "id": "C",
+        "execution": "tool",
+        "requires": [
+          "http.fetch"
+        ],
+        "writes": [
+          {
+            "name": "done",
+            "type": "bool",
+            "optional": false
+          }
+        ],
+        "transitions": []
+      }
+    ]
+  },
+  "config": {
+    "trace_id": "0123456789abcdef0123456789abcdef",
+    "clock": "2026-01-02T03:04:05.000Z",
+    "path_aliases": {
+      "$workspace": "/work"
+    },
+    "safe_path_aliases": [
+      "$workspace"
+    ],
+    "approved_metrics": [
+      "B.score"
+    ],
+    "secrets": [
+      "sk-parity-TEST-secret-9999"
+    ]
+  },
+  "ops": [
+    {
+      "op": "begin_run"
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "run_started",
+        "sequence": 1
+      }
+    },
+    {
+      "op": "begin_stage_visit",
+      "stage_id": "A"
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "stage_started",
+        "sequence": 2,
+        "stage_id": "A"
+      }
+    },
+    {
+      "op": "begin_tool_call"
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "tool_call_started",
+        "sequence": 3,
+        "stage_id": "A",
+        "capability": "fs.write",
+        "tool_name": "writer",
+        "args": {
+          "path": "/work/f.txt",
+          "content": "hello sk-parity-TEST-secret-9999"
+        }
+      }
+    },
+    {
+      "op": "record_tool_result",
+      "result": {
+        "ok": true
+      }
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "tool_call_completed",
+        "sequence": 4,
+        "stage_id": "A",
+        "capability": "fs.write",
+        "tool_name": "writer"
+      }
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "stage_completed",
+        "sequence": 5,
+        "stage_id": "A",
+        "output": {
+          "note": "hello world"
+        }
+      }
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "transition_selected",
+        "sequence": 6,
+        "stage_id": "A",
+        "transition_to": "B",
+        "metadata": {
+          "reason": "explicit_transition",
+          "priority": 0
+        }
+      }
+    },
+    {
+      "op": "begin_stage_visit",
+      "stage_id": "B"
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "stage_started",
+        "sequence": 7,
+        "stage_id": "B"
+      }
+    },
+    {
+      "op": "begin_model_call"
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "model_delta",
+        "sequence": 8,
+        "stage_id": "B",
+        "channel": "assistant",
+        "text": "partial"
+      }
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "model_delta",
+        "sequence": 9,
+        "stage_id": "B",
+        "channel": "reasoning",
+        "text": "chain"
+      }
+    },
+    {
+      "op": "record_model_response",
+      "response_bytes": 128,
+      "tool_call_count": 0
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "model_completed",
+        "sequence": 10,
+        "stage_id": "B"
+      }
+    },
+    {
+      "op": "begin_model_call"
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "model_retry",
+        "sequence": 11,
+        "stage_id": "B",
+        "metadata": {
+          "attempt": 1,
+          "max_retries": 3,
+          "category": "stage_output"
+        }
+      }
+    },
+    {
+      "op": "record_model_response",
+      "response_bytes": 64,
+      "tool_call_count": 0
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "model_completed",
+        "sequence": 12,
+        "stage_id": "B"
+      }
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "stage_completed",
+        "sequence": 13,
+        "stage_id": "B",
+        "output": {
+          "score": 0.9
+        }
+      }
+    },
+    {
+      "op": "record_annotation",
+      "namespace": "nemoir.autoresearch/v1",
+      "kind": "trial_finished",
+      "anchor_sequence": 13,
+      "payload": {
+        "trial_id": 1,
+        "candidate_ref": "candidate-1",
+        "parent_ref": null,
+        "candidate_digest": null,
+        "parent_digest": null,
+        "selection_metrics": {
+          "candidate_median_ns": 100.0,
+          "incumbent_median_ns": 120.0,
+          "delta_ns": 20.0,
+          "effect_ns": 20.0,
+          "valid": true
+        },
+        "confirmation_metrics": null,
+        "verdict": "rejected",
+        "reason_code": "no_improvement",
+        "source_reason_code": "no-improvement",
+        "mechanism_ref": null,
+        "mechanism_id": null,
+        "artifact_refs": []
+      }
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "transition_selected",
+        "sequence": 14,
+        "stage_id": "B",
+        "transition_to": "C",
+        "metadata": {
+          "reason": "explicit_transition",
+          "priority": 1
+        }
+      }
+    },
+    {
+      "op": "begin_stage_visit",
+      "stage_id": "Evil sk-parity-TEST-secret-9999"
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "stage_started",
+        "sequence": 15,
+        "stage_id": "Evil sk-parity-TEST-secret-9999"
+      }
+    },
+    {
+      "op": "begin_stage_visit",
+      "stage_id": "C"
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "stage_started",
+        "sequence": 16,
+        "stage_id": "C"
+      }
+    },
+    {
+      "op": "begin_tool_call"
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "tool_call_started",
+        "sequence": 17,
+        "stage_id": "C",
+        "capability": "http.fetch",
+        "tool_name": "fetcher",
+        "args": {
+          "method": "GET",
+          "url": "https://api.example.com/data?token=abc",
+          "headers": {
+            "Authorization": "Bearer x"
+          },
+          "body": "x"
+        }
+      }
+    },
+    {
+      "op": "record_tool_error",
+      "error_type": "ToolInvocationError"
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "tool_call_failed",
+        "sequence": 18,
+        "stage_id": "C",
+        "capability": "http.fetch",
+        "tool_name": "fetcher"
+      }
+    },
+    {
+      "op": "begin_tool_call"
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "tool_call_started",
+        "sequence": 19,
+        "stage_id": "C",
+        "capability": "os.shell",
+        "tool_name": "shelltool",
+        "args": {
+          "command": "DELETE FROM secrets"
+        }
+      }
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "tool_call_completed",
+        "sequence": 20,
+        "stage_id": "C",
+        "capability": "os.shell",
+        "tool_name": "shelltool"
+      }
+    },
+    {
+      "op": "begin_tool_call"
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "tool_call_started",
+        "sequence": 21,
+        "stage_id": "C",
+        "capability": "user.elicit",
+        "tool_name": "elicit",
+        "args": {
+          "question": "Pick one",
+          "options": [
+            "a",
+            "b"
+          ]
+        }
+      }
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "tool_call_completed",
+        "sequence": 22,
+        "stage_id": "C",
+        "capability": "user.elicit",
+        "tool_name": "elicit"
+      }
+    },
+    {
+      "op": "begin_tool_call"
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "tool_call_started",
+        "sequence": 23,
+        "stage_id": "C",
+        "capability": "user.confirm",
+        "tool_name": "confirm",
+        "args": {
+          "message": "Proceed?"
+        }
+      }
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "tool_call_completed",
+        "sequence": 24,
+        "stage_id": "C",
+        "capability": "user.confirm",
+        "tool_name": "confirm"
+      }
+    },
+    {
+      "op": "begin_tool_call"
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "tool_call_started",
+        "sequence": 25,
+        "stage_id": "C",
+        "capability": "browser.storage.read",
+        "tool_name": "reader",
+        "args": {
+          "key": "k"
+        }
+      }
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "tool_call_completed",
+        "sequence": 26,
+        "stage_id": "C",
+        "capability": "browser.storage.read",
+        "tool_name": "reader"
+      }
+    },
+    {
+      "op": "begin_tool_call"
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "tool_call_started",
+        "sequence": 27,
+        "stage_id": "C",
+        "capability": "browser.js.run",
+        "tool_name": "runner",
+        "args": {
+          "code": "return 1",
+          "input": {
+            "x": 1
+          }
+        }
+      }
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "tool_call_completed",
+        "sequence": 28,
+        "stage_id": "C",
+        "capability": "browser.js.run",
+        "tool_name": "runner"
+      }
+    },
+    {
+      "op": "begin_tool_call"
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "tool_call_started",
+        "sequence": 29,
+        "stage_id": "C",
+        "capability": "made.up",
+        "tool_name": "mystery",
+        "args": {
+          "anything": "x"
+        }
+      }
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "tool_call_completed",
+        "sequence": 30,
+        "stage_id": "C",
+        "capability": "made.up",
+        "tool_name": "mystery"
+      }
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "policy_checked",
+        "sequence": 31,
+        "stage_id": "C",
+        "capability": "fs.write",
+        "metadata": {
+          "policy_id": "deny fs.write if guard",
+          "policy_kind": "deny",
+          "denied": true
+        }
+      }
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "policy_denied",
+        "sequence": 32,
+        "stage_id": "C",
+        "capability": "fs.write",
+        "metadata": {
+          "policy_id": "deny fs.write if guard"
+        }
+      }
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "stage_completed",
+        "sequence": 33,
+        "stage_id": "C",
+        "output": {
+          "done": true
+        }
+      }
+    },
+    {
+      "op": "observe",
+      "event": {
+        "kind": "run_completed",
+        "sequence": 34,
+        "result": {
+          "summary": "ok"
+        }
+      }
+    }
+  ]
+}
