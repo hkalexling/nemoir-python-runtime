@@ -31,6 +31,7 @@ Fidelity limits, stated honestly:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import PurePath
 from typing import TYPE_CHECKING, Any, cast
 
 from nemoir_runtime.canonical import parse_json_strict
@@ -333,6 +334,24 @@ def _is_redaction_marker(value: Any) -> bool:
         return False
     marker = cast("dict[Any, Any]", value)
     return isinstance(marker.get("$redacted"), dict)
+
+
+def _normalize_replayed_output(value: Any) -> Any:
+    """Canonicalize replay-only host types to their recorded JSON forms.
+
+    Stage outputs are compared against vault snapshots (JSON), while the
+    replay produces live Python values; a declared ``path`` output arrives
+    as ``pathlib.Path`` and must compare equal to its serialized string.
+    """
+    if isinstance(value, PurePath):
+        return str(value)
+    if isinstance(value, dict):
+        mapping = cast("dict[Any, Any]", value)
+        return {key: _normalize_replayed_output(item) for key, item in mapping.items()}
+    if isinstance(value, (list, tuple)):
+        sequence = cast("list[Any]", value)
+        return [_normalize_replayed_output(item) for item in sequence]
+    return value
 
 
 def _marker_aware_equal(replayed: Any, recorded: Any) -> bool:
@@ -958,7 +977,7 @@ def _compare_paths(
         if event.kind == "stage_started":
             current_visit = tracker.next()
         if event.kind == "stage_completed":
-            visit_to_output[current_visit] = event.output or {}
+            visit_to_output[current_visit] = _normalize_replayed_output(event.output or {})
     for visit, snapshot in snapshots.items():
         if not isinstance(snapshot, dict):
             continue

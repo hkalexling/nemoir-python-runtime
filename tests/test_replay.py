@@ -21,6 +21,8 @@ from nemoir_runtime.replay import (
     TapedModelAdapter,
     TapedReplayError,
     TapedToolRegistry,
+    _marker_aware_equal,  # type: ignore[reportPrivateUsage]
+    _normalize_replayed_output,  # type: ignore[reportPrivateUsage]
     _unmark_fixture,  # type: ignore[reportPrivateUsage]
     replay_trace,
 )
@@ -387,3 +389,22 @@ def test_fixture_placeholders_cover_marker_types() -> None:
     assert _unmark_fixture(marker("null")) is None
     nested = {"a": [marker("string", 1)], "b": {"c": marker("number")}, "d": "kept"}
     assert _unmark_fixture(nested) == {"a": ["?"], "b": {"c": 0}, "d": "kept"}
+
+
+def test_replayed_path_outputs_compare_as_serialized_strings() -> None:
+    """Path-typed outputs compare as their recorded JSON strings.
+
+    The live runtime returns ``Path`` objects for declared ``path`` outputs
+    while the vault snapshot stores the serialized string, so replay must
+    canonicalize the host type or every path-valued output reports a false
+    divergence.
+    """
+    recorded = {"location": "$workspace/a.txt", "count": 3}
+    replayed = _normalize_replayed_output({"location": Path("$workspace/a.txt"), "count": 3})
+    assert _marker_aware_equal(replayed, recorded)
+    marker: dict[str, Any] = {
+        "$redacted": {"token": "r-1", "reason": "absolute_path", "value_type": "object"}
+    }
+    assert _marker_aware_equal(
+        _normalize_replayed_output({"location": Path("x")}), {"location": marker}
+    )
