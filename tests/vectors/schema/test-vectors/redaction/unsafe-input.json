@@ -1,0 +1,23 @@
+{
+  "note": "All values in this file are synthetic test data, not credentials or personal data.",
+  "run_inputs": {
+    "api_key_echo": "sk-nemoir-phase0-TEST-000000000000",
+    "email": "trace-test@example.invalid",
+    "workspace": "/home/nemoir-secret-user/private-project"
+  },
+  "model": {
+    "extra_headers": {
+      "Authorization": "Bearer nemoir-phase0-TEST-bearer-token"
+    },
+    "reasoning": "The hidden oracle value is 8675309."
+  },
+  "tool": {
+    "capability": "fs.write",
+    "args": {
+      "path": "/home/nemoir-secret-user/private-project/secret.txt",
+      "content": "PRIVATE-CANDIDATE-SOURCE-PHASE0"
+    },
+    "error": "Permission denied under /home/nemoir-secret-user/private-project"
+  },
+  "policy_id": "deny os.shell(command) if command.eq(\"PRIVATE-COMMAND-PHASE0\")"
+}

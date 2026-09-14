@@ -1,0 +1,28 @@
+{
+  "kind": "stage_completed",
+  "output": {
+    "private_a": {
+      "$redacted": {
+        "reason": "private_content",
+        "token": "r-1",
+        "value_type": "string"
+      }
+    },
+    "private_b": {
+      "$redacted": {
+        "reason": "personal_data",
+        "token": "r-2",
+        "value_type": "object"
+      }
+    }
+  },
+  "redacted_fields": [
+    "/output/private_a",
+    "/output/private_b"
+  ],
+  "run_id": "0123456789abcdef0123456789abcdef",
+  "sequence": 7,
+  "stage_id": "PrivateStage",
+  "stage_visit_id": "s-2",
+  "timestamp": "2026-01-02T03:04:05.006Z"
+}

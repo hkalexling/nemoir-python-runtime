@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nemoir.dev/schema/trace/0.1/vault-record.schema.json",
+  "title": "NemoTrace 0.1 decrypted vault record",
+  "type": "object",
+  "required": ["record_id", "record_type", "payload"],
+  "properties": {
+    "record_id": {"type": "string", "pattern": "^v-[1-9][0-9]*$"},
+    "record_type": {
+      "enum": [
+        "run_inputs",
+        "stage_snapshot",
+        "model_request",
+        "model_response",
+        "tool_result",
+        "transition_evaluation",
+        "policy_evaluation",
+        "private_fields",
+        "full_workflow_ir",
+        "annotation_private_fields"
+      ]
+    },
+    "event_sequence": {"type": "integer", "minimum": 1},
+    "stage_visit_id": {"$ref": "common.schema.json#/$defs/stage_visit_id"},
+    "model_call_id": {"$ref": "common.schema.json#/$defs/model_call_id"},
+    "tool_call_id": {"$ref": "common.schema.json#/$defs/tool_call_id"},
+    "payload": {"$ref": "common.schema.json#/$defs/json_value"}
+  },
+  "additionalProperties": false
+}

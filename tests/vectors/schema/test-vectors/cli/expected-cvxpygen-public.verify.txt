@@ -1,0 +1,14 @@
+archive: cvxpygen-public.nemotrace
+format: nemoir.trace/0.1
+trace_id: 0123456789abcdef0123456789abcdef
+workflow: CvxpygenH50Autoresearch
+profile: audit
+status: complete
+content_identity: sha256:53f367fb190e45e621cc67d9c0f8648d4f701da8372662d455bf842e86ebd7e2
+integrity: passed
+structural: passed
+semantic: not-evaluated
+replayability: playback-only
+warnings: 0
+errors: 0
+result: ok

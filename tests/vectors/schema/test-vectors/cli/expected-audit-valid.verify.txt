@@ -1,0 +1,14 @@
+archive: audit-valid.nemotrace
+format: nemoir.trace/0.1
+trace_id: 0123456789abcdef0123456789abcdef
+workflow: MinimalTrace
+profile: audit
+status: complete
+content_identity: sha256:168cceb6d53a7318054d6a87ab977ea651c3f19adb4bf252af7793de3e535d95
+integrity: passed
+structural: passed
+semantic: not-evaluated
+replayability: playback-only
+warnings: 0
+errors: 0
+result: ok

@@ -1,0 +1,160 @@
+{
+  "note": "Shared Python/Web vault fixture (Phase 4). Both recorders drive ops in order with fixed clock + trace id + passphrase, and must emit byte-identical public/events.ndjson, public/workflow.graph.json, and decrypted vault plaintext (expected-vault-records.ndjson). All values are synthetic.",
+  "manifest": {
+    "workflow_id": "MiniReplay",
+    "entry": "A",
+    "exits": ["C"],
+    "policies": [
+      {"id": "deny fs.write if guard", "kind": "deny", "trigger_capability": "fs.write"}
+    ],
+    "stages": [
+      {
+        "id": "A",
+        "execution": "tool",
+        "requires": ["fs.read"],
+        "writes": [{"name": "text", "type": "string", "optional": false}],
+        "transitions": [
+          {"to": "B", "priority": 0, "reason": "explicit_transition", "guard_kind": "always"}
+        ]
+      },
+      {
+        "id": "B",
+        "execution": "model",
+        "requires": [],
+        "writes": [{"name": "score", "type": "number", "optional": false}],
+        "transitions": [
+          {"to": "C", "priority": 0, "reason": "explicit_transition", "guard_kind": "always"}
+        ]
+      },
+      {
+        "id": "C",
+        "execution": "tool",
+        "requires": ["fs.write"],
+        "writes": [{"name": "done", "type": "bool", "optional": false}],
+        "transitions": []
+      }
+    ]
+  },
+  "config": {
+    "trace_id": "123456789abcdef0123456789abcdef0",
+    "clock": "2026-03-04T05:06:07.000Z",
+    "passphrase": "phase4-vault-fake-passphrase-01",
+    "path_aliases": {"$workspace": "/work"},
+    "safe_path_aliases": ["$workspace"],
+    "approved_metrics": ["B.score"],
+    "secrets": ["sk-vault-TEST-secret-9999"]
+  },
+  "ops": [
+    {"op": "begin_run"},
+    {"op": "record_run_inputs", "inputs": {"topic": "synthetic-vault"}},
+    {"op": "observe", "event": {"kind": "run_started", "sequence": 1}},
+    {"op": "begin_stage_visit", "stage_id": "A"},
+    {"op": "observe", "event": {"kind": "stage_started", "sequence": 2, "stage_id": "A"}},
+    {"op": "begin_tool_call"},
+    {
+      "op": "observe",
+      "event": {
+        "kind": "tool_call_started",
+        "sequence": 3,
+        "stage_id": "A",
+        "capability": "fs.read",
+        "tool_name": "reader",
+        "args": {"path": "/work/a.txt"}
+      }
+    },
+    {
+      "op": "record_tool_result",
+      "result": {"body": "file-bytes sk-vault-TEST-secret-9999", "bytes": 34},
+      "args": {"path": "/work/a.txt"}
+    },
+    {"op": "observe", "event": {"kind": "tool_call_completed", "sequence": 4, "stage_id": "A", "capability": "fs.read", "tool_name": "reader"}},
+    {"op": "observe", "event": {"kind": "stage_completed", "sequence": 5, "stage_id": "A", "output": {"text": "hello"}}},
+    {
+      "op": "record_transition_evaluation",
+      "candidates": [
+        {"to": "B", "priority": 0, "reason": "explicit_transition", "matched": true},
+        {"to": "C", "priority": 1, "reason": "explicit_transition", "matched": false}
+      ]
+    },
+    {"op": "observe", "event": {"kind": "transition_selected", "sequence": 6, "stage_id": "A", "transition_to": "B", "metadata": {"reason": "explicit_transition", "priority": 0}}},
+    {"op": "begin_stage_visit", "stage_id": "B"},
+    {"op": "observe", "event": {"kind": "stage_started", "sequence": 7, "stage_id": "B"}},
+    {"op": "begin_model_call"},
+    {
+      "op": "record_model_request",
+      "request": {
+        "messages": [{"role": "system", "content": "You are stage B."}, {"role": "user", "content": "score this"}],
+        "tools": [],
+        "output_schema": {"type": "object"}
+      }
+    },
+    {
+      "op": "record_model_response_full",
+      "response": {
+        "content": "{\"score\": 0.9}",
+        "tool_calls": [],
+        "reasoning": "private-chain-of-thought",
+        "usage": {"input_tokens": 10, "output_tokens": 5}
+      },
+      "response_bytes": 64,
+      "tool_call_count": 0
+    },
+    {"op": "observe", "event": {"kind": "model_completed", "sequence": 8, "stage_id": "B"}},
+    {"op": "observe", "event": {"kind": "stage_completed", "sequence": 9, "stage_id": "B", "output": {"score": 0.9}}},
+    {
+      "op": "record_transition_evaluation",
+      "candidates": [
+        {"to": "C", "priority": 0, "reason": "explicit_transition", "matched": true}
+      ]
+    },
+    {"op": "observe", "event": {"kind": "transition_selected", "sequence": 10, "stage_id": "B", "transition_to": "C", "metadata": {"reason": "explicit_transition", "priority": 0}}},
+    {"op": "begin_stage_visit", "stage_id": "C"},
+    {"op": "observe", "event": {"kind": "stage_started", "sequence": 11, "stage_id": "C"}},
+    {
+      "op": "observe",
+      "event": {
+        "kind": "policy_checked",
+        "sequence": 12,
+        "stage_id": "C",
+        "capability": "fs.write",
+        "metadata": {"policy_id": "deny fs.write if guard", "policy_kind": "deny", "denied": false}
+      }
+    },
+    {
+      "op": "record_policy_evaluation",
+      "policy_id": "deny fs.write if guard",
+      "bound": {"path": "/work/out.txt"},
+      "outcome": "allowed"
+    },
+    {"op": "begin_tool_call"},
+    {
+      "op": "observe",
+      "event": {
+        "kind": "tool_call_started",
+        "sequence": 13,
+        "stage_id": "C",
+        "capability": "http.fetch",
+        "tool_name": "fetcher",
+        "args": {
+          "method": "GET",
+          "url": "https://api.example.com/data",
+          "headers": {"Authorization": "Bearer sk-vault-TEST-secret-9999"},
+          "body": "request-body /home/vault-user/secret.txt"
+        }
+      }
+    },
+    {
+      "op": "record_tool_result",
+      "result": {"status": 200, "api_key": "SHOULD-NEVER-APPEAR", "body": "ok"},
+      "args": {
+        "method": "GET",
+        "url": "https://api.example.com/data",
+        "headers": {"Authorization": "Bearer sk-vault-TEST-secret-9999"},
+        "body": "request-body /home/vault-user/secret.txt"
+      }
+    },
+    {"op": "observe", "event": {"kind": "tool_call_completed", "sequence": 14, "stage_id": "C", "capability": "http.fetch", "tool_name": "fetcher"}},
+    {"op": "observe", "event": {"kind": "stage_completed", "sequence": 15, "stage_id": "C", "output": {"done": true}}},
+    {"op": "observe", "event": {"kind": "run_completed", "sequence": 16, "result": {"summary": "ok"}}}
+  ]
+}

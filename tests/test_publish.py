@@ -35,16 +35,11 @@ from nemoir_runtime.trace import read_archive_entries
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
-ROOT = Path(__file__).resolve().parents[3]
-VECTORS = ROOT / "docs" / "trace" / "schema" / "test-vectors"
+VECTORS = Path(__file__).resolve().parent / "vectors" / "schema" / "test-vectors"
 PUBLICATION = VECTORS / "publication"
 FIXTURE = PUBLICATION / "cvxpygen-publication.nemotrace"
 AUDIT = VECTORS / "audit-valid.nemotrace"
 REPLAY = VECTORS / "cli" / "replay-e2e.nemotrace"
-
-pytestmark = pytest.mark.skipif(
-    not PUBLICATION.exists(), reason="publication vectors require the meta checkout"
-)
 
 
 @pytest.fixture

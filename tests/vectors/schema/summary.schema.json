@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nemoir.dev/schema/trace/0.1/summary.schema.json",
+  "title": "NemoTrace 0.1 derived summary cache",
+  "type": "object",
+  "required": [
+    "format",
+    "events_sha256",
+    "event_count",
+    "stage_visit_count",
+    "counts_by_kind"
+  ],
+  "properties": {
+    "format": {
+      "const": "nemoir.trace.summary/0.1"
+    },
+    "events_sha256": {
+      "$ref": "common.schema.json#/$defs/sha256"
+    },
+    "event_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "stage_visit_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "counts_by_kind": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "annotations_dropped": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "annotation_warnings": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "type": "string",
+        "maxLength": 320
+      }
+    }
+  },
+  "additionalProperties": false
+}

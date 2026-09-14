@@ -50,8 +50,7 @@ from nemoir_runtime.trace import (
     verify_archive,
 )
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-SCHEMA_DIR = REPO_ROOT / "docs" / "trace" / "schema"
+SCHEMA_DIR = Path(__file__).resolve().parent / "vectors" / "schema"
 VECTORS = SCHEMA_DIR / "test-vectors"
 
 FIXED_TIME = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)

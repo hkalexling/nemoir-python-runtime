@@ -1,6 +1,7 @@
 """Phase 4 replay vault: capture, encryption, unlock, and tamper resistance.
 
-``docs/trace/schema/test-vectors/vault/vault-fake-run.json`` drives the
+``tests/vectors/schema/test-vectors/vault/vault-fake-run.json`` (a vendored
+copy of the meta fixture) drives the
 recorder through a fixed op sequence (fixed clock + trace id + passphrase).
 The decrypted vault plaintext must match the frozen
 ``expected-vault-records.ndjson`` byte-for-byte; the web recorder asserts
@@ -39,8 +40,7 @@ from nemoir_runtime.trace import (
     verify_archive,
 )
 
-ROOT = Path(__file__).resolve().parents[3]
-VAULT_VECTORS = ROOT / "docs" / "trace" / "schema" / "test-vectors" / "vault"
+VAULT_VECTORS = Path(__file__).resolve().parent / "vectors" / "schema" / "test-vectors" / "vault"
 FAKE_PASSPHRASE = "phase4-vault-fake-passphrase-01"  # noqa: S105
 
 

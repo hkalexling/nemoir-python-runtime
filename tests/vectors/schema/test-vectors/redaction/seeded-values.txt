@@ -1,0 +1,7 @@
+sk-nemoir-phase0-TEST-000000000000
+trace-test@example.invalid
+/home/nemoir-secret-user
+nemoir-phase0-TEST-bearer-token
+8675309
+PRIVATE-CANDIDATE-SOURCE-PHASE0
+PRIVATE-COMMAND-PHASE0

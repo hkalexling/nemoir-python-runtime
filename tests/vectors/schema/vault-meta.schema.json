@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nemoir.dev/schema/trace/0.1/vault-meta.schema.json",
+  "title": "NemoTrace 0.1 encrypted vault metadata",
+  "type": "object",
+  "required": ["format", "codec", "passphrase", "kdf", "cipher", "plaintext", "aad"],
+  "properties": {
+    "format": {"const": "nemoir.trace.vault-meta/0.1"},
+    "codec": {"const": "PBKDF2-HMAC-SHA-256+A256GCM"},
+    "passphrase": {
+      "type": "object",
+      "required": ["encoding", "normalization"],
+      "properties": {
+        "encoding": {"const": "UTF-8"},
+        "normalization": {"const": "NFC"}
+      },
+      "additionalProperties": false
+    },
+    "kdf": {
+      "type": "object",
+      "required": ["name", "iterations", "salt_base64url", "derived_key_bits"],
+      "properties": {
+        "name": {"const": "PBKDF2-HMAC-SHA-256"},
+        "iterations": {"const": 600000},
+        "salt_base64url": {
+          "$ref": "common.schema.json#/$defs/base64url_no_pad",
+          "minLength": 22,
+          "maxLength": 22
+        },
+        "derived_key_bits": {"const": 256}
+      },
+      "additionalProperties": false
+    },
+    "cipher": {
+      "type": "object",
+      "required": ["name", "nonce_base64url", "tag_length_bits", "tag_placement"],
+      "properties": {
+        "name": {"const": "AES-256-GCM"},
+        "nonce_base64url": {
+          "$ref": "common.schema.json#/$defs/base64url_no_pad",
+          "minLength": 16,
+          "maxLength": 16
+        },
+        "tag_length_bits": {"const": 128},
+        "tag_placement": {"const": "ciphertext_suffix"}
+      },
+      "additionalProperties": false
+    },
+    "plaintext": {
+      "type": "object",
+      "required": ["media_type", "encoding", "compression"],
+      "properties": {
+        "media_type": {"const": "application/x-ndjson"},
+        "encoding": {"const": "UTF-8"},
+        "compression": {"const": "none"}
+      },
+      "additionalProperties": false
+    },
+    "aad": {
+      "type": "object",
+      "required": [
+        "format",
+        "trace_id",
+        "ir_sha256",
+        "manifest_sha256",
+        "events_sha256",
+        "workflow_graph_sha256"
+      ],
+      "properties": {
+        "format": {"const": "nemoir.trace.vault-aad/0.1"},
+        "trace_id": {"$ref": "common.schema.json#/$defs/trace_id"},
+        "ir_sha256": {"$ref": "common.schema.json#/$defs/sha256"},
+        "manifest_sha256": {"$ref": "common.schema.json#/$defs/sha256"},
+        "events_sha256": {"$ref": "common.schema.json#/$defs/sha256"},
+        "workflow_graph_sha256": {"$ref": "common.schema.json#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

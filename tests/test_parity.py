@@ -1,6 +1,7 @@
 """Cross-language parity: the shared fixture must project byte-identical ledgers.
 
-``docs/trace/schema/test-vectors/parity/fake-run.json`` drives the recorder
+``tests/vectors/schema/test-vectors/parity/fake-run.json`` (a vendored copy of
+the meta fixture) drives the recorder
 through a fixed op sequence (hooks + observations, fixed clock + trace id).
 Both the Python and TypeScript recorders must emit byte-identical
 ``public/events.ndjson`` and ``public/workflow.graph.json`` matching the
@@ -33,8 +34,7 @@ from nemoir_runtime.trace import (
     verify_archive,
 )
 
-ROOT = Path(__file__).resolve().parents[3]
-PARITY = ROOT / "docs" / "trace" / "schema" / "test-vectors" / "parity"
+PARITY = Path(__file__).resolve().parent / "vectors" / "schema" / "test-vectors" / "parity"
 
 
 def _load_fixture() -> dict[str, Any]:

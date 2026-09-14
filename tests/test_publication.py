@@ -41,8 +41,8 @@ from tests.test_parity import _drive_fixture  # type: ignore[reportPrivateUsage]
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-ROOT = Path(__file__).resolve().parents[3]
-VECTORS = ROOT / "docs" / "trace" / "schema" / "test-vectors"
+VECTORS = Path(__file__).resolve().parent / "vectors" / "schema" / "test-vectors"
+CATALOG = Path(__file__).resolve().parent / "vectors" / "catalog.json"
 AUDIT_FIXTURE = VECTORS / "audit-valid.nemotrace"
 CVXPYGEN_FIXTURE = VECTORS / "cvxpygen-public.nemotrace"
 REPLAY_FIXTURE = VECTORS / "cli" / "replay-e2e.nemotrace"
@@ -58,10 +58,6 @@ RECORDS = [
     "public/summary.json",
     "integrity.json",
 ]
-
-pytestmark = pytest.mark.skipif(
-    not VECTORS.exists(), reason="publication tests require the meta checkout"
-)
 
 
 # ---------------------------------------------------------------------------
@@ -157,9 +153,6 @@ def _run_err(capsys: pytest.CaptureFixture[str], argv: list[str]) -> tuple[int, 
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(
-    not PUBLICATION_VECTORS.exists(), reason="publication vectors require the meta checkout"
-)
 def test_projection_matches_frozen_vectors() -> None:
     """The projected entries must equal the bytes the vectors freeze."""
     projection = scan_publication(PUBLICATION_SOURCE, archive_name=PUBLICATION_NAME)
@@ -783,8 +776,6 @@ def test_cli_prepare_refuses_stale_attestation(
 def test_cvxpygen_publication_fixture_is_attested_and_clean() -> None:
     """The reviewed showcase fixture: publication profile, attested, secret-free."""
     fixture = PUBLICATION_VECTORS / "cvxpygen-publication.nemotrace"
-    if not fixture.exists():
-        pytest.skip("publication fixture requires the meta checkout")
     report = verify_archive(fixture)
     assert report.ok, report.errors
     assert report.replayability == "playback-only"
@@ -823,9 +814,7 @@ def test_cvxpygen_publication_fixture_is_attested_and_clean() -> None:
     ]
     assert all("tool_name" not in event for event in ledger)
     # The catalog entry must describe this exact artifact.
-    catalog: dict[str, Any] = cast(
-        "dict[str, Any]", json.loads((ROOT / "docs" / "trace" / "catalog.json").read_text())
-    )
+    catalog: dict[str, Any] = cast("dict[str, Any]", json.loads(CATALOG.read_text()))
     entry = catalog["entries"][0]
     integrity: dict[str, Any] = cast(
         "dict[str, Any]", parse_json_strict(entries["integrity.json"].decode())

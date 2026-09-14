@@ -1,0 +1,14 @@
+archive: vault-fake-run.nemotrace
+format: nemoir.trace/0.1
+trace_id: 123456789abcdef0123456789abcdef0
+workflow: MiniReplay
+profile: replay
+status: complete
+content_identity: sha256:bba447dd4b11a7a45482b56f06463984c5c25b25114a22365f059939364ccc62
+integrity: passed
+structural: passed
+semantic: passed
+replayability: taped-replay
+warnings: 0
+errors: 0
+result: ok

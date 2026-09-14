@@ -191,10 +191,9 @@ def _write_entries(tmp_path: Path, entries: dict[str, bytes], out_path: Path):
         for name in sorted(payloads):
             info = zipfile.ZipInfo(filename=name, date_time=(1980, 1, 1, 0, 0, 0))
             info.compress_type = zipfile.ZIP_DEFLATED
-            info.compress_level = 6
             info.create_system = 3
             info.external_attr = 0o100644 << 16
-            z.writestr(info, payloads[name])
+            z.writestr(info, payloads[name], compresslevel=6)
 
 
 def test_verifier_rejects_numeric_stage_id(tmp_path: Path):
@@ -255,10 +254,9 @@ def test_verifier_handles_incomplete_integrity_without_crash(tmp_path: Path):
         for name in sorted(new_payloads):
             info = zipfile.ZipInfo(filename=name, date_time=(1980, 1, 1, 0, 0, 0))
             info.compress_type = zipfile.ZIP_DEFLATED
-            info.compress_level = 6
             info.create_system = 3
             info.external_attr = 0o100644 << 16
-            z.writestr(info, new_payloads[name])
+            z.writestr(info, new_payloads[name], compresslevel=6)
     report = verify_archive(tmp_bad)
     assert not report.ok
     # Should not have raised, and should contain integrity error, not KeyError

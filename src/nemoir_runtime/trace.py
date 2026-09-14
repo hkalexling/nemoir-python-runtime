@@ -3137,12 +3137,14 @@ def _zip_info(name: str) -> zipfile.ZipInfo:
     """Deterministic ZIP entry metadata for the NemoTrace container profile."""
     info = zipfile.ZipInfo(filename=name, date_time=ZIP_EPOCH)
     # Ciphertext is incompressible and must not be compressed before
-    # or after encryption (spike §1); everything else is DEFLATE.
+    # or after encryption (spike §1); everything else is DEFLATE. The
+    # deflate level is passed to `writestr` because `ZipInfo` only gained a
+    # public `compress_level` attribute in Python 3.13; the
+    # `compresslevel` keyword is the version-safe public API.
     if name == VAULT_ENC_PATH:
         info.compress_type = zipfile.ZIP_STORED
     else:
         info.compress_type = zipfile.ZIP_DEFLATED
-        info.compress_level = ZIP_DEFLATE_LEVEL
     info.create_system = 3
     info.external_attr = ZIP_UNIX_REGULAR << 16
     return info
@@ -3157,7 +3159,7 @@ def _write_zip_archive(path: Path, entries: Mapping[str, bytes]) -> None:
     try:
         with zipfile.ZipFile(tmp, "w") as archive:
             for name in sorted(entries):
-                archive.writestr(_zip_info(name), entries[name])
+                archive.writestr(_zip_info(name), entries[name], compresslevel=ZIP_DEFLATE_LEVEL)
         tmp.replace(path)
     finally:
         try:

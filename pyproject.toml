@@ -52,10 +52,11 @@ asyncio_mode = "auto"
 typeCheckingMode = "strict"
 venv = ".venv"
 venvPath = "."
-exclude = ["**/.venv", "tests/test_review_followup.py"]
+exclude = ["**/.venv", "tests/test_review_followup.py", "tests/vectors"]
 
 [tool.ruff]
 line-length = 100
+extend-exclude = ["tests/vectors"]
 
 [tool.ruff.lint]
 select = ["ALL"]

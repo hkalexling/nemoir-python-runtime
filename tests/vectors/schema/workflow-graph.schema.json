@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nemoir.dev/schema/trace/0.1/workflow-graph.schema.json",
+  "title": "NemoTrace 0.1 safe workflow graph",
+  "type": "object",
+  "required": ["format", "workflow_id", "entry", "exits", "nodes", "transitions", "policies"],
+  "properties": {
+    "format": {"const": "nemoir.trace.workflow-graph/0.1"},
+    "workflow_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "entry": {"type": "string", "minLength": 1, "maxLength": 256},
+    "exits": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1, "maxLength": 256}
+    },
+    "nodes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "execution", "capabilities", "writes"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1, "maxLength": 256},
+          "execution": {"enum": ["model", "tool"]},
+          "capabilities": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {"type": "string", "minLength": 1, "maxLength": 128}
+          },
+          "writes": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["name", "type", "optional"],
+              "properties": {
+                "name": {"type": "string", "minLength": 1, "maxLength": 256},
+                "type": {"type": "string", "minLength": 1, "maxLength": 64},
+                "optional": {"type": "boolean"}
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "transitions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["from", "to", "priority", "guard_kind"],
+        "properties": {
+          "from": {"type": "string", "minLength": 1, "maxLength": 256},
+          "to": {"type": "string", "minLength": 1, "maxLength": 256},
+          "priority": {"type": "integer", "minimum": 0},
+          "guard_kind": {"enum": ["always", "has_value", "missing", "eq", "if"]}
+        },
+        "additionalProperties": false
+      }
+    },
+    "policies": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["ref", "kind", "trigger_capability"],
+        "properties": {
+          "ref": {"type": "string", "pattern": "^p-[1-9][0-9]*$"},
+          "kind": {"enum": ["before", "deny"]},
+          "trigger_capability": {"type": "string", "minLength": 1, "maxLength": 128},
+          "required_capabilities": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {"type": "string", "minLength": 1, "maxLength": 128}
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

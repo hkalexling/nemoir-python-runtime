@@ -15,8 +15,9 @@ from nemoir_runtime.canonical import (
     to_canonical_bytes,
 )
 
-ROOT = Path(__file__).resolve().parents[3]
-VECTORS = ROOT / "docs" / "trace" / "schema" / "test-vectors"
+# Vendored copy of the frozen meta vectors: the suite must run in a
+# standalone checkout (CI has no meta repo).
+VECTORS = Path(__file__).resolve().parent / "vectors" / "schema" / "test-vectors"
 
 
 def test_primitives_vector_matches_checked_in_canonical() -> None:

@@ -1,8 +1,9 @@
 """``nemotrace verify`` CLI: golden outputs, exit codes, and passphrase sources.
 
-The golden stdout files under ``docs/trace/schema/test-vectors/cli/`` are
-shared with the TypeScript suite (``web/nemoir-runtime/src/__tests__/cli.test.ts``)
-and asserted by both, so the two CLIs provably agree byte-for-byte.
+The golden stdout files under the vendored
+``tests/vectors/schema/test-vectors/cli/`` are shared with the TypeScript suite
+(``web/nemoir-runtime/src/__tests__/cli.test.ts``) and asserted by both, so
+the two CLIs provably agree byte-for-byte.
 """
 
 from __future__ import annotations
@@ -14,8 +15,7 @@ import pytest
 
 from nemoir_runtime import cli
 
-ROOT = Path(__file__).resolve().parents[3]
-VECTORS = ROOT / "docs" / "trace" / "schema" / "test-vectors"
+VECTORS = Path(__file__).resolve().parent / "vectors" / "schema" / "test-vectors"
 CLI_VECTORS = VECTORS / "cli"
 AUDIT_FIXTURE = VECTORS / "audit-valid.nemotrace"
 CVXPYGEN_FIXTURE = VECTORS / "cvxpygen-public.nemotrace"
@@ -23,10 +23,6 @@ REPLAY_FIXTURE = CLI_VECTORS / "replay-e2e.nemotrace"
 VAULT_FIXTURE = CLI_VECTORS / "vault-fake-run.nemotrace"
 REPLAY_PASSPHRASE = "replay-e2e-passphrase"  # noqa: S105
 VAULT_PASSPHRASE = "phase4-vault-fake-passphrase-01"  # noqa: S105
-
-pytestmark = pytest.mark.skipif(
-    not CLI_VECTORS.exists(), reason="CLI vectors require the meta checkout"
-)
 
 
 def _run(capsys: pytest.CaptureFixture[str], argv: list[str]) -> tuple[int, str]:
