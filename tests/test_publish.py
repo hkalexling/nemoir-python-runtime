@@ -10,14 +10,18 @@ catalog claims.
 
 from __future__ import annotations
 
+import io
 import json
+import shlex
 import threading
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import pytest
 
+from nemoir_runtime.canonical import sha256_tag, to_canonical_bytes
 from nemoir_runtime.publication import PublicationError
 from nemoir_runtime.publish import (
     PublishCheck,
@@ -29,7 +33,7 @@ from nemoir_runtime.publish import (
 from nemoir_runtime.trace import read_archive_entries
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
 ROOT = Path(__file__).resolve().parents[3]
 VECTORS = ROOT / "docs" / "trace" / "schema" / "test-vectors"
@@ -89,6 +93,49 @@ def test_plan_refuses_missing_title_license_and_bad_filename(plan: PublishPlan) 
     with pytest.raises(PublicationError, match="plain"):
         plan_publication(FIXTURE, title="t", license_id="CC-BY-4.0", filename="nested/x.nemotrace")
     assert plan.catalog_entry["artifact"]["bytes"] == FIXTURE.stat().st_size
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "trace'; echo PWN; #.nemotrace",
+        "trace with space.nemotrace",
+        "trace$(id).nemotrace",
+        "trace`id`.nemotrace",
+        'trace".nemotrace',
+        "trace.nemotrace.sh",
+        ".hidden",
+    ],
+)
+def test_plan_refuses_shell_hostile_filenames(plan: PublishPlan, filename: str) -> None:
+    """A published filename lands in a copy/paste runbook: it must be inert."""
+    with pytest.raises(PublicationError, match="plain"):
+        plan_publication(FIXTURE, title="t", license_id="CC-BY-4.0", filename=filename)
+    assert plan.filename == FIXTURE.name
+
+
+def test_plan_runbook_quotes_user_controlled_tokens() -> None:
+    hostile_title = 'fixture"; echo RUNBOOK_INJECTION; $(id) `id` # '
+    plan = plan_publication(FIXTURE, title=hostile_title, license_id="CC-BY-4.0")
+    normalized = " ".join(hostile_title.split())
+    create_line = next(line for line in plan.commands if line.startswith("gh gist create"))
+    tokens = shlex.split(create_line)
+    # The hostile title is exactly one inert argument, not a command sequence.
+    assert tokens[tokens.index("--desc") + 1] == normalized
+    commit_line = next(line for line in plan.commands if line.startswith("cd nemotrace-gist"))
+    commit_tokens = shlex.split(commit_line.replace(" && ", " "))
+    assert f"Add {FIXTURE.name}" in commit_tokens
+    copy_line = next(line for line in plan.commands if line.startswith("cp "))
+    copy_tokens = shlex.split(copy_line)
+    assert copy_tokens[1] == str(FIXTURE)
+    assert copy_tokens[2] == f"nemotrace-gist/{FIXTURE.name}"
+
+
+def test_plan_normalizes_and_bounds_the_title() -> None:
+    plan = plan_publication(FIXTURE, title="  two\n\tlines  ", license_id="CC-BY-4.0")
+    assert plan.title == "two lines"
+    with pytest.raises(PublicationError, match="at most"):
+        plan_publication(FIXTURE, title="x" * 500, license_id="CC-BY-4.0")
 
 
 def test_plan_refuses_an_over_budget_archive(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -180,6 +227,7 @@ def _metadata(
     raw_url: str,
     revision: str = REVISION,
     extra: dict[str, Any] | None = None,
+    public: bool = True,
 ) -> bytes:
     files: dict[str, Any] = {filename: {"filename": filename, "raw_url": raw_url, "size": 1}}
     if extra:
@@ -187,10 +235,53 @@ def _metadata(
     payload = {
         "id": GIST_ID,
         "description": "fixture",
+        "public": public,
         "history": [{"version": revision}],
         "files": files,
     }
     return json.dumps(payload).encode("utf-8")
+
+
+def _reindexed_fixture(mutate: Callable[[dict[str, Any]], None]) -> bytes:
+    """Rebuild the publication fixture with a mutated manifest and fresh hashes."""
+    entries = read_archive_entries(FIXTURE)
+    manifest: dict[str, Any] = json.loads(entries["manifest.json"].decode("utf-8"))
+    mutate(manifest)
+    entries["manifest.json"] = to_canonical_bytes(manifest)
+    integrity: dict[str, Any] = json.loads(entries["integrity.json"].decode("utf-8"))
+    for entry in cast("list[dict[str, Any]]", integrity["entries"]):
+        data = entries[cast("str", entry["path"])]
+        entry["sha256"] = sha256_tag(data)
+        entry["uncompressed_bytes"] = len(data)
+    identity = {
+        "format": "nemoir.trace.content-identity/0.1",
+        "entries": sorted(
+            (
+                {
+                    "path": entry["path"],
+                    "sha256": entry["sha256"],
+                    "uncompressed_bytes": entry["uncompressed_bytes"],
+                }
+                for entry in cast("list[dict[str, Any]]", integrity["entries"])
+            ),
+            key=lambda item: cast("str", item["path"]),
+        ),
+    }
+    integrity["content_identity"] = sha256_tag(to_canonical_bytes(identity))
+    entries["integrity.json"] = to_canonical_bytes(integrity)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name in sorted(entries):
+            archive.writestr(name, entries[name])
+    return buffer.getvalue()
+
+
+def _serve_bytes(routes: dict[str, tuple[str, bytes]], base: str, data: bytes) -> None:
+    raw_path = f"/raw/{GIST_ID}/{REVISION}/{FIXTURE.name}"
+    metadata = _metadata(filename=FIXTURE.name, raw_url=f"{base}{raw_path}")
+    routes[f"/gists/{GIST_ID}"] = ("application/json", metadata)
+    routes[f"/gists/{GIST_ID}/{REVISION}"] = ("application/json", metadata)
+    routes[raw_path] = ("application/octet-stream", data)
 
 
 def _serve_fixture(
@@ -324,3 +415,52 @@ def test_verify_published_check_reports_failure_without_raising(
     )
     assert isinstance(check.errors, tuple)
     assert check.ok is False
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("capture.scanner.status", "failed", "scanner did not pass"),
+        ("capture.scanner.ruleset", "secrets-v9", "scanner ruleset"),
+        ("capture.redaction_policy", "audit-v1", "redaction policy"),
+        ("capture.publication_eligible", False, "publication_eligible"),
+        ("capture.attested", False, "not attested"),
+        ("provenance.complete", False, "complete provenance"),
+    ],
+)
+def test_verify_published_applies_the_strict_artifact_gate(
+    gist_server: tuple[str, dict[str, tuple[str, bytes]]],
+    field: str,
+    value: Any,
+    expected: str,
+) -> None:
+    """A re-indexed Gist artifact must not verify as an attested publication."""
+    base, routes = gist_server
+
+    def mutate(manifest: dict[str, Any]) -> None:
+        target: Any = manifest
+        *parents, leaf = field.split(".")
+        for key in parents:
+            target = target[key]
+        target[leaf] = value
+
+    _serve_bytes(routes, base, _reindexed_fixture(mutate))
+    check = verify_published(GIST_ID, api_base=base, allow_insecure=True)
+    assert not check.ok
+    assert any(expected in error for error in check.errors), check.errors
+
+
+def test_verify_published_refuses_a_secret_gist(
+    gist_server: tuple[str, dict[str, tuple[str, bytes]]],
+) -> None:
+    base, routes = gist_server
+    _serve_fixture(routes, base)
+    metadata = _metadata(
+        filename=FIXTURE.name,
+        raw_url=f"{base}/raw/{GIST_ID}/{REVISION}/{FIXTURE.name}",
+        public=False,
+    )
+    routes[f"/gists/{GIST_ID}"] = ("application/json", metadata)
+    routes[f"/gists/{GIST_ID}/{REVISION}"] = ("application/json", metadata)
+    with pytest.raises(PublicationError, match="not public"):
+        verify_published(GIST_ID, api_base=base, allow_insecure=True)

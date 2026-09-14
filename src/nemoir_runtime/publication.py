@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -45,6 +46,8 @@ from nemoir_runtime.trace import (
     GRAPH_PATH,
     INTEGRITY_PATH,
     MANIFEST_PATH,
+    MAX_SAFE_INT,
+    MIN_SAFE_INT,
     SCANNER_RULESET,
     SUMMARY_FORMAT,
     SUMMARY_PATH,
@@ -152,6 +155,177 @@ _ATTESTATION_KEYS = frozenset(
 _ATTESTATION_SOURCE_KEYS = frozenset({"content_identity", "trace_id"})
 _ATTESTATION_PROJECTION_KEYS = frozenset({"sha256"})
 _OPTIONS_KEYS = frozenset({"allow_tool_names", "keep_relative_paths"})
+
+# Strict publication-v1 allowlists. A forward-compatible *reader* tolerates
+# unknown fields (schema README §1); the publication transform must not,
+# because a published artifact asserts what it contains. Sets mirror
+# ``docs/trace/schema/public-event.schema.json`` exactly.
+_LEDGER_KEYS = frozenset(
+    {
+        "kind",
+        "run_id",
+        "sequence",
+        "timestamp",
+        "stage_id",
+        "stage_visit_id",
+        "model_call_id",
+        "tool_call_id",
+        "channel",
+        "text",
+        "capability",
+        "tool_name",
+        "args",
+        "output",
+        "result",
+        "error",
+        "transition_to",
+        "metadata",
+        "redacted_fields",
+        "anchor_sequence",
+        "annotation",
+    }
+)
+_METADATA_KEYS = frozenset(
+    {
+        "approval",
+        "attempt",
+        "byte_count",
+        "category",
+        "code_bytes",
+        "command_id",
+        "content_omitted",
+        "cost_usd",
+        "denied",
+        "duration_ms",
+        "entry",
+        "error_code",
+        "error_type",
+        "exit_class",
+        "input_bytes",
+        "input_tokens",
+        "max_retries",
+        "method",
+        "origin_class",
+        "output_tokens",
+        "path_ref",
+        "policy_kind",
+        "policy_ref",
+        "priority",
+        "reason",
+        "required_capabilities",
+        "response_bytes",
+        "result_status",
+        "result_type",
+        "root_class",
+        "status_class",
+        "step_count",
+        "total_tokens",
+        "value_type",
+        "workflow_id",
+    }
+)
+# ``args`` names are open tool-domain data: the audit writer mirrors arbitrary
+# argument names as markers for ``user.*`` / ``browser.*`` capabilities, so an
+# unrecognized name is dropped with a redaction pointer instead of refusing
+# an otherwise-valid source.
+_PUBLIC_ARGS_KEYS = frozenset(
+    {
+        "path",
+        "path_ref",
+        "root_class",
+        "content",
+        "command_id",
+        "method",
+        "origin_class",
+        "key",
+        "value",
+        "code",
+        "input",
+        "headers",
+        "body",
+        "question",
+        "message",
+        "options",
+    }
+)
+_ARGS_MARKER_KEYS = frozenset(
+    {
+        "content",
+        "key",
+        "value",
+        "code",
+        "input",
+        "headers",
+        "body",
+        "question",
+        "message",
+        "options",
+    }
+)
+_METADATA_BOOLS = frozenset({"approval", "content_omitted", "denied"})
+_METADATA_ENUMS: dict[str, frozenset[str]] = {
+    "exit_class": frozenset({"success", "failure", "signal", "timeout"}),
+    "policy_kind": frozenset({"before", "deny"}),
+    "value_type": frozenset({"string", "number", "boolean", "object", "array", "null", "binary"}),
+    "reason": frozenset(
+        {
+            "explicit_transition",
+            "backward_ref_loop",
+            "next_stage_required_input_available",
+            "skip_next_stage_required_input_missing",
+            "fallthrough",
+            "other",
+        }
+    ),
+}
+_METADATA_INT_MINIMUMS: dict[str, int] = {
+    "attempt": 1,
+    "byte_count": 0,
+    "code_bytes": 0,
+    "duration_ms": 0,
+    "input_bytes": 0,
+    "input_tokens": 0,
+    "max_retries": 0,
+    "output_tokens": 0,
+    "priority": 0,
+    "response_bytes": 0,
+    "step_count": 0,
+    "total_tokens": 0,
+}
+_METADATA_PATTERNS: dict[str, str] = {
+    "category": r"^[a-z][a-z0-9_]*$",
+    "command_id": r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    "error_code": r"^[a-z][a-z0-9_]*$",
+    "error_type": r"^[A-Za-z][A-Za-z0-9_]*$",
+    "method": r"^[A-Z]+$",
+    "origin_class": r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    "path_ref": r"^path-[1-9][0-9]*$",
+    "policy_ref": r"^p-[1-9][0-9]*$",
+    "result_status": r"^[a-z][a-z0-9_]*$",
+    "result_type": r"^[a-z][a-z0-9_]*$",
+    "root_class": r"^\$[a-z][a-z0-9_]*$",
+    "status_class": r"^[1-5]xx$",
+}
+_METADATA_MAX_LENGTHS: dict[str, int] = {
+    "category": 64,
+    "command_id": 128,
+    "entry": 256,
+    "error_code": 64,
+    "error_type": 128,
+    "method": 16,
+    "origin_class": 128,
+    "result_status": 64,
+    "result_type": 64,
+    "workflow_id": 256,
+}
+_NON_ANNOTATION_KEYS = frozenset({"annotation", "anchor_sequence"})
+
+# Bounds for the few `public_args` values that are plain strings rather than
+# opaque markers (``public-event.schema.json#/$defs/public_args``).
+_MAX_ARGS_PATH_LEN = 512
+_MAX_ARGS_METHOD_LEN = 16
+_MAX_ARGS_CLASS_LEN = 128
+_MAX_CAPABILITY_NAME_LEN = 128
 
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:\-]*$")
@@ -441,6 +615,140 @@ def _require_keys(
         raise PublicationError(msg)
 
 
+def _is_marker(value: Any) -> bool:
+    """True for a ``common.schema.json`` redaction marker (opaque by design)."""
+    if not isinstance(value, dict):
+        return False
+    marker = cast("dict[Any, Any]", value)
+    return isinstance(marker.get("$redacted"), dict)
+
+
+def _public_scalar_ok(value: Any) -> bool:
+    """The closed ``public_scalar`` set: null, boolean, finite number, or marker."""
+    if value is None or isinstance(value, bool):
+        return True
+    if isinstance(value, int):
+        return MIN_SAFE_INT <= value <= MAX_SAFE_INT
+    if isinstance(value, float):
+        return math.isfinite(value)
+    return _is_marker(value)
+
+
+def _metadata_value_ok(key: str, value: Any) -> bool:
+    """Per-key shape check mirroring ``public-event.schema.json`` metadata."""
+    if key in _METADATA_BOOLS:
+        return isinstance(value, bool)
+    enums = _METADATA_ENUMS.get(key)
+    if enums is not None:
+        return isinstance(value, str) and value in enums
+    minimum = _METADATA_INT_MINIMUMS.get(key)
+    if minimum is not None:
+        return isinstance(value, int) and not isinstance(value, bool) and value >= minimum
+    if key == "cost_usd":
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0
+    if key == "required_capabilities":
+        return isinstance(value, list) and all(
+            isinstance(item, str) and 1 <= len(item) <= _MAX_CAPABILITY_NAME_LEN
+            for item in cast("list[Any]", value)
+        )
+    pattern = _METADATA_PATTERNS.get(key)
+    if pattern is not None:
+        limit = _METADATA_MAX_LENGTHS.get(key)
+        return (
+            isinstance(value, str)
+            and re.fullmatch(pattern, value) is not None
+            and (limit is None or len(value) <= limit)
+        )
+    limit = _METADATA_MAX_LENGTHS.get(key)
+    if limit is not None:
+        return isinstance(value, str) and 1 <= len(value) <= limit
+    return False  # unreachable for allowlisted keys; fail closed if a set drifts.
+
+
+def _arg_value_ok(key: str, value: Any) -> bool:
+    """Per-key shape check mirroring ``public-event.schema.json`` public_args."""
+    if key in _ARGS_MARKER_KEYS:
+        return _is_marker(value)
+    if key == "path":
+        return isinstance(value, str) and value.startswith("$") and len(value) <= _MAX_ARGS_PATH_LEN
+    if key == "root_class":
+        return isinstance(value, str) and re.fullmatch(r"^\$[a-z][a-z0-9_]*$", value) is not None
+    if key == "path_ref":
+        return isinstance(value, str) and re.fullmatch(r"^path-[1-9][0-9]*$", value) is not None
+    if key == "method":
+        return (
+            isinstance(value, str)
+            and re.fullmatch(r"^[A-Z]+$", value) is not None
+            and len(value) <= _MAX_ARGS_METHOD_LEN
+        )
+    if key in ("command_id", "origin_class"):
+        return (
+            isinstance(value, str)
+            and re.fullmatch(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$", value) is not None
+            and len(value) <= _MAX_ARGS_CLASS_LEN
+        )
+    return False  # unreachable for allowlisted keys; fail closed if a set drifts.
+
+
+def _validate_record_shape(record: Mapping[str, Any], redacted: list[str]) -> None:
+    """Enforce the ``publication-v1`` nested allowlists on one ledger record.
+
+    The reader tolerates forward-compatible fields; publication refuses them:
+    a field this transform does not classify must never reach a published
+    artifact. ``args`` names are the one exception (open tool-domain names are
+    dropped with a redaction pointer), and annotation payloads are already
+    shape-gated by ``verify_archive``.
+    """
+    _require_keys(
+        record,
+        _LEDGER_KEYS,
+        "source ledger record",
+        required=["kind", "run_id", "timestamp", "redacted_fields"],
+    )
+    if record.get("kind") != "annotation":
+        present = sorted(_NON_ANNOTATION_KEYS & set(record))
+        if present:
+            msg = (
+                f"publication source ledger record of kind {record.get('kind')!r} "
+                f"carries annotation fields {present}"
+            )
+            raise PublicationError(msg)
+    metadata = record.get("metadata")
+    if metadata is not None:
+        metadata_map = _dict(metadata, "source ledger metadata")
+        _require_keys(metadata_map, _METADATA_KEYS, "source ledger metadata")
+        for key in sorted(metadata_map):
+            if not _metadata_value_ok(key, metadata_map[key]):
+                msg = (
+                    f"publication source ledger metadata field {key!r} "
+                    "does not match the publication-v1 shape"
+                )
+                raise PublicationError(msg)
+    output = record.get("output")
+    if output is not None:
+        output_map = _dict(output, "source ledger output")
+        for key in sorted(output_map):
+            if not _public_scalar_ok(output_map[key]):
+                msg = (
+                    f"publication source ledger output field {key!r} "
+                    "does not match the publication-v1 shape"
+                )
+                raise PublicationError(msg)
+    args = record.get("args")
+    if args is not None:
+        args_map = _dict(args, "source ledger args")
+        for key in sorted(args_map):
+            if key not in _PUBLIC_ARGS_KEYS:
+                redacted.append(f"/args/{key}")
+                continue
+            if not _arg_value_ok(key, args_map[key]):
+                msg = (
+                    f"publication source ledger args field {key!r} "
+                    "does not match the publication-v1 shape"
+                )
+                raise PublicationError(msg)
+
+
 # ---------------------------------------------------------------------------
 # Source validation
 # ---------------------------------------------------------------------------
@@ -598,8 +906,13 @@ def _count_markers(node: Any) -> int:
 def _project_args(
     args: Mapping[str, Any], state: _ProjectionState, redacted: list[str]
 ) -> dict[str, Any]:
-    """Apply the ``publication-v1`` capability projection to tool arguments."""
-    projected = {key: args[key] for key in args}
+    """Apply the ``publication-v1`` capability projection to tool arguments.
+
+    Unrecognized argument names were already reported by
+    :func:`_validate_record_shape`; they are dropped here rather than
+    refused, because ``args`` names are open tool-domain data.
+    """
+    projected = {key: args[key] for key in args if key in _PUBLIC_ARGS_KEYS}
     path = projected.get("path")
     if isinstance(path, str) and not state.options.keep_relative_paths:
         projected.pop("path", None)
@@ -616,6 +929,7 @@ def _project_record(
     projected = {key: record[key] for key in record}
     projected["run_id"] = run_id
     fields = _string_list(record.get("redacted_fields", []), "source redacted_fields")
+    _validate_record_shape(record, fields)
     tool_name = projected.get("tool_name")
     if isinstance(tool_name, str):
         if tool_name in state.options.allow_tool_names:
@@ -846,6 +1160,67 @@ def _content_identity(entries: Mapping[str, bytes]) -> str:
         parse_json_strict(entries[INTEGRITY_PATH].decode("utf-8")), "publication integrity"
     )
     return _string(integrity.get("content_identity"), "integrity content_identity")
+
+
+def require_publication_artifact(
+    manifest: Mapping[str, Any],
+    entries: Mapping[str, bytes],
+    *,
+    size_bytes: int,
+    max_bytes: int,
+) -> None:
+    """Strict gate for an attested, vault-free ``publication`` artifact.
+
+    Shared by the pre-upload plan and the post-download Gist verification so
+    a re-indexed, truncated, or hand-edited archive cannot pass one path and
+    fail the other (``plan.md`` §7.5, §9.2). Every failure is a location-only
+    reason: no field value is ever echoed.
+    """
+    capture = _dict(manifest.get("capture"), "publication manifest capture")
+    profile = capture.get("profile")
+    if profile != "publication":
+        msg = (
+            "only an attested publication-profile archive may be published; "
+            f"this archive is {profile!r}, not 'publication'"
+        )
+        raise PublicationError(msg)
+    if capture.get("vault_present") is not False or "private/vault.enc" in entries:
+        msg = "refusing to publish an archive that carries a vault"
+        raise PublicationError(msg)
+    if capture.get("attested") is not True:
+        msg = "refusing to publish an archive that is not attested"
+        raise PublicationError(msg)
+    if capture.get("publication_eligible") is not True:
+        msg = "refusing to publish an archive that is not marked publication_eligible"
+        raise PublicationError(msg)
+    policy = capture.get("redaction_policy")
+    if policy != PUBLICATION_REDACTION_POLICY:
+        msg = (
+            "refusing to publish an archive whose redaction policy is "
+            f"{policy!r}, not {PUBLICATION_REDACTION_POLICY!r}"
+        )
+        raise PublicationError(msg)
+    scanner = _dict(capture.get("scanner"), "publication manifest scanner")
+    if scanner.get("status") != "passed":
+        msg = "refusing to publish an archive whose scanner did not pass"
+        raise PublicationError(msg)
+    ruleset = scanner.get("ruleset")
+    if ruleset != SCANNER_RULESET:
+        msg = (
+            "refusing to publish an archive whose scanner ruleset is "
+            f"{ruleset!r}, not {SCANNER_RULESET!r}"
+        )
+        raise PublicationError(msg)
+    provenance = _dict(manifest.get("provenance"), "publication manifest provenance")
+    if provenance.get("complete") is not True:
+        msg = "refusing to publish an archive without complete provenance"
+        raise PublicationError(msg)
+    if size_bytes > max_bytes:
+        msg = (
+            f"archive is {size_bytes} bytes, over the {max_bytes} public budget; "
+            "produce a smaller publication projection instead of splitting the trace"
+        )
+        raise PublicationError(msg)
 
 
 # ---------------------------------------------------------------------------

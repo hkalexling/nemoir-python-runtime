@@ -121,10 +121,16 @@ def test_replay_refuses_audit_archive(
 def test_replay_that_cannot_run_reports_generic_error(
     capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The degenerate vault fixture makes Python replay raise; no traceback."""
+    """The degenerate vault fixture makes replay fail closed; no traceback.
+
+    Shared with `nemotrace-js` via `expected-vault-fake-run.replay.txt`
+    (M-C1): a manifest whose deterministic stages no taped tool can satisfy
+    cannot re-execute, so neither runtime may report a synthetic divergence.
+    """
     monkeypatch.setenv("NEMOTRACE_TEST_PW", VAULT_PASSPHRASE)
     code, out = _run(capsys, ["verify", str(VAULT_FIXTURE), "--replay", "env:NEMOTRACE_TEST_PW"])
     assert code == 1
+    assert out == _golden("expected-vault-fake-run.replay.txt")
     assert "replay: error" in out
     assert "error: taped replay could not run" in out
     assert "result: failed" in out

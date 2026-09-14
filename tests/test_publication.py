@@ -406,6 +406,124 @@ def test_destination_must_differ_from_source(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# publication-v1 nested allowlists (H-S1)
+#
+# A forward-compatible reader tolerates unknown fields; the publication
+# transform must not. These tests poison a structurally valid audit archive
+# with ordinary (non-secret-pattern) private text and prove the transform
+# refuses or drops it instead of republishing it.
+# ---------------------------------------------------------------------------
+
+
+def _event(document: dict[str, Any], kind: str, position: int = 0) -> dict[str, Any]:
+    matches = [
+        cast("dict[str, Any]", event)
+        for event in cast("list[Any]", document["events"])
+        if cast("dict[str, Any]", event).get("kind") == kind
+    ]
+    return matches[position]
+
+
+def test_unknown_metadata_field_is_refused(tmp_path: Path) -> None:
+    source = _drive_fixture(tmp_path / "src")
+
+    def poison(document: dict[str, Any]) -> None:
+        metadata = cast("dict[str, Any]", _event(document, "run_started")["metadata"])
+        metadata["private_note"] = "patient narrative: seasonal allergies"
+
+    poisoned = _rebuild_archive(source, tmp_path / "poisoned.nemotrace", poison)
+    assert verify_archive(poisoned).ok  # structurally valid, forward-compatible
+    with pytest.raises(PublicationError, match="refusing to republish unknown structure"):
+        scan_publication(poisoned)
+
+
+def test_out_of_shape_metadata_value_is_refused(tmp_path: Path) -> None:
+    source = _drive_fixture(tmp_path / "src")
+
+    def poison(document: dict[str, Any]) -> None:
+        metadata = cast("dict[str, Any]", _event(document, "run_started")["metadata"])
+        metadata["duration_ms"] = "fast"  # schema: integer, minimum 0
+
+    poisoned = _rebuild_archive(source, tmp_path / "poisoned.nemotrace", poison)
+    assert verify_archive(poisoned).ok
+    with pytest.raises(
+        PublicationError,
+        match="metadata field 'duration_ms' does not match the publication-v1 shape",
+    ):
+        scan_publication(poisoned)
+
+
+def test_free_text_output_scalar_is_refused(tmp_path: Path) -> None:
+    source = _drive_fixture(tmp_path / "src")
+
+    def poison(document: dict[str, Any]) -> None:
+        output = cast("dict[str, Any]", _event(document, "stage_completed")["output"])
+        output["note"] = "patient narrative: seasonal allergies"
+
+    poisoned = _rebuild_archive(source, tmp_path / "poisoned.nemotrace", poison)
+    assert verify_archive(poisoned).ok
+    with pytest.raises(
+        PublicationError, match="output field 'note' does not match the publication-v1 shape"
+    ):
+        scan_publication(poisoned)
+
+
+def test_absolute_args_path_is_refused(tmp_path: Path) -> None:
+    """`path` must stay alias-relative, even if a reviewer would keep paths."""
+    source = _drive_fixture(tmp_path / "src")
+
+    def poison(document: dict[str, Any]) -> None:
+        args = cast("dict[str, Any]", _event(document, "tool_call_started")["args"])
+        args["path"] = "/home/alice/private/candidate.py"
+
+    poisoned = _rebuild_archive(source, tmp_path / "poisoned.nemotrace", poison)
+    assert verify_archive(poisoned).ok
+    with pytest.raises(
+        PublicationError, match="args field 'path' does not match the publication-v1 shape"
+    ):
+        scan_publication(poisoned, options=PublicationOptions(keep_relative_paths=True))
+
+
+def test_unrecognized_args_name_is_dropped_with_a_pointer(tmp_path: Path) -> None:
+    """Argument *names* are open tool-domain data: drop them, keep the record."""
+    source = _drive_fixture(tmp_path / "src")
+
+    def poison(document: dict[str, Any]) -> None:
+        args = cast("dict[str, Any]", _event(document, "tool_call_started")["args"])
+        args["private_hint"] = "seasonal allergies"
+
+    poisoned = _rebuild_archive(source, tmp_path / "poisoned.nemotrace", poison)
+    projection = scan_publication(poisoned)
+    text = projection.entries["public/events.ndjson"].decode("utf-8")
+    assert "seasonal allergies" not in text
+    records = [
+        cast("dict[str, Any]", parse_json_strict(line.decode("utf-8")))
+        for line in projection.entries["public/events.ndjson"].split(b"\n")
+        if line.strip()
+    ]
+    started = next(
+        record
+        for record in records
+        if record["kind"] == "tool_call_started"
+        and "/args/private_hint" in cast("list[str]", record["redacted_fields"])
+    )
+    # The location is reported; the name and value are gone from the args.
+    assert "private_hint" not in cast("dict[str, Any]", started["args"])
+
+
+def test_annotation_fields_on_a_plain_record_are_refused(tmp_path: Path) -> None:
+    source = _drive_fixture(tmp_path / "src")
+
+    def poison(document: dict[str, Any]) -> None:
+        _event(document, "run_started")["anchor_sequence"] = 1
+
+    poisoned = _rebuild_archive(source, tmp_path / "poisoned.nemotrace", poison)
+    assert verify_archive(poisoned).ok
+    with pytest.raises(PublicationError, match="carries annotation fields"):
+        scan_publication(poisoned)
+
+
+# ---------------------------------------------------------------------------
 # attestation binding
 # ---------------------------------------------------------------------------
 

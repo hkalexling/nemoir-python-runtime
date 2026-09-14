@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import tempfile
 import urllib.error
 import urllib.parse
@@ -35,6 +36,7 @@ from typing import Any, cast
 from nemoir_runtime.publication import (
     PUBLICATION_REDACTION_POLICY,
     PublicationError,
+    require_publication_artifact,
 )
 from nemoir_runtime.trace import (
     MANIFEST_PATH,
@@ -49,6 +51,11 @@ DEFAULT_VIEWER_BASE = "https://hkalexling.github.io/nemoir-tracer"
 GIST_RAW_HOST = "gist.githubusercontent.com"
 GIST_ID_RE = re.compile(r"^[0-9a-f]{8,64}$")
 REVISION_RE = re.compile(r"^[0-9a-f]{7,64}$")
+# Published filenames are user input that lands in a copy/paste runbook, so
+# they are restricted to characters that are inert in every shell.
+RELEASE_NAME_PATTERN = r"[A-Za-z0-9._-]+\.nemotrace"
+RELEASE_NAME_RE = re.compile(rf"^{RELEASE_NAME_PATTERN}$")
+MAX_TITLE_LEN = 200
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 HTTP_TIMEOUT_SECONDS = 20.0
 MAX_METADATA_BYTES = 4 * 1024 * 1024
@@ -98,34 +105,9 @@ def _artifact_facts(archive: Path) -> tuple[dict[str, Any], dict[str, Any]]:
         raise PublicationError(msg) from exc
     manifest = cast("dict[str, Any]", json.loads(entries[MANIFEST_PATH].decode("utf-8")))
     integrity = cast("dict[str, Any]", json.loads(entries["integrity.json"].decode("utf-8")))
-    capture = cast("dict[str, Any]", manifest.get("capture") or {})
-    if capture.get("profile") != "publication":
-        msg = (
-            "only an attested publication-profile archive may be published; "
-            f"this archive is {capture.get('profile')!r} "
-            "(run scan-publication / attest-publication / prepare-publication first)"
-        )
-        raise PublicationError(msg)
-    if capture.get("vault_present") is not False or "private/vault.enc" in entries:
-        msg = "refusing to publish an archive that carries a vault"
-        raise PublicationError(msg)
-    if capture.get("attested") is not True:
-        msg = "refusing to publish an archive that is not attested"
-        raise PublicationError(msg)
-    scanner = cast("dict[str, Any]", capture.get("scanner") or {})
-    if scanner.get("status") != "passed":
-        msg = "refusing to publish an archive whose scanner did not pass"
-        raise PublicationError(msg)
-    if not cast("dict[str, Any]", manifest.get("provenance") or {}).get("complete"):
-        msg = "refusing to publish an archive without complete provenance"
-        raise PublicationError(msg)
-    size = archive.stat().st_size
-    if size > PUBLICATION_MAX_BYTES:
-        msg = (
-            f"archive is {size} bytes, over the {PUBLICATION_MAX_BYTES} public budget; "
-            "produce a smaller publication projection instead of splitting the trace"
-        )
-        raise PublicationError(msg)
+    require_publication_artifact(
+        manifest, entries, size_bytes=archive.stat().st_size, max_bytes=PUBLICATION_MAX_BYTES
+    )
     return manifest, integrity
 
 
@@ -149,15 +131,24 @@ def plan_publication(
     """
     path = Path(archive)
     manifest, integrity = _artifact_facts(path)
-    if not title.strip():
-        msg = "publication title must not be empty"
-        raise PublicationError(msg)
     if not license_id.strip():
         msg = "publication requires a license identifier (for example CC-BY-4.0 or Apache-2.0)"
         raise PublicationError(msg)
     release_name = filename if filename is not None else path.name
-    if not release_name.endswith(".nemotrace") or "/" in release_name or "\\" in release_name:
-        msg = "published filename must be a plain *.nemotrace name"
+    if not RELEASE_NAME_RE.fullmatch(release_name):
+        msg = (
+            "published filename must be a plain *.nemotrace name "
+            f"({RELEASE_NAME_PATTERN}); got {release_name!r}"
+        )
+        raise PublicationError(msg)
+    # Normalize so a title cannot break the one-command-per-line runbook or
+    # inject markup into the generated README.
+    title = " ".join(title.split())
+    if not title:
+        msg = "publication title must not be empty"
+        raise PublicationError(msg)
+    if len(title) > MAX_TITLE_LEN:
+        msg = f"publication title must be at most {MAX_TITLE_LEN} characters"
         raise PublicationError(msg)
     capture: dict[str, Any] = manifest.get("capture") or {}
     workflow: dict[str, Any] = manifest.get("workflow") or {}
@@ -185,18 +176,18 @@ def plan_publication(
     commands = (
         "# 1. create the Gist shell with your own credential (text only; the API",
         "#    cannot carry a binary .nemotrace safely)",
-        f'gh gist create --public --desc "{title}" README.md',
+        f"gh gist create --public --desc {shlex.quote(title)} README.md",
         "#    -> prints https://gist.github.com/<gist-id>",
         "",
         "# 2. push the archive over the Gist's Git remote",
         "git clone https://gist.github.com/<gist-id>.git nemotrace-gist",
-        f"cp {path} nemotrace-gist/{release_name}",
-        f"cd nemotrace-gist && git add {release_name} && git commit -m "
-        f"'Add {release_name}' && git push",
+        f"cp {shlex.quote(str(path))} {shlex.quote(f'nemotrace-gist/{release_name}')}",
+        f"cd nemotrace-gist && git add {shlex.quote(release_name)} && git commit -m "
+        f"{shlex.quote(f'Add {release_name}')} && git push",
         "",
         "# 3. verify the uploaded bytes and print the pinned citation link",
-        f"nemotrace publish-verify <gist-id> --filename {release_name} "
-        f"--expect-content-identity {content_identity}",
+        f"nemotrace publish-verify <gist-id> --filename {shlex.quote(release_name)} "
+        f"--expect-content-identity {shlex.quote(content_identity)}",
     )
     catalog_entry: dict[str, Any] = {
         "id": f"{workflow.get('id', 'trace')}-{content_identity[-12:]}",
@@ -361,6 +352,9 @@ def verify_published(
         allow_insecure=allow_insecure,
     )
     metadata = cast("dict[str, Any]", json.loads(raw_metadata))
+    if metadata.get("public") is not True:
+        msg = "gist metadata is not public; refusing to verify a non-public publication"
+        raise PublicationError(msg)
     history = cast("list[Any]", metadata.get("history") or [])
     revision = str(history[0].get("version")) if history else ""
     if not REVISION_RE.fullmatch(revision):
@@ -419,15 +413,17 @@ def verify_published(
             )
             content_identity = str(integrity.get("content_identity", ""))
             manifest = cast("dict[str, Any]", json.loads(entries[MANIFEST_PATH].decode("utf-8")))
-            capture: dict[str, Any] = manifest.get("capture") or {}
-            if capture.get("profile") != "publication":
-                errors.append(
-                    f"published archive profile is {capture.get('profile')!r}, not 'publication'"
+            # Same strict gate the pre-upload plan uses: a re-indexed or
+            # hand-edited Gist artifact must not verify as a publication.
+            try:
+                require_publication_artifact(
+                    manifest,
+                    entries,
+                    size_bytes=len(data),
+                    max_bytes=PUBLICATION_MAX_BYTES,
                 )
-            if capture.get("vault_present") is not False:
-                errors.append("published archive declares a vault")
-            if capture.get("attested") is not True:
-                errors.append("published archive is not attested")
+            except PublicationError as exc:
+                errors.append(str(exc))
     if expect_content_identity is not None:
         if not _SHA256_RE.fullmatch(expect_content_identity):
             msg = "--expect-content-identity must be a sha256: tag"

@@ -177,3 +177,41 @@ def test_parity_fixture_matches_frozen_vectors(tmp_path: Path) -> None:
     assert entries["public/workflow.graph.json"] == expected_graph
     report = verify_archive(path)
     assert report.ok, report.errors
+
+    # Canonical manifest wire keys, mirrored by `trace.test.ts` on the web
+    # side. `provenance.compiler_version` must stay snake_case: a camelCase
+    # leak made web-produced archives unpublishable (the publication
+    # transform refuses unknown fields).
+    manifest: dict[str, Any] = json.loads(entries["manifest.json"].decode("utf-8"))
+    assert sorted(manifest) == [
+        "capture",
+        "created_at",
+        "format",
+        "integrity",
+        "provenance",
+        "status",
+        "trace_id",
+        "viewer",
+        "workflow",
+    ]
+    assert sorted(manifest["provenance"]) == [
+        "compiler_version",
+        "complete",
+        "frontend",
+        "runtime",
+        "target",
+    ]
+    assert sorted(manifest["workflow"]) == [
+        "entry",
+        "exits",
+        "id",
+        "ir_sha256",
+        "ir_version",
+    ]
+    assert sorted(manifest["capture"]) == [
+        "profile",
+        "publication_eligible",
+        "redaction_policy",
+        "scanner",
+        "vault_present",
+    ]
